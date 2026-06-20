@@ -27,14 +27,14 @@ describe("api client", () => {
       "fetch",
       vi.fn(
         async () =>
-          new Response(JSON.stringify({ detail: "Ollama 연결 실패" }), {
+          new Response(JSON.stringify({ detail: "Local AI 연결 실패" }), {
             status: 503,
             headers: { "Content-Type": "application/json" },
           }),
       ),
     );
 
-    await expect(api.health()).rejects.toThrow("Ollama 연결 실패");
+    await expect(api.health()).rejects.toThrow("Local AI 연결 실패");
   });
 
   it("adds the desktop api token when configured", async () => {

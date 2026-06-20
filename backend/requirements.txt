@@ -7,5 +7,6 @@ langchain==0.3.11
 langchain-community==0.3.11
 langgraph==0.2.59
 chromadb==0.5.23
+llama-cpp-python==0.3.31
 pytest==8.3.4
 pyinstaller==6.11.1

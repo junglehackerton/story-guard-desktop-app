@@ -1,8 +1,15 @@
-import type { ContinuityIssue, EntityNode, EvidenceChunk, IssueStatus } from "../lib/types";
+import type {
+  ContinuityIssue,
+  EntityNode,
+  EntityRelationshipDetail,
+  EvidenceChunk,
+  IssueStatus,
+} from "../lib/types";
 import { ENTITY_TYPE_LABELS, ISSUE_CATEGORY_LABELS, ISSUE_STATUS_LABELS } from "../lib/labels";
 
 interface InspectorProps {
   entity: EntityNode | null;
+  relationships: EntityRelationshipDetail[];
   issues: ContinuityIssue[];
   evidenceByIssueId: Record<number, EvidenceChunk[]>;
   onIssueStatus: (issueId: number, status: IssueStatus) => void;
@@ -15,7 +22,13 @@ const APPEARANCE_LABELS: Record<EntityNode["appearance_state"], string> = {
   dormant: "언급 소실",
 };
 
-export function Inspector({ entity, issues, evidenceByIssueId, onIssueStatus }: InspectorProps) {
+export function Inspector({
+  entity,
+  relationships,
+  issues,
+  evidenceByIssueId,
+  onIssueStatus,
+}: InspectorProps) {
   return (
     <aside className="inspector">
       <section className="panel">
@@ -33,6 +46,27 @@ export function Inspector({ entity, issues, evidenceByIssueId, onIssueStatus }: 
               <span>{entity.document_count}편 등장</span>
             </div>
             {entity.aliases.length > 0 && <p>별칭: {entity.aliases.join(", ")}</p>}
+            <div className="entity-relations">
+              <div className="entity-relations-title">
+                <strong>활성 관계</strong>
+                <span>{relationships.length}</span>
+              </div>
+              {relationships.length === 0 ? (
+                <p className="muted">현재 필터에서 연결된 관계가 없습니다.</p>
+              ) : (
+                relationships.map((detail) => (
+                  <article key={detail.relation.id} className="entity-relation-card">
+                    <div>
+                      <span className={`entity-type entity-${detail.other.type}`}>
+                        {ENTITY_TYPE_LABELS[detail.other.type]}
+                      </span>
+                      <strong>{detail.other.name}</strong>
+                    </div>
+                    <p>{detail.explanation}</p>
+                  </article>
+                ))
+              )}
+            </div>
           </div>
         ) : (
           <p className="muted">그래프 노드를 선택하면 설정 상세와 근거가 표시됩니다.</p>

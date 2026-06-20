@@ -27,6 +27,7 @@ mkdir -p src-tauri/binaries
   --distpath src-tauri/binaries \
   --workpath build/pyinstaller \
   --specpath build/pyinstaller \
+  --collect-binaries llama_cpp \
   backend/sidecar.py
 
 chmod +x "src-tauri/binaries/story-guard-backend-${TARGET_TRIPLE}" 2>/dev/null || true

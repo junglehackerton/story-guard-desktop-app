@@ -17,3 +17,7 @@ def database_path() -> Path:
 
 def chroma_path() -> Path:
     return app_data_dir() / "chroma"
+
+
+def models_path() -> Path:
+    return app_data_dir() / "models"

@@ -24,16 +24,16 @@ export function SetupPanel({ status, progress, onStart, onRefresh }: SetupPanelP
           </button>
           <button onClick={onStart} disabled={running || ready || status?.can_auto_install === false}>
             {ready ? <CheckCircle2 size={16} /> : <Download size={16} />}
-            {running ? "준비 중" : ready ? "완료" : "모델 준비"}
+            {running ? "설치 중" : ready ? "완료" : "LLM 설치"}
           </button>
         </div>
       </div>
 
       <div className="setup-grid">
-        <SetupItem label="Ollama 설치" ok={status?.ollama_installed} />
-        <SetupItem label="Ollama 실행" ok={status?.ollama_running} />
-        <SetupItem label={status?.embedding_model ?? "embeddinggemma"} ok={status?.embedding_model_ready} />
-        <SetupItem label={status?.generation_model ?? "qwen2.5:3b"} ok={status?.generation_model_ready} />
+        <SetupItem label="llama.cpp 런타임" ok={status?.runtime_installed} />
+        <SetupItem label={status?.model_dir ? "앱 모델 폴더" : "모델 폴더"} ok={status?.runtime_running} />
+        <SetupItem label={status?.embedding_model ?? "qwen2.5-1.5b-instruct-q4_k_m.gguf"} ok={status?.embedding_model_ready} />
+        <SetupItem label={status?.generation_model ?? "qwen2.5-1.5b-instruct-q4_k_m.gguf"} ok={status?.generation_model_ready} />
       </div>
 
       {!ready && (

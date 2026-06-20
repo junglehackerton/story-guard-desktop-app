@@ -12,7 +12,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.app.config import chroma_path, database_path
+from backend.app.config import chroma_path, database_path, models_path
 from backend.app.database import Database
 from backend.app.models import (
     AppSettings,
@@ -25,7 +25,7 @@ from backend.app.models import (
     EvidenceChunk,
     GraphPayload,
     IssueStatus,
-    OllamaHealth,
+    LocalAiHealth,
     Project,
     ProjectCreate,
     ProjectUpdate,
@@ -33,18 +33,20 @@ from backend.app.models import (
 )
 from backend.app.pipeline.analyzer import StoryAnalyzer
 from backend.app.repository import StoryRepository
-from backend.app.services.local_llm import LocalLlmExtractor
 from backend.app.services.environment_setup import EnvironmentSetupManager
-from backend.app.services.ollama import OllamaClient
+from backend.app.services.local_ai import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_GENERATION_MODEL,
+    LocalAiRuntime,
+)
+from backend.app.services.local_llm import LocalLlmExtractor
 from backend.app.services.parser import UnsupportedDocumentFormat, read_document, split_chunks
 from backend.app.services.rag import RagService
-from backend.app.services.vector_store import VectorIndex
 
 
 database = Database(database_path())
 repository = StoryRepository(database)
-ollama = OllamaClient()
-vector_index = VectorIndex(chroma_path())
+local_ai = LocalAiRuntime(models_path())
 
 
 def save_environment_settings(embedding_model: str, generation_model: str) -> None:
@@ -52,7 +54,23 @@ def save_environment_settings(embedding_model: str, generation_model: str) -> No
     repository.set_setting("generation_model", generation_model)
 
 
-setup_manager = EnvironmentSetupManager(save_environment_settings)
+def load_environment_settings() -> AppSettings:
+    generation_model = repository.get_setting("generation_model", DEFAULT_GENERATION_MODEL).strip()
+    if (
+        not generation_model
+        or not generation_model.lower().endswith(".gguf")
+    ):
+        generation_model = DEFAULT_GENERATION_MODEL
+    embedding_model = repository.get_setting("embedding_model", DEFAULT_EMBEDDING_MODEL).strip()
+    if embedding_model != DEFAULT_EMBEDDING_MODEL:
+        embedding_model = DEFAULT_EMBEDDING_MODEL
+    return AppSettings(
+        generation_model=generation_model,
+        embedding_model=embedding_model or DEFAULT_EMBEDDING_MODEL,
+    )
+
+
+setup_manager = EnvironmentSetupManager(save_environment_settings, load_environment_settings)
 
 app = FastAPI(title="Story Guard API", version="0.1.0")
 app.add_middleware(
@@ -94,22 +112,19 @@ def health() -> dict[str, str]:
 
 @app.get("/settings", response_model=AppSettings)
 def get_settings() -> AppSettings:
-    return AppSettings(
-        generation_model=repository.get_setting("generation_model", ""),
-        embedding_model=repository.get_setting("embedding_model", "embeddinggemma") or "embeddinggemma",
-    )
+    return load_environment_settings()
 
 
 @app.put("/settings", response_model=AppSettings)
 def update_settings(payload: AppSettings) -> AppSettings:
-    repository.set_setting("generation_model", payload.generation_model.strip())
-    repository.set_setting("embedding_model", payload.embedding_model.strip() or "embeddinggemma")
+    repository.set_setting("generation_model", payload.generation_model.strip() or DEFAULT_GENERATION_MODEL)
+    repository.set_setting("embedding_model", payload.embedding_model.strip() or DEFAULT_EMBEDDING_MODEL)
     return get_settings()
 
 
-@app.get("/health/ollama", response_model=OllamaHealth)
-async def ollama_health() -> OllamaHealth:
-    return await ollama.health()
+@app.get("/health/local-ai", response_model=LocalAiHealth)
+def local_ai_health() -> LocalAiHealth:
+    return local_ai.health()
 
 
 @app.get("/setup/status", response_model=EnvironmentStatus)
@@ -189,15 +204,8 @@ async def index_document_chunks(
     embedding_model: str,
 ) -> None:
     try:
-        ollama_status = await ollama.health()
-        if not ollama_status.ok:
-            return
         request_rag = RagService(chroma_path(), embedding_model=embedding_model)
-        try:
-            await asyncio.to_thread(request_rag.index_chunks, project_id, chunk_ids, chunks)
-        except Exception:
-            embeddings = await ollama.embed(chunks, model=embedding_model)
-            await asyncio.to_thread(vector_index.upsert_texts, project_id, chunk_ids, chunks, embeddings)
+        await asyncio.to_thread(request_rag.index_chunks, project_id, chunk_ids, chunks)
     except Exception:
         return
 
@@ -222,9 +230,12 @@ def analyze_project(project_id: int) -> dict[str, int]:
     analyzer = StoryAnalyzer(
         repository,
         RagService(chroma_path(), embedding_model=settings.embedding_model),
-        LocalLlmExtractor(model=settings.generation_model),
+        LocalLlmExtractor(model=settings.generation_model, model_dir=models_path()),
     )
-    result = analyzer.analyze_project(project_id)
+    try:
+        result = analyzer.analyze_project(project_id)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
     return {
         "entity_count": result.entity_count,
         "relation_count": result.relation_count,

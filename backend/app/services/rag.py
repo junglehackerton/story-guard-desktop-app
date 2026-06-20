@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
+from backend.app.services.local_ai import DEFAULT_EMBEDDING_MODEL, LocalLlmEmbeddings
 
 
 @dataclass
@@ -12,47 +12,14 @@ class RagChunk:
     metadata: dict[str, int | str]
 
 
-class OllamaLangChainEmbeddings:
-    """LangChain-compatible local embedding adapter backed by Ollama."""
-
-    def __init__(
-        self,
-        base_url: str = "http://localhost:11434/api",
-        model: str = "embeddinggemma",
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-
-    def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        return self._embed(texts)
-
-    def embed_query(self, text: str) -> list[float]:
-        vectors = self._embed([text])
-        if not vectors:
-            raise RuntimeError("Ollama returned no embedding for query")
-        return vectors[0]
-
-    def _embed(self, texts: list[str]) -> list[list[float]]:
-        with httpx.Client(timeout=60.0) as client:
-            response = client.post(
-                f"{self.base_url}/embed",
-                json={"model": self.model, "input": texts},
-            )
-            response.raise_for_status()
-            payload = response.json()
-        return payload.get("embeddings", [])
-
-
 class RagService:
     def __init__(
         self,
         persist_dir: Path,
-        embedding_model: str = "embeddinggemma",
-        ollama_base_url: str = "http://localhost:11434/api",
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ) -> None:
         self.persist_dir = persist_dir
         self.embedding_model = embedding_model
-        self.ollama_base_url = ollama_base_url
         self.persist_dir.mkdir(parents=True, exist_ok=True)
 
     def split_text(self, text: str, document_id: int, project_id: int) -> list[RagChunk]:
@@ -95,10 +62,7 @@ class RagService:
         ]
         Chroma.from_documents(
             documents=documents,
-            embedding=OllamaLangChainEmbeddings(
-                base_url=self.ollama_base_url,
-                model=self.embedding_model,
-            ),
+            embedding=LocalLlmEmbeddings(model=self.embedding_model),
             collection_name=f"project_{project_id}",
             persist_directory=str(self.persist_dir),
             client_settings=Settings(anonymized_telemetry=False),
@@ -118,10 +82,7 @@ class RagService:
         store = Chroma(
             collection_name=f"project_{project_id}",
             persist_directory=str(self.persist_dir),
-            embedding_function=OllamaLangChainEmbeddings(
-                base_url=self.ollama_base_url,
-                model=self.embedding_model,
-            ),
+            embedding_function=LocalLlmEmbeddings(model=self.embedding_model),
             client_settings=Settings(anonymized_telemetry=False),
         )
         docs = store.similarity_search(query, k=limit)

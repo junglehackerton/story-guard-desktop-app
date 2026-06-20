@@ -12,7 +12,7 @@ Story Guard는 웹소설, 장편 소설, 드라마 시나리오처럼 설정과 
 - 핵심 관계/전체 관계 보기 전환
 - 설정 충돌, 시간선 오류, 미회수 떡밥 후보 리포트
 - 이슈 상태 관리: 열림, 확정, 무시, 보류
-- Ollama 기반 로컬 생성 모델 선택
+- 앱 관리 로컬 LLM 설치와 분석
 - LangChain 기반 chunking/RAG 색인
 - LangGraph 스타일 분석 파이프라인
 - SQLite와 Chroma를 이용한 로컬 저장
@@ -23,7 +23,7 @@ Story Guard는 웹소설, 장편 소설, 드라마 시나리오처럼 설정과 
 - 프론트엔드: React, TypeScript, Vite, Cytoscape
 - 백엔드: Python, FastAPI
 - 데이터 저장: SQLite, Chroma
-- 로컬 AI: Ollama, LangChain, LangGraph
+- 로컬 AI: llama.cpp, GGUF 로컬 모델, LangChain, LangGraph
 - 패키징: PyInstaller sidecar, Tauri bundle
 
 ## 동작 구조
@@ -34,7 +34,7 @@ flowchart LR
   B --> C["FastAPI Python Sidecar"]
   C --> D["SQLite"]
   C --> E["Chroma Vector Store"]
-  C --> F["Ollama Local API"]
+  C --> F["Local AI Runtime / GGUF Models"]
   C --> G["LangChain / LangGraph 분석 파이프라인"]
 ```
 
@@ -54,12 +54,13 @@ flowchart LR
 ## 보안과 프라이버시
 
 - 원고 본문, chunk, 엔티티, 관계, 이슈는 로컬 앱 데이터 디렉터리에 저장됩니다.
-- 기본 LLM 호출 대상은 로컬 Ollama API입니다.
+- 분석은 앱 데이터 디렉터리에 설치된 로컬 GGUF 모델로만 동작합니다.
+- 모델이 없으면 분석을 실행하지 않고, 환경 설정에서 로컬 LLM 설치가 필요하다고 표시합니다.
 - 외부 클라우드 LLM 호출 코드는 기본 경로에 없습니다.
 - 데스크톱 앱은 FastAPI sidecar를 `127.0.0.1`에만 바인딩합니다.
 - 데스크톱 실행 시 Tauri가 임시 로컬 API 토큰을 생성하고, sidecar API 요청에 토큰을 붙입니다.
 - `/health`를 제외한 API는 토큰이 설정된 경우 토큰 없이 접근할 수 없습니다.
-- Ollama 설치 파일을 자동 다운로드/설치하지 않습니다. Ollama 설치는 사용자가 직접 수행해야 합니다.
+- 기본 모델 설치는 공개 모델 파일 다운로드만 수행하며, 원고 본문은 외부로 전송하지 않습니다.
 
 주의: 개발 모드에서는 별도 backend 서버를 직접 띄울 수 있으므로, 공개 네트워크 인터페이스에 backend를 바인딩하지 마세요.
 
@@ -69,17 +70,11 @@ flowchart LR
 - Node.js 20 이상 권장
 - Python 3.11
 - Rust/Cargo
-- Ollama
-- Ollama 모델
-  - 임베딩 기본값: `embeddinggemma`
-  - 생성 모델 예시: `qwen2.5:3b`, `llama3.1:8b`
+- 기본 생성/임베딩 모델: `qwen2.5-1.5b-instruct-q4_k_m.gguf`
+- 기본 모델 출처: `Qwen/Qwen2.5-1.5B-Instruct-GGUF`
+- 런타임: `llama-cpp-python`
 
-Ollama 모델 준비 예시는 다음과 같습니다.
-
-```bash
-ollama pull embeddinggemma
-ollama pull qwen2.5:3b
-```
+앱의 `LLM 설치` 버튼은 기본 GGUF 모델을 앱 데이터 디렉터리의 `models/` 폴더에 내려받습니다. 다른 GGUF 모델을 사용할 때도 같은 폴더에 파일을 넣고 생성 모델 선택에서 고릅니다.
 
 ## 개발 환경 실행
 
@@ -196,7 +191,7 @@ STORY_GUARD_DATA_DIR=/tmp/story-guard-dev npm run backend
 - HWP와 PDF 파싱은 아직 지원하지 않습니다.
 - 협업 기능은 없습니다.
 - 실시간 집필 감시는 아직 없습니다.
-- 분석 품질은 선택한 로컬 모델과 원고 형식에 영향을 받습니다.
+- 분석 품질은 설치된 로컬 LLM 모델과 원고 형식에 영향을 받습니다.
 - LLM 추출 결과는 작가가 검토해야 하는 후보입니다. 최종 판정 도구가 아니라 설정 검토 보조 도구입니다.
 
 ## GitHub 업로드 주의
@@ -209,6 +204,7 @@ STORY_GUARD_DATA_DIR=/tmp/story-guard-dev npm run backend
 - `build/`, `dist/`, `src-tauri/target/`
 - `src-tauri/binaries/story-guard-backend*`
 - `.story-guard/`, `chroma/`
+- `models/`, `*.gguf`
 - `.env*`, `*.sqlite`, `*.db`, 로그 파일
 
 대용량 빌드 산출물과 로컬 원고 데이터가 들어가지 않도록 커밋 전 `git status`를 확인하세요.

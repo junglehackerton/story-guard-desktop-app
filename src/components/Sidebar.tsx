@@ -1,13 +1,14 @@
 import { FilePlus2, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
-import type { AppSettings, OllamaHealth, Project, StoryDocument } from "../lib/types";
+import type { AppSettings, LocalAiHealth, Project, StoryDocument } from "../lib/types";
 
 interface SidebarProps {
   projects: Project[];
   selectedProject: Project | null;
   documents: StoryDocument[];
-  ollama: OllamaHealth | null;
+  localAi: LocalAiHealth | null;
   settings: AppSettings;
   loading: boolean;
+  aiReady: boolean;
   onCreateProject: () => void;
   onSelectProject: (project: Project) => void;
   onImportDocument: () => void;
@@ -21,9 +22,10 @@ export function Sidebar({
   projects,
   selectedProject,
   documents,
-  ollama,
+  localAi,
   settings,
   loading,
+  aiReady,
   onCreateProject,
   onSelectProject,
   onImportDocument,
@@ -42,9 +44,9 @@ export function Sidebar({
         </div>
       </div>
 
-      <div className={`ollama-status ${ollama?.ok ? "ok" : "warn"}`}>
-        <strong>Ollama</strong>
-        <span>{ollama?.message ?? "확인 중"}</span>
+      <div className={`runtime-status ${localAi?.ok ? "ok" : "warn"}`}>
+        <strong>Local AI</strong>
+        <span>{localAi?.message ?? "확인 중"}</span>
       </div>
 
       <div className="settings-panel">
@@ -54,20 +56,23 @@ export function Sidebar({
           value={settings.generation_model}
           onChange={(event) => onGenerationModelChange(event.target.value)}
         >
-          <option value="">휴리스틱 fallback</option>
-          {ollama?.models.map((model) => (
+          {localAi?.models.map((model) => (
             <option key={model} value={model}>
               {model}
             </option>
           ))}
+          {(localAi?.models.length ?? 0) === 0 && (
+            <option value={settings.generation_model}>{settings.generation_model}</option>
+          )}
           {settings.generation_model &&
-            !ollama?.models.includes(settings.generation_model) && (
+            (localAi?.models.length ?? 0) > 0 &&
+            !localAi?.models.includes(settings.generation_model) && (
               <option value={settings.generation_model}>{settings.generation_model}</option>
             )}
         </select>
         <span>
           임베딩: {settings.embedding_model}
-          {!ollama?.ok ? " · ollama serve / pull 필요" : ""}
+          {!localAi?.ok ? " · 로컬 런타임 확인 필요" : ""}
         </span>
       </div>
 
@@ -125,9 +130,9 @@ export function Sidebar({
         </div>
       </section>
 
-      <button className="analyze-button" onClick={onAnalyze} disabled={!selectedProject || loading}>
+      <button className="analyze-button" onClick={onAnalyze} disabled={!selectedProject || loading || !aiReady}>
         <Play size={16} />
-        {loading ? "분석 중" : "분석 실행"}
+        {loading ? "분석 중" : aiReady ? "분석 실행" : "LLM 설치 필요"}
       </button>
     </aside>
   );

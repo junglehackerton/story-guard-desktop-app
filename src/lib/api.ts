@@ -8,7 +8,7 @@ import type {
   EvidenceChunk,
   GraphPayload,
   IssueStatus,
-  OllamaHealth,
+  LocalAiHealth,
   Project,
   StoryDocument,
 } from "./types";
@@ -52,7 +52,7 @@ export const api = {
       method: "POST",
       body: JSON.stringify(payload),
     }),
-  ollamaHealth: () => request<OllamaHealth>("/health/ollama"),
+  localAiHealth: () => request<LocalAiHealth>("/health/local-ai"),
   listProjects: () => request<Project[]>("/projects"),
   createProject: (title: string) =>
     request<Project>("/projects", {

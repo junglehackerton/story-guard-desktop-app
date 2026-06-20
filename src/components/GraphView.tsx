@@ -1,7 +1,7 @@
 import cytoscape, { Core } from "cytoscape";
 import { Maximize2, ZoomIn, ZoomOut } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { EntityNode, GraphPayload } from "../lib/types";
+import type { EntityNode, EntityType, GraphPayload, RelationEdge } from "../lib/types";
 
 const ENTITY_COLORS: Record<string, { fill: string; border: string }> = {
   character: { fill: "#7163c6", border: "#4c3fa2" },
@@ -14,21 +14,24 @@ const ENTITY_COLORS: Record<string, { fill: string; border: string }> = {
 };
 
 const GRAPH_LAYOUT: cytoscape.LayoutOptions = {
-  name: "cose",
+  name: "preset",
   animate: false,
   fit: true,
-  padding: 78,
-  randomize: true,
-  idealEdgeLength: 128,
-  nodeOverlap: 14,
-  refresh: 20,
-  componentSpacing: 130,
-  nodeRepulsion: 7200,
-  edgeElasticity: 88,
-  nestingFactor: 1.2,
-  gravity: 0.16,
-  numIter: 1000,
+  padding: 86,
 };
+
+const ENTITY_TYPE_ORDER: EntityType[] = [
+  "character",
+  "place",
+  "organization",
+  "item",
+  "event",
+  "rule",
+  "foreshadowing",
+];
+const MEMBERSHIP_RELATION_PATTERN = /소속|조직|구성원|대표|멤버|member|leader|belongs|works/i;
+
+type GraphPosition = { x: number; y: number };
 
 interface GraphViewProps {
   graph: GraphPayload;
@@ -65,9 +68,13 @@ function shortEntityLabel(label: string) {
   return label.length > 14 ? `${label.slice(0, 13)}...` : label;
 }
 
-function entityVisual(entity: EntityNode, degree: number) {
+function entityVisual(entity: EntityNode, degree: number, clusterSize: number) {
   const palette = ENTITY_COLORS[entity.type] ?? { fill: "#7a8494", border: "#596272" };
-  const weight = clamp(entity.visual_weight ?? 0.5, 0.22, 1);
+  const weight = clamp(
+    entity.type === "organization" ? Math.max(entity.visual_weight ?? 0.5, 0.72) : (entity.visual_weight ?? 0.5),
+    0.22,
+    1,
+  );
   const livelyFill = mixHex("#efe6d8", palette.fill, weight);
   const fill =
     entity.appearance_state === "dormant"
@@ -87,7 +94,11 @@ function entityVisual(entity: EntityNode, degree: number) {
     fill,
     border,
     opacity: entity.appearance_state === "dormant" ? 0.5 : entity.appearance_state === "fading" ? 0.72 : 1,
-    size: 30 + weight * 24 + Math.min(degree * 1.6, 10),
+    size:
+      30 +
+      weight * 24 +
+      Math.min(degree * 1.6, 10) +
+      (entity.type === "organization" ? 14 + Math.min(clusterSize * 3.8, 34) : 0),
     weight,
   };
 }
@@ -118,6 +129,129 @@ function relationTone(label: string) {
   return "#8790a0";
 }
 
+function isMembershipRelation(relation: RelationEdge) {
+  return MEMBERSHIP_RELATION_PATTERN.test(`${relation.type} ${relation.display_label}`);
+}
+
+function buildOrganizationMembership(
+  graph: GraphPayload,
+  entitiesById: Map<number, EntityNode>,
+) {
+  const membershipByOrganizationId = new Map<number, Set<number>>();
+  for (const entity of graph.entities) {
+    if (entity.type === "organization") {
+      membershipByOrganizationId.set(entity.id, new Set());
+    }
+  }
+
+  for (const relation of graph.relations) {
+    if (!isMembershipRelation(relation)) {
+      continue;
+    }
+    const source = entitiesById.get(relation.source_entity_id);
+    const target = entitiesById.get(relation.target_entity_id);
+    if (!source || !target) {
+      continue;
+    }
+    if (source.type === "organization" && target.type !== "organization") {
+      membershipByOrganizationId.get(source.id)?.add(target.id);
+    }
+    if (target.type === "organization" && source.type !== "organization") {
+      membershipByOrganizationId.get(target.id)?.add(source.id);
+    }
+  }
+
+  return { membershipByOrganizationId };
+}
+
+function sortedEntities(
+  entities: EntityNode[],
+  degreeByEntityId: Map<number, number>,
+) {
+  return [...entities].sort((left, right) => {
+    const typeDelta = ENTITY_TYPE_ORDER.indexOf(left.type) - ENTITY_TYPE_ORDER.indexOf(right.type);
+    if (typeDelta !== 0) {
+      return typeDelta;
+    }
+    const degreeDelta = (degreeByEntityId.get(right.id) ?? 0) - (degreeByEntityId.get(left.id) ?? 0);
+    if (degreeDelta !== 0) {
+      return degreeDelta;
+    }
+    return left.name.localeCompare(right.name, "ko");
+  });
+}
+
+function buildObsidianPositions(
+  graph: GraphPayload,
+  entitiesById: Map<number, EntityNode>,
+  membershipByOrganizationId: Map<number, Set<number>>,
+  degreeByEntityId: Map<number, number>,
+) {
+  const positions = new Map<number, GraphPosition>();
+  const assignedEntityIds = new Set<number>();
+  const organizations = sortedEntities(
+    graph.entities.filter((entity) => entity.type === "organization"),
+    degreeByEntityId,
+  ).sort(
+    (left, right) =>
+      (membershipByOrganizationId.get(right.id)?.size ?? 0) -
+        (membershipByOrganizationId.get(left.id)?.size ?? 0) ||
+      (degreeByEntityId.get(right.id) ?? 0) - (degreeByEntityId.get(left.id) ?? 0),
+  );
+
+  const hubGap = 360;
+  const hubStartX = -((organizations.length - 1) * hubGap) / 2;
+  organizations.forEach((organization, index) => {
+    const hubPosition = {
+      x: hubStartX + index * hubGap,
+      y: index % 2 === 0 ? -60 : 36,
+    };
+    positions.set(organization.id, hubPosition);
+    assignedEntityIds.add(organization.id);
+
+    const memberEntities = sortedEntities(
+      [...(membershipByOrganizationId.get(organization.id) ?? [])]
+        .map((entityId) => entitiesById.get(entityId))
+        .filter((entity): entity is EntityNode => Boolean(entity)),
+      degreeByEntityId,
+    );
+    const radius = 118 + Math.min(memberEntities.length, 10) * 6;
+    memberEntities.forEach((member, memberIndex) => {
+      const angle = -Math.PI / 2 + (memberIndex / Math.max(memberEntities.length, 1)) * Math.PI * 2;
+      const ringOffset = (memberIndex % 3) * 20;
+      positions.set(member.id, {
+        x: hubPosition.x + Math.cos(angle) * (radius + ringOffset),
+        y: hubPosition.y + Math.sin(angle) * (radius + ringOffset),
+      });
+      assignedEntityIds.add(member.id);
+    });
+  });
+
+  const looseEntities = sortedEntities(
+    graph.entities.filter((entity) => !assignedEntityIds.has(entity.id)),
+    degreeByEntityId,
+  );
+  const entitiesByType = new Map<EntityType, EntityNode[]>();
+  for (const entity of looseEntities) {
+    entitiesByType.set(entity.type, [...(entitiesByType.get(entity.type) ?? []), entity]);
+  }
+  const activeTypes = ENTITY_TYPE_ORDER.filter((type) => entitiesByType.has(type));
+  const laneGap = 220;
+  const startY = organizations.length > 0 ? 330 : -130;
+  activeTypes.forEach((type, laneIndex) => {
+    const laneEntities = entitiesByType.get(type) ?? [];
+    const laneX = (laneIndex - (activeTypes.length - 1) / 2) * laneGap;
+    laneEntities.forEach((entity, index) => {
+      positions.set(entity.id, {
+        x: laneX + (index % 2 === 0 ? -18 : 18),
+        y: startY + Math.floor(index / 2) * 92,
+      });
+    });
+  });
+
+  return positions;
+}
+
 export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
@@ -139,6 +273,22 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
     return degrees;
   }, [graph.entities, graph.relations]);
 
+  const { membershipByOrganizationId } = useMemo(
+    () => buildOrganizationMembership(graph, entitiesById),
+    [entitiesById, graph],
+  );
+
+  const nodePositions = useMemo(
+    () =>
+      buildObsidianPositions(
+        graph,
+        entitiesById,
+        membershipByOrganizationId,
+        degreeByEntityId,
+      ),
+    [degreeByEntityId, entitiesById, graph, membershipByOrganizationId],
+  );
+
   useEffect(() => {
     if (!containerRef.current) {
       return;
@@ -152,7 +302,11 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
       }
       const elements = [
         ...graph.entities.map((entity) => {
-          const visual = entityVisual(entity, degreeByEntityId.get(entity.id) ?? 0);
+          const visual = entityVisual(
+            entity,
+            degreeByEntityId.get(entity.id) ?? 0,
+            membershipByOrganizationId.get(entity.id)?.size ?? 0,
+          );
           return {
             data: {
               id: `entity-${entity.id}`,
@@ -165,7 +319,9 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
               opacity: visual.opacity,
               size: visual.size,
               weight: visual.weight,
+              clusterSize: membershipByOrganizationId.get(entity.id)?.size ?? 0,
             },
+            position: nodePositions.get(entity.id),
           };
         }),
         ...graph.relations.map((relation) => {
@@ -185,6 +341,7 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
               color: relationTone(relation.type),
               arrowShape: isWeak ? "none" : "triangle",
               lineStyle: relation.is_recent ? "solid" : "dashed",
+              aggregate: relation.id < 0 ? "yes" : "no",
             },
           };
         }),
@@ -235,6 +392,19 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
             },
           },
           {
+            selector: "node[type = 'organization']",
+            style: {
+              shape: "round-rectangle",
+              color: "#fffdf8",
+              "font-size": 13,
+              "font-weight": 850,
+              "text-valign": "center",
+              "text-margin-y": 0,
+              "text-background-opacity": 0,
+              "text-border-opacity": 0,
+            },
+          },
+          {
             selector: "node:selected",
             style: {
               "border-width": 4,
@@ -272,6 +442,17 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
                 element.data("lineStyle") === "dashed" ? "dashed" : "solid",
               "curve-style": "bezier",
               "control-point-step-size": 42,
+            },
+          },
+          {
+            selector: "edge[aggregate = 'yes']",
+            style: {
+              width: (element: cytoscape.EdgeSingular) =>
+                2.4 + Number(element.data("strength") ?? 0.55) * 4.4,
+              opacity: 0.88,
+              "text-opacity": 0.9,
+              "line-style": "solid",
+              "z-index": 8,
             },
           },
           {
@@ -320,9 +501,13 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
 
       cyRef.current = cy;
       mountedCy = cy;
-      applyFocus(cy, selectedEntityId);
       layout = cy.layout(GRAPH_LAYOUT);
       layout.run();
+      applyFocus(cy, selectedEntityId);
+      if (selectedEntityId !== null) {
+        cy.$id(`entity-${selectedEntityId}`).select();
+        focusSelectedNode(cy, selectedEntityId);
+      }
     });
 
     return () => {
@@ -338,7 +523,7 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
         }
       }
     };
-  }, [degreeByEntityId, entitiesById, graph, onSelectEntity]);
+  }, [degreeByEntityId, entitiesById, graph, membershipByOrganizationId, nodePositions, onSelectEntity]);
 
   useEffect(() => {
     const cy = cyRef.current;
@@ -349,6 +534,7 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
     applyFocus(cy, selectedEntityId);
     if (selectedEntityId !== null) {
       cy.$id(`entity-${selectedEntityId}`).select();
+      focusSelectedNode(cy, selectedEntityId);
     }
   }, [selectedEntityId]);
 
@@ -379,7 +565,8 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
       return;
     }
     cy.layout(GRAPH_LAYOUT).run();
-  }, []);
+    applyFocus(cy, selectedEntityId);
+  }, [selectedEntityId]);
 
   if (graph.entities.length === 0) {
     return (
@@ -424,4 +611,28 @@ function applyFocus(cy: Core, selectedEntityId: number | null) {
   selected.removeClass("dimmed").addClass("spotlight");
   connectedNodes.removeClass("dimmed").addClass("spotlight");
   connectedEdges.removeClass("dimmed").addClass("spotlight");
+}
+
+function focusSelectedNode(cy: Core, selectedEntityId: number) {
+  const selected = cy.$id(`entity-${selectedEntityId}`);
+  if (selected.empty()) {
+    return;
+  }
+  const neighborhood = selected.closedNeighborhood();
+  if (neighborhood.nodes().length <= 1) {
+    cy.animate({ fit: { eles: selected, padding: 140 } }, { duration: 220, easing: "ease-out-cubic" });
+    return;
+  }
+  neighborhood
+    .layout({
+      name: "concentric",
+      fit: true,
+      padding: 108,
+      animate: true,
+      animationDuration: 240,
+      minNodeSpacing: 58,
+      concentric: (node: cytoscape.NodeSingular) => (node.id() === selected.id() ? 2 : 1),
+      levelWidth: () => 1,
+    })
+    .run();
 }

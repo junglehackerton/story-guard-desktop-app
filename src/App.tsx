@@ -6,6 +6,7 @@ import { ensureDesktopBackend, isTauriRuntime } from "./lib/desktopBackend";
 import { ENTITY_TYPE_LABELS } from "./lib/labels";
 import type {
   EntityNode,
+  EntityRelationshipDetail,
   EntityType,
   EnvironmentSetupProgress,
   EnvironmentStatus,
@@ -13,8 +14,9 @@ import type {
   GraphPayload,
   IssueStatus,
   AppSettings,
-  OllamaHealth,
+  LocalAiHealth,
   Project,
+  RelationEdge,
   StoryDocument,
 } from "./lib/types";
 import { GraphView } from "./components/GraphView";
@@ -29,8 +31,8 @@ const EMPTY_GRAPH: GraphPayload = {
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
-  generation_model: "",
-  embedding_model: "embeddinggemma",
+  generation_model: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  embedding_model: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
 };
 
 const ENTITY_TYPES: EntityType[] = [
@@ -45,6 +47,7 @@ const ENTITY_TYPES: EntityType[] = [
 
 type RelationScope = "core" | "all";
 const SELECTED_PROJECT_STORAGE_KEY = "storyGuard.selectedProjectId";
+const MEMBERSHIP_RELATION_PATTERN = /소속|조직|구성원|대표|멤버|member|leader|belongs|works/i;
 
 function strongestRelationPerPair(relations: GraphPayload["relations"]) {
   const bestByPair = new Map<string, GraphPayload["relations"][number]>();
@@ -61,6 +64,134 @@ function strongestRelationPerPair(relations: GraphPayload["relations"]) {
     (left, right) =>
       (right.strength ?? right.confidence ?? 0) - (left.strength ?? left.confidence ?? 0),
   );
+}
+
+function relationScore(relation: RelationEdge) {
+  return relation.strength ?? relation.confidence ?? 0;
+}
+
+function isCoreRelation(relation: RelationEdge) {
+  return !relation.is_weak && relation.type !== "co_occurs" && relation.confidence >= 0.68;
+}
+
+function relationName(relation: RelationEdge) {
+  return relation.display_label || (relation.type === "co_occurs" ? "동시 등장" : relation.type);
+}
+
+function isMembershipRelation(relation: RelationEdge) {
+  return MEMBERSHIP_RELATION_PATTERN.test(`${relation.type} ${relation.display_label}`);
+}
+
+function aggregateOrganizationRelations(graph: GraphPayload, scope: RelationScope): RelationEdge[] {
+  const entitiesById = new Map(graph.entities.map((entity) => [entity.id, entity]));
+  const organizationIds = new Set(
+    graph.entities.filter((entity) => entity.type === "organization").map((entity) => entity.id),
+  );
+  if (organizationIds.size < 2) {
+    return [];
+  }
+
+  const ownerOrganizationByEntityId = new Map<number, number>();
+  for (const organizationId of organizationIds) {
+    ownerOrganizationByEntityId.set(organizationId, organizationId);
+  }
+
+  for (const relation of graph.relations) {
+    if (!isMembershipRelation(relation)) {
+      continue;
+    }
+    const source = entitiesById.get(relation.source_entity_id);
+    const target = entitiesById.get(relation.target_entity_id);
+    if (!source || !target) {
+      continue;
+    }
+    if (source.type === "organization" && target.type !== "organization") {
+      ownerOrganizationByEntityId.set(target.id, source.id);
+    }
+    if (target.type === "organization" && source.type !== "organization") {
+      ownerOrganizationByEntityId.set(source.id, target.id);
+    }
+  }
+
+  const aggregateByPair = new Map<
+    string,
+    {
+      sourceId: number;
+      targetId: number;
+      count: number;
+      confidence: number;
+      strength: number;
+      isRecent: boolean;
+      evidenceChunkIds: Set<number>;
+    }
+  >();
+
+  for (const relation of graph.relations) {
+    if (scope === "core" && !isCoreRelation(relation) && !isMembershipRelation(relation)) {
+      continue;
+    }
+    const sourceOrganizationId = ownerOrganizationByEntityId.get(relation.source_entity_id);
+    const targetOrganizationId = ownerOrganizationByEntityId.get(relation.target_entity_id);
+    if (
+      !sourceOrganizationId ||
+      !targetOrganizationId ||
+      sourceOrganizationId === targetOrganizationId
+    ) {
+      continue;
+    }
+    const [leftId, rightId] = [sourceOrganizationId, targetOrganizationId].sort((left, right) => left - right);
+    const key = `${leftId}-${rightId}`;
+    const current =
+      aggregateByPair.get(key) ??
+      {
+        sourceId: leftId,
+        targetId: rightId,
+        count: 0,
+        confidence: 0,
+        strength: 0,
+        isRecent: false,
+        evidenceChunkIds: new Set<number>(),
+      };
+    current.count += 1;
+    current.confidence = Math.max(current.confidence, relation.confidence ?? 0.55);
+    current.strength = Math.max(current.strength, relationScore(relation));
+    current.isRecent ||= relation.is_recent;
+    for (const chunkId of relation.evidence_chunk_ids) {
+      current.evidenceChunkIds.add(chunkId);
+    }
+    aggregateByPair.set(key, current);
+  }
+
+  let virtualId = -1;
+  return [...aggregateByPair.values()].map((aggregate) => ({
+    id: virtualId--,
+    project_id: graph.entities[0]?.project_id ?? 0,
+    source_entity_id: aggregate.sourceId,
+    target_entity_id: aggregate.targetId,
+    type: "조직 간접 관계",
+    confidence: Math.min(0.95, Math.max(0.7, aggregate.confidence)),
+    evidence_chunk_ids: [...aggregate.evidenceChunkIds].slice(0, 8),
+    strength: Math.min(0.96, 0.48 + Math.log2(aggregate.count + 1) * 0.14 + aggregate.strength * 0.22),
+    is_weak: false,
+    is_recent: aggregate.isRecent,
+    display_label: `하위 관계 ${aggregate.count}개`,
+  }));
+}
+
+function buildRelationshipExplanation(
+  entity: EntityNode,
+  other: EntityNode,
+  relation: RelationEdge,
+  direction: EntityRelationshipDetail["direction"],
+) {
+  const sourceName = direction === "outgoing" ? entity.name : other.name;
+  const targetName = direction === "outgoing" ? other.name : entity.name;
+  const confidence = Math.round((relation.confidence ?? 0) * 100);
+  const strength = Math.round(relationScore(relation) * 100);
+  const recency = relation.is_recent ? "최근 원고에서도 유지" : "이전 원고 근거 중심";
+  const evidenceCount = relation.evidence_chunk_ids.length;
+  const evidence = evidenceCount > 0 ? `, 근거 chunk ${evidenceCount}개` : "";
+  return `${sourceName} -> ${targetName}: ${relationName(relation)}. 신뢰도 ${confidence}%, 관계 강도 ${strength}%. ${recency}${evidence}.`;
 }
 
 export default function App() {
@@ -80,7 +211,7 @@ export default function App() {
     () => new Set(ENTITY_TYPES),
   );
   const [evidenceByIssueId, setEvidenceByIssueId] = useState<Record<number, EvidenceChunk[]>>({});
-  const [ollama, setOllama] = useState<OllamaHealth | null>(null);
+  const [localAi, setLocalAi] = useState<LocalAiHealth | null>(null);
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [setupStatus, setSetupStatus] = useState<EnvironmentStatus | null>(null);
   const [setupProgress, setSetupProgress] = useState<EnvironmentSetupProgress | null>(null);
@@ -96,17 +227,22 @@ export default function App() {
   const filteredGraph = useMemo(() => {
     const entities = graph.entities.filter((entity) => visibleTypes.has(entity.type));
     const visibleIds = new Set(entities.map((entity) => entity.id));
-    const relations = graph.relations
+    const directRelations = graph.relations
       .filter(
         (relation) =>
           visibleIds.has(relation.source_entity_id) && visibleIds.has(relation.target_entity_id),
       )
-      .filter((relation) => {
-        if (relationScope === "all") {
-          return true;
-        }
-        return !relation.is_weak && relation.type !== "co_occurs" && relation.confidence >= 0.68;
-      });
+      .filter(
+        (relation) =>
+          relationScope === "all" || isCoreRelation(relation) || isMembershipRelation(relation),
+      );
+    const organizationOnly =
+      entities.length > 0 && [...visibleTypes].every((type) => type === "organization");
+    const organizationRelations = organizationOnly ? aggregateOrganizationRelations(graph, relationScope) : [];
+    const relations = [...directRelations, ...organizationRelations].filter(
+      (relation) =>
+        visibleIds.has(relation.source_entity_id) && visibleIds.has(relation.target_entity_id),
+    );
     const scopedRelations =
       relationScope === "core" ? strongestRelationPerPair(relations).slice(0, 46) : relations;
     let scopedEntities = entities;
@@ -125,15 +261,47 @@ export default function App() {
     };
   }, [graph, relationScope, visibleTypes]);
 
-  const refreshOllama = useCallback(async () => {
+  const selectedRelationshipDetails = useMemo<EntityRelationshipDetail[]>(() => {
+    if (!selectedEntity) {
+      return [];
+    }
+    const entitiesById = new Map(filteredGraph.entities.map((entity) => [entity.id, entity]));
+    return filteredGraph.relations
+      .filter(
+        (relation) =>
+          relation.source_entity_id === selectedEntity.id ||
+          relation.target_entity_id === selectedEntity.id,
+      )
+      .map((relation) => {
+        const direction = relation.source_entity_id === selectedEntity.id ? "outgoing" : "incoming";
+        const otherEntityId =
+          direction === "outgoing" ? relation.target_entity_id : relation.source_entity_id;
+        const other = entitiesById.get(otherEntityId);
+        if (!other) {
+          return null;
+        }
+        return {
+          relation,
+          other,
+          direction,
+          explanation: buildRelationshipExplanation(selectedEntity, other, relation, direction),
+        };
+      })
+      .filter((detail): detail is EntityRelationshipDetail => detail !== null)
+      .sort((left, right) => relationScore(right.relation) - relationScore(left.relation))
+      .slice(0, 12);
+  }, [filteredGraph, selectedEntity]);
+
+  const refreshLocalAi = useCallback(async () => {
     try {
-      setOllama(await api.ollamaHealth());
+      setLocalAi(await api.localAiHealth());
     } catch (error) {
-      setOllama({
+      setLocalAi({
         ok: false,
-        base_url: "http://localhost:11434/api",
-        message: error instanceof Error ? error.message : "Ollama 상태 확인 실패",
+        runtime: "story-guard-local",
+        message: error instanceof Error ? error.message : "Local AI 상태 확인 실패",
         models: [],
+        model_dir: "",
       });
     }
   }, []);
@@ -190,7 +358,7 @@ export default function App() {
       const nextSelectedProject = await refreshProjects();
       await Promise.all([
         refreshProjectData(nextSelectedProject),
-        refreshOllama(),
+        refreshLocalAi(),
         refreshSettings(),
         refreshSetup(),
       ]);
@@ -198,7 +366,7 @@ export default function App() {
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "백엔드 연결 실패");
     }
-  }, [refreshOllama, refreshProjectData, refreshProjects, refreshSettings, refreshSetup]);
+  }, [refreshLocalAi, refreshProjectData, refreshProjects, refreshSettings, refreshSetup]);
 
   useEffect(() => {
     void refreshAll();
@@ -210,6 +378,15 @@ export default function App() {
   }, [selectedProject?.id, selectedProject?.title]);
 
   useEffect(() => {
+    if (
+      selectedEntity &&
+      !filteredGraph.entities.some((entity) => entity.id === selectedEntity.id)
+    ) {
+      setSelectedEntity(null);
+    }
+  }, [filteredGraph.entities, selectedEntity]);
+
+  useEffect(() => {
     if (!setupProgress?.running) {
       return;
     }
@@ -217,12 +394,12 @@ export default function App() {
       void api.setupProgress().then(async (progress) => {
         setSetupProgress(progress);
         if (!progress.running) {
-          await Promise.all([refreshSetup(), refreshOllama(), refreshSettings()]);
+          await Promise.all([refreshSetup(), refreshLocalAi(), refreshSettings()]);
         }
       });
     }, 2000);
     return () => window.clearInterval(intervalId);
-  }, [refreshOllama, refreshSettings, refreshSetup, setupProgress?.running]);
+  }, [refreshLocalAi, refreshSettings, refreshSetup, setupProgress?.running]);
 
   useEffect(() => {
     const issueIds = graph.issues.map((issue) => issue.id);
@@ -441,7 +618,7 @@ export default function App() {
         generation_model: model,
       });
       setSettings(updated);
-      setNotice(model ? `생성 모델 저장: ${model}` : "생성 모델을 휴리스틱 fallback으로 설정했습니다.");
+      setNotice(`생성 모델 저장: ${updated.generation_model}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "설정 저장 실패");
     }
@@ -451,12 +628,14 @@ export default function App() {
     try {
       setNotice("로컬 AI 모델을 준비합니다.");
       const progress = await api.runSetup({
-        install_ollama: false,
-        pull_embedding_model: true,
-        pull_generation_model: true,
+        install_runtime: false,
+        prepare_embedding_model: true,
+        prepare_generation_model: true,
         embedding_model: setupStatus?.embedding_model ?? settings.embedding_model,
         generation_model:
-          settings.generation_model || setupStatus?.generation_model || "qwen2.5:3b",
+          settings.generation_model ||
+          setupStatus?.generation_model ||
+          "qwen2.5-1.5b-instruct-q4_k_m.gguf",
       });
       setSetupProgress(progress);
     } catch (error) {
@@ -466,7 +645,7 @@ export default function App() {
 
   async function refreshEnvironmentSetup() {
     try {
-      await Promise.all([refreshSetup(), refreshOllama(), refreshSettings()]);
+      await Promise.all([refreshSetup(), refreshLocalAi(), refreshSettings()]);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "환경 상태 확인 실패");
     }
@@ -478,13 +657,14 @@ export default function App() {
         projects={projects}
         selectedProject={selectedProject}
         documents={documents}
-        ollama={ollama}
+        localAi={localAi}
         settings={settings}
         loading={loading}
         onCreateProject={createProject}
         onSelectProject={selectProject}
         onImportDocument={importDocument}
         onAnalyze={analyze}
+        aiReady={setupStatus?.ready ?? false}
         onRefresh={refreshAll}
         onGenerationModelChange={updateGenerationModel}
         onDeleteDocument={deleteDocument}
@@ -581,6 +761,7 @@ export default function App() {
       </main>
       <Inspector
         entity={selectedEntity}
+        relationships={selectedRelationshipDetails}
         issues={openIssues}
         evidenceByIssueId={evidenceByIssueId}
         onIssueStatus={updateIssueStatus}

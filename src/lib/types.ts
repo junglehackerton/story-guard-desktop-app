@@ -94,11 +94,19 @@ export interface GraphPayload {
   issues: ContinuityIssue[];
 }
 
-export interface OllamaHealth {
+export interface EntityRelationshipDetail {
+  relation: RelationEdge;
+  other: EntityNode;
+  direction: "outgoing" | "incoming";
+  explanation: string;
+}
+
+export interface LocalAiHealth {
   ok: boolean;
-  base_url: string;
+  runtime: string;
   message: string;
   models: string[];
+  model_dir: string;
 }
 
 export interface AppSettings {
@@ -108,8 +116,9 @@ export interface AppSettings {
 
 export interface EnvironmentStatus {
   platform: string;
-  ollama_installed: boolean;
-  ollama_running: boolean;
+  runtime_installed: boolean;
+  runtime_running: boolean;
+  model_dir: string;
   embedding_model: string;
   generation_model: string;
   embedding_model_ready: boolean;
@@ -122,9 +131,9 @@ export interface EnvironmentStatus {
 }
 
 export interface EnvironmentSetupRequest {
-  install_ollama: boolean;
-  pull_embedding_model: boolean;
-  pull_generation_model: boolean;
+  install_runtime: boolean;
+  prepare_embedding_model: boolean;
+  prepare_generation_model: boolean;
   embedding_model: string;
   generation_model: string;
 }

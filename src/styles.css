@@ -139,11 +139,11 @@ select:focus-visible {
 .brand p,
 .muted,
 .document-row span,
-.ollama-status span {
+.runtime-status span {
   color: #b7aa9b;
 }
 
-.ollama-status,
+.runtime-status,
 .settings-panel {
   display: grid;
   gap: 8px;
@@ -153,20 +153,20 @@ select:focus-visible {
   background: rgba(255, 255, 255, 0.055);
 }
 
-.ollama-status strong {
+.runtime-status strong {
   font-size: 13px;
 }
 
-.ollama-status span {
+.runtime-status span {
   font-size: 12px;
   line-height: 1.45;
 }
 
-.ollama-status.ok strong {
+.runtime-status.ok strong {
   color: #95c8a6;
 }
 
-.ollama-status.warn strong {
+.runtime-status.warn strong {
   color: #e4b567;
 }
 
@@ -753,6 +753,51 @@ select:focus-visible {
   background: var(--paper-muted);
   font-size: 12px;
   font-weight: 800;
+}
+
+.entity-relations {
+  display: grid;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.entity-relations-title,
+.entity-relation-card > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.entity-relations-title strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.entity-relations-title span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.entity-relation-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 253, 248, 0.78);
+}
+
+.entity-relation-card > div {
+  justify-content: flex-start;
+}
+
+.entity-relation-card strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--ink);
+  font-size: 13px;
 }
 
 .entity-type {

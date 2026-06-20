@@ -136,22 +136,24 @@ class AnalysisJob(BaseModel):
     updated_at: str
 
 
-class OllamaHealth(BaseModel):
+class LocalAiHealth(BaseModel):
     ok: bool
-    base_url: str
+    runtime: str
     message: str
     models: list[str] = []
+    model_dir: str = ""
 
 
 class AppSettings(BaseModel):
-    generation_model: str = ""
-    embedding_model: str = "embeddinggemma"
+    generation_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    embedding_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 
 
 class EnvironmentStatus(BaseModel):
     platform: str
-    ollama_installed: bool
-    ollama_running: bool
+    runtime_installed: bool
+    runtime_running: bool
+    model_dir: str
     embedding_model: str
     generation_model: str
     embedding_model_ready: bool
@@ -164,11 +166,11 @@ class EnvironmentStatus(BaseModel):
 
 
 class EnvironmentSetupRequest(BaseModel):
-    install_ollama: bool = False
-    pull_embedding_model: bool = True
-    pull_generation_model: bool = True
-    embedding_model: str = "embeddinggemma"
-    generation_model: str = "qwen2.5:3b"
+    install_runtime: bool = False
+    prepare_embedding_model: bool = True
+    prepare_generation_model: bool = True
+    embedding_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    generation_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 
 
 class EnvironmentSetupProgress(BaseModel):
