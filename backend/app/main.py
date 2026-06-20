@@ -3,18 +3,22 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import threading
+import time
 from pathlib import Path
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 os.environ.setdefault("CHROMA_TELEMETRY", "False")
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from backend.app.config import chroma_path, database_path, models_path
 from backend.app.database import Database
 from backend.app.models import (
+    AnalysisJob,
+    AnalysisStatus,
     AppSettings,
     ContinuityIssue,
     DocumentDeleteResult,
@@ -28,6 +32,7 @@ from backend.app.models import (
     LocalAiHealth,
     Project,
     ProjectCreate,
+    ProjectDeleteResult,
     ProjectUpdate,
     StoryDocument,
 )
@@ -110,6 +115,51 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/health/ready")
+def authenticated_health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.post("/shutdown")
+def shutdown(background_tasks: BackgroundTasks) -> dict[str, str]:
+    background_tasks.add_task(shutdown_process)
+    return {"status": "stopping"}
+
+
+def shutdown_process() -> None:
+    time.sleep(0.2)
+    os._exit(0)
+
+
+def start_parent_process_monitor() -> None:
+    parent_pid = os.getenv("STORY_GUARD_PARENT_PID", "").strip()
+    if not parent_pid:
+        return
+    try:
+        pid = int(parent_pid)
+    except ValueError:
+        return
+    monitor = threading.Thread(target=monitor_parent_process, args=(pid,), daemon=True)
+    monitor.start()
+
+
+def monitor_parent_process(parent_pid: int) -> None:
+    while True:
+        time.sleep(1.0)
+        if not process_exists(parent_pid):
+            os._exit(0)
+
+
+def process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 @app.get("/settings", response_model=AppSettings)
 def get_settings() -> AppSettings:
     return load_environment_settings()
@@ -149,10 +199,7 @@ def create_project(payload: ProjectCreate) -> Project:
 
 @app.get("/projects", response_model=list[Project])
 def list_projects() -> list[Project]:
-    projects = repository.list_projects()
-    if projects:
-        return projects
-    return [repository.create_project("새 작품")]
+    return repository.list_projects()
 
 
 @app.patch("/projects/{project_id}", response_model=Project)
@@ -164,6 +211,19 @@ def update_project(project_id: int, payload: ProjectUpdate) -> Project:
         return repository.update_project_title(project_id, title)
     except KeyError as error:
         raise HTTPException(status_code=404, detail="작품을 찾을 수 없습니다.") from error
+
+
+@app.delete("/projects/{project_id}", response_model=ProjectDeleteResult)
+def delete_project(project_id: int) -> ProjectDeleteResult:
+    try:
+        deleted_project_id = repository.delete_project(project_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="작품을 찾을 수 없습니다.") from error
+    try:
+        RagService(chroma_path()).delete_project_index(project_id)
+    except Exception:
+        pass
+    return ProjectDeleteResult(project_id=deleted_project_id)
 
 
 @app.post("/documents/import", response_model=StoryDocument)
@@ -243,6 +303,28 @@ def analyze_project(project_id: int) -> dict[str, int]:
     }
 
 
+@app.get("/projects/{project_id}/analysis/status", response_model=AnalysisJob)
+def analysis_status(project_id: int) -> AnalysisJob:
+    job = repository.latest_analysis_job(project_id)
+    if job is not None:
+        return job
+    return AnalysisJob(
+        id=0,
+        project_id=project_id,
+        status=AnalysisStatus.idle,
+        current_step="idle",
+        progress=0,
+        message="분석 대기 중입니다.",
+        created_at="",
+        updated_at="",
+    )
+
+
+@app.post("/projects/{project_id}/analysis/cancel", response_model=AnalysisJob)
+def cancel_analysis(project_id: int) -> AnalysisJob:
+    return repository.cancel_analysis(project_id)
+
+
 @app.get("/projects/{project_id}/graph", response_model=GraphPayload)
 def project_graph(project_id: int) -> GraphPayload:
     return repository.graph(project_id)
@@ -274,6 +356,8 @@ def issue_evidence(issue_id: int) -> list[EvidenceChunk]:
 def main() -> None:
     import uvicorn
 
+    start_parent_process_monitor()
+    repository.mark_running_jobs_interrupted()
     port = int(os.getenv("STORY_GUARD_BACKEND_PORT", "8765"))
     uvicorn.run("backend.app.main:app", host="127.0.0.1", port=port, reload=False)
 

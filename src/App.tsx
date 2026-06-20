@@ -1,8 +1,10 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
-import { Check, Pencil, X } from "lucide-react";
+import { Check, Pencil, Trash2, X } from "lucide-react";
 import { api } from "./lib/api";
 import { ensureDesktopBackend, isTauriRuntime } from "./lib/desktopBackend";
+import { clearGraphPositions } from "./lib/graphLayoutStorage";
+import { isMembershipRelation } from "./lib/graphMembership";
 import { ENTITY_TYPE_LABELS } from "./lib/labels";
 import type {
   EntityNode,
@@ -13,6 +15,7 @@ import type {
   EvidenceChunk,
   GraphPayload,
   IssueStatus,
+  AnalysisJob,
   AppSettings,
   LocalAiHealth,
   Project,
@@ -23,6 +26,8 @@ import { GraphView } from "./components/GraphView";
 import { Inspector } from "./components/Inspector";
 import { Sidebar } from "./components/Sidebar";
 import { SetupPanel } from "./components/SetupPanel";
+import { StartupLoader, type StartupStatus } from "./components/StartupLoader";
+import { AnalysisProgressPanel } from "./components/AnalysisProgressPanel";
 
 const EMPTY_GRAPH: GraphPayload = {
   entities: [],
@@ -47,7 +52,45 @@ const ENTITY_TYPES: EntityType[] = [
 
 type RelationScope = "core" | "all";
 const SELECTED_PROJECT_STORAGE_KEY = "storyGuard.selectedProjectId";
-const MEMBERSHIP_RELATION_PATTERN = /소속|조직|구성원|대표|멤버|member|leader|belongs|works/i;
+const INITIAL_STARTUP_STATUS: StartupStatus = {
+  visible: true,
+  mode: "loading",
+  message: "백엔드 시작 중",
+  detail: "로컬 API와 앱 데이터 폴더를 확인하고 있습니다.",
+  progress: 12,
+};
+
+function makePendingAnalysisJob(projectId: number): AnalysisJob {
+  const timestamp = new Date().toISOString();
+  return {
+    id: 0,
+    project_id: projectId,
+    status: "running",
+    current_step: "prepare",
+    progress: 5,
+    message: "분석 요청을 보냈습니다.",
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
+}
+
+function makeFailedAnalysisJob(projectId: number, message: string): AnalysisJob {
+  const timestamp = new Date().toISOString();
+  return {
+    id: 0,
+    project_id: projectId,
+    status: "failed",
+    current_step: "failed",
+    progress: 100,
+    message,
+    created_at: timestamp,
+    updated_at: timestamp,
+  };
+}
+
+function isAnalysisRunning(job: AnalysisJob | null) {
+  return job?.status === "running";
+}
 
 function strongestRelationPerPair(relations: GraphPayload["relations"]) {
   const bestByPair = new Map<string, GraphPayload["relations"][number]>();
@@ -76,10 +119,6 @@ function isCoreRelation(relation: RelationEdge) {
 
 function relationName(relation: RelationEdge) {
   return relation.display_label || (relation.type === "co_occurs" ? "동시 등장" : relation.type);
-}
-
-function isMembershipRelation(relation: RelationEdge) {
-  return MEMBERSHIP_RELATION_PATTERN.test(`${relation.type} ${relation.display_label}`);
 }
 
 function aggregateOrganizationRelations(graph: GraphPayload, scope: RelationScope): RelationEdge[] {
@@ -215,9 +254,12 @@ export default function App() {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [setupStatus, setSetupStatus] = useState<EnvironmentStatus | null>(null);
   const [setupProgress, setSetupProgress] = useState<EnvironmentSetupProgress | null>(null);
+  const [analysisJob, setAnalysisJob] = useState<AnalysisJob | null>(null);
   const [loading, setLoading] = useState(false);
   const [notice, setNotice] = useState("백엔드 연결을 확인하는 중입니다.");
+  const [startupStatus, setStartupStatus] = useState<StartupStatus>(INITIAL_STARTUP_STATUS);
   const dataRequestIdRef = useRef(0);
+  const startupActiveRef = useRef(true);
 
   const openIssues = useMemo(
     () => graph.issues.filter((issue) => issue.status !== "ignored"),
@@ -329,13 +371,16 @@ export default function App() {
   const refreshProjects = useCallback(async (preferredProjectId?: number | null) => {
     const nextProjects = await api.listProjects();
     const storedProjectId = Number(window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY) ?? 0);
-    const targetProjectId = preferredProjectId ?? selectedProject?.id ?? storedProjectId;
+    const targetProjectId =
+      preferredProjectId === undefined ? selectedProject?.id ?? storedProjectId : preferredProjectId;
     const nextSelected =
       nextProjects.find((project) => project.id === targetProjectId) ?? nextProjects[0] ?? null;
     setProjects(nextProjects);
     setSelectedProject(nextSelected);
     if (nextSelected) {
       window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, String(nextSelected.id));
+    } else {
+      window.localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
     }
     return nextSelected;
   }, [selectedProject?.id]);
@@ -351,22 +396,91 @@ export default function App() {
     return status;
   }, []);
 
+  const updateStartup = useCallback((message: string, detail: string, progress: number) => {
+    if (!startupActiveRef.current) {
+      return;
+    }
+    setStartupStatus({
+      visible: true,
+      mode: "loading",
+      message,
+      detail,
+      progress,
+    });
+  }, []);
+
+  const completeStartup = useCallback(() => {
+    if (!startupActiveRef.current) {
+      return;
+    }
+    startupActiveRef.current = false;
+    setStartupStatus((status) => ({
+      ...status,
+      visible: false,
+      progress: 100,
+      message: "준비 완료",
+      detail: "작업실을 열었습니다.",
+    }));
+  }, []);
+
+  const failStartup = useCallback((message: string) => {
+    if (!startupActiveRef.current) {
+      return;
+    }
+    setStartupStatus({
+      visible: true,
+      mode: "error",
+      message: "초기 로딩 실패",
+      detail: message,
+      progress: 100,
+    });
+  }, []);
+
   const refreshAll = useCallback(async () => {
+    const showStartup = startupActiveRef.current;
     try {
+      if (showStartup) {
+        updateStartup("백엔드 시작 중", "로컬 API와 앱 데이터 폴더를 확인하고 있습니다.", 18);
+      }
       const backendMessage = await ensureDesktopBackend();
       setNotice(backendMessage);
+      if (showStartup) {
+        updateStartup("Local AI 확인 중", "로컬 LLM 런타임과 모델 파일을 확인하고 있습니다.", 52);
+      }
+      const localAiPromise = refreshLocalAi();
+      const settingsPromise = refreshSettings();
+      const setupPromise = refreshSetup();
+      if (showStartup) {
+        updateStartup("작품 데이터 불러오는 중", "최근 작품, 원고, 그래프 데이터를 준비하고 있습니다.", 74);
+      }
       const nextSelectedProject = await refreshProjects();
       await Promise.all([
+        localAiPromise,
+        settingsPromise,
+        setupPromise,
         refreshProjectData(nextSelectedProject),
-        refreshLocalAi(),
-        refreshSettings(),
-        refreshSetup(),
       ]);
       setNotice("준비 완료");
+      if (showStartup) {
+        completeStartup();
+      }
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "백엔드 연결 실패");
+      const message = error instanceof Error ? error.message : "백엔드 연결 실패";
+      setNotice(message);
+      if (showStartup) {
+        failStartup(message);
+      }
     }
-  }, [refreshLocalAi, refreshProjectData, refreshProjects, refreshSettings, refreshSetup]);
+  }, [
+    completeStartup,
+    failStartup,
+    refreshLocalAi,
+    refreshProjectData,
+    refreshProjects,
+    refreshSettings,
+    refreshSetup,
+    updateStartup,
+  ]);
 
   useEffect(() => {
     void refreshAll();
@@ -400,6 +514,36 @@ export default function App() {
     }, 2000);
     return () => window.clearInterval(intervalId);
   }, [refreshLocalAi, refreshSettings, refreshSetup, setupProgress?.running]);
+
+  useEffect(() => {
+    if (
+      !selectedProject ||
+      analysisJob?.status !== "running" ||
+      analysisJob.project_id !== selectedProject.id
+    ) {
+      return;
+    }
+    let cancelled = false;
+    const projectId = selectedProject.id;
+    const loadAnalysisStatus = async () => {
+      try {
+        const nextJob = await api.analysisStatus(projectId);
+        if (!cancelled) {
+          setAnalysisJob(nextJob);
+        }
+      } catch {
+        // The analyze request keeps the visible failure message if polling misses once.
+      }
+    };
+    const intervalId = window.setInterval(() => {
+      void loadAnalysisStatus();
+    }, 900);
+    void loadAnalysisStatus();
+    return () => {
+      cancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [analysisJob?.project_id, analysisJob?.status, selectedProject]);
 
   useEffect(() => {
     const issueIds = graph.issues.map((issue) => issue.id);
@@ -444,6 +588,7 @@ export default function App() {
     setSelectedEntity(null);
     setDocuments([]);
     setGraph(EMPTY_GRAPH);
+    setAnalysisJob(null);
     void refreshProjectData(project);
   }
 
@@ -467,6 +612,7 @@ export default function App() {
       setDocuments([]);
       setGraph(EMPTY_GRAPH);
       setSelectedEntity(null);
+      setAnalysisJob(null);
       setProjectModalOpen(false);
       setNewProjectTitle("");
       setNotice(`작품 생성: ${project.title}`);
@@ -502,6 +648,37 @@ export default function App() {
     }
   }
 
+  async function deleteSelectedProject() {
+    if (!selectedProject) {
+      return;
+    }
+    const confirmed = window.confirm(
+      `'${selectedProject.title}' 작품을 삭제할까요?\n이 작품의 원고, 청크, 엔티티, 관계, 이슈가 모두 삭제됩니다.`,
+    );
+    if (!confirmed) {
+      return;
+    }
+    const deletedProject = selectedProject;
+    setLoading(true);
+    try {
+      await api.deleteProject(deletedProject.id);
+      clearGraphPositions(deletedProject.id);
+      window.localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
+      setSelectedProject(null);
+      setDocuments([]);
+      setGraph(EMPTY_GRAPH);
+      setSelectedEntity(null);
+      setAnalysisJob(null);
+      const nextSelectedProject = await refreshProjects(null);
+      await refreshProjectData(nextSelectedProject);
+      setNotice(`작품 삭제: ${deletedProject.title}`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "작품 삭제 실패");
+    } finally {
+      setLoading(false);
+    }
+  }
+
   async function importDocumentPath(path: string) {
     if (!selectedProject) {
       return false;
@@ -519,6 +696,7 @@ export default function App() {
       );
       setGraph(EMPTY_GRAPH);
       setSelectedEntity(null);
+      setAnalysisJob(null);
       setNotice(`원고 추가: ${document.title} · 분석을 다시 실행하세요.`);
       void refreshProjectData(selectedProject);
       return true;
@@ -571,6 +749,7 @@ export default function App() {
       setDocuments((current) => current.filter((item) => item.id !== document.id));
       setGraph(EMPTY_GRAPH);
       setSelectedEntity(null);
+      setAnalysisJob(null);
       await refreshProjectData(selectedProject);
       setNotice(`원고 삭제: ${document.title}`);
     } catch (error) {
@@ -584,16 +763,32 @@ export default function App() {
     if (!selectedProject) {
       return;
     }
+    const project = selectedProject;
     setLoading(true);
-    setNotice("분석 중입니다.");
+    setAnalysisJob(makePendingAnalysisJob(project.id));
+    setNotice("LLM 분석을 시작합니다.");
     try {
-      const result = await api.analyzeProject(selectedProject.id);
-      await refreshProjectData(selectedProject);
+      const analyzePromise = api.analyzeProject(project.id);
+      await api.analysisStatus(project.id).then(setAnalysisJob).catch(() => undefined);
+      const result = await analyzePromise;
+      const latestJob = await api.analysisStatus(project.id).catch(() => null);
+      if (latestJob) {
+        setAnalysisJob(latestJob);
+      }
+      await refreshProjectData(project);
       setNotice(
         `분석 완료: 엔티티 ${result.entity_count}개, 관계 ${result.relation_count}개, 이슈 ${result.issue_count}개`,
       );
+      window.setTimeout(() => {
+        setAnalysisJob((current) =>
+          current?.project_id === project.id && current.status === "completed" ? null : current,
+        );
+      }, 1800);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "분석 실패");
+      const message = error instanceof Error ? error.message : "분석 실패";
+      const latestJob = await api.analysisStatus(project.id).catch(() => null);
+      setAnalysisJob(latestJob ?? makeFailedAnalysisJob(project.id, message));
+      setNotice(message);
     } finally {
       setLoading(false);
     }
@@ -651,6 +846,12 @@ export default function App() {
     }
   }
 
+  function retryStartup() {
+    startupActiveRef.current = true;
+    setStartupStatus(INITIAL_STARTUP_STATUS);
+    void refreshAll();
+  }
+
   return (
     <div className="app-shell">
       <Sidebar
@@ -700,14 +901,25 @@ export default function App() {
               <div className="project-title-row">
                 <h2>{selectedProject?.title ?? "작품 없음"}</h2>
                 {selectedProject && (
-                  <button
-                    className="icon-button"
-                    type="button"
-                    title="작품 제목 편집"
-                    onClick={() => setEditingProjectTitle(true)}
-                  >
-                    <Pencil size={16} />
-                  </button>
+                  <>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      title="작품 제목 편집"
+                      onClick={() => setEditingProjectTitle(true)}
+                    >
+                      <Pencil size={16} />
+                    </button>
+                    <button
+                      className="icon-button danger"
+                      type="button"
+                      title="작품 삭제"
+                      onClick={deleteSelectedProject}
+                      disabled={loading}
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </>
                 )}
               </div>
             )}
@@ -725,6 +937,9 @@ export default function App() {
             onStart={startEnvironmentSetup}
             onRefresh={refreshEnvironmentSetup}
           />
+        )}
+        {analysisJob && analysisJob.status !== "idle" && (
+          <AnalysisProgressPanel job={analysisJob} />
         )}
         <div className="graph-controls">
           <div className="relation-scope" aria-label="관계 표시 범위">
@@ -754,6 +969,7 @@ export default function App() {
           ))}
         </div>
         <GraphView
+          projectId={selectedProject?.id ?? null}
           graph={filteredGraph}
           selectedEntityId={selectedEntity?.id ?? null}
           onSelectEntity={setSelectedEntity}
@@ -766,6 +982,7 @@ export default function App() {
         evidenceByIssueId={evidenceByIssueId}
         onIssueStatus={updateIssueStatus}
       />
+      <StartupLoader status={startupStatus} onRetry={retryStartup} />
       {projectModalOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setProjectModalOpen(false)}>
           <form

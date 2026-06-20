@@ -74,9 +74,19 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   status TEXT NOT NULL,
+  current_step TEXT NOT NULL DEFAULT 'queued',
+  progress INTEGER NOT NULL DEFAULT 0,
   message TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS document_analysis_cache (
+  document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  content_hash TEXT NOT NULL,
+  payload TEXT NOT NULL,
+  analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -106,6 +116,32 @@ class Database:
     def initialize(self) -> None:
         with sqlite3.connect(self.db_path) as connection:
             connection.executescript(SCHEMA)
+            ensure_column(
+                connection,
+                "analysis_jobs",
+                "current_step",
+                "TEXT NOT NULL DEFAULT 'queued'",
+            )
+            ensure_column(
+                connection,
+                "analysis_jobs",
+                "progress",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+
+
+def ensure_column(
+    connection: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    column_definition: str,
+) -> None:
+    columns = {
+        str(row[1])
+        for row in connection.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    if column_name not in columns:
+        connection.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_definition}")
 
 
 def encode_json(value: object) -> str:

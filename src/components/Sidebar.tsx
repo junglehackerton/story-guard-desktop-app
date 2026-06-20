@@ -46,7 +46,7 @@ export function Sidebar({
 
       <div className={`runtime-status ${localAi?.ok ? "ok" : "warn"}`}>
         <strong>Local AI</strong>
-        <span>{localAi?.message ?? "확인 중"}</span>
+        <span>{localAi?.message ?? "백엔드 시작 중"}</span>
       </div>
 
       <div className="settings-panel">

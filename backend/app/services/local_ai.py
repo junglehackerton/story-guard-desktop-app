@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from functools import lru_cache
+import os
 from pathlib import Path
 
 import httpx
@@ -54,12 +56,38 @@ def default_model_path(model_dir: Path | None = None) -> Path:
     return (model_dir or local_models_dir()) / DEFAULT_GENERATION_MODEL
 
 
+@lru_cache(maxsize=1)
 def llama_cpp_available() -> bool:
     try:
         import llama_cpp  # noqa: F401
     except Exception:
         return False
     return True
+
+
+@lru_cache(maxsize=1)
+def llama_supports_gpu_offload() -> bool:
+    try:
+        import llama_cpp
+    except Exception:
+        return False
+    support_check = getattr(llama_cpp, "llama_supports_gpu_offload", None)
+    if support_check is None:
+        return False
+    try:
+        return bool(support_check())
+    except Exception:
+        return False
+
+
+def llama_gpu_layer_count() -> int:
+    if not llama_supports_gpu_offload():
+        return 0
+    raw_value = os.getenv("STORY_GUARD_GPU_LAYERS", "-1").strip()
+    try:
+        return int(raw_value)
+    except ValueError:
+        return -1
 
 
 def download_default_model(
@@ -183,6 +211,7 @@ class LocalLlmEmbeddings:
             embedding=True,
             n_ctx=2048,
             n_threads=4,
+            n_gpu_layers=llama_gpu_layer_count(),
             verbose=False,
         )
         self._llm_cache[cache_key] = llm

@@ -1,4 +1,5 @@
 import type {
+  AnalysisJob,
   AppSettings,
   ContinuityIssue,
   DocumentDeleteResult,
@@ -10,6 +11,7 @@ import type {
   IssueStatus,
   LocalAiHealth,
   Project,
+  ProjectDeleteResult,
   StoryDocument,
 } from "./types";
 
@@ -39,6 +41,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   health: () => request<{ status: string }>("/health"),
+  ready: () => request<{ status: string }>("/health/ready"),
+  shutdown: () => request<{ status: string }>("/shutdown", { method: "POST" }),
   settings: () => request<AppSettings>("/settings"),
   updateSettings: (settings: AppSettings) =>
     request<AppSettings>("/settings", {
@@ -64,6 +68,10 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify({ title }),
     }),
+  deleteProject: (projectId: number) =>
+    request<ProjectDeleteResult>(`/projects/${projectId}`, {
+      method: "DELETE",
+    }),
   importDocument: (projectId: number, path: string) =>
     request<StoryDocument>("/documents/import", {
       method: "POST",
@@ -80,6 +88,12 @@ export const api = {
       `/projects/${projectId}/analyze`,
       { method: "POST" },
     ),
+  analysisStatus: (projectId: number) =>
+    request<AnalysisJob>(`/projects/${projectId}/analysis/status`),
+  cancelAnalysis: (projectId: number) =>
+    request<AnalysisJob>(`/projects/${projectId}/analysis/cancel`, {
+      method: "POST",
+    }),
   graph: (projectId: number) => request<GraphPayload>(`/projects/${projectId}/graph`),
   updateIssueStatus: (issueId: number, status: IssueStatus) =>
     request<ContinuityIssue>(`/issues/${issueId}/status`, {

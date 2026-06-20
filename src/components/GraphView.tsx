@@ -1,6 +1,13 @@
 import cytoscape, { Core } from "cytoscape";
-import { Maximize2, ZoomIn, ZoomOut } from "lucide-react";
+import { Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { buildOrganizationMembership, isMembershipRelation } from "../lib/graphMembership";
+import {
+  clearGraphPositions,
+  readGraphPositions,
+  type GraphPosition,
+  writeGraphPositions,
+} from "../lib/graphLayoutStorage";
 import type { EntityNode, EntityType, GraphPayload, RelationEdge } from "../lib/types";
 
 const ENTITY_COLORS: Record<string, { fill: string; border: string }> = {
@@ -17,8 +24,16 @@ const GRAPH_LAYOUT: cytoscape.LayoutOptions = {
   name: "preset",
   animate: false,
   fit: true,
-  padding: 86,
+  padding: 96,
 };
+
+export const MEMBERSHIP_EDGE_STYLE = {
+  opacity: 0.48,
+  "text-opacity": 0,
+  "line-style": "dotted",
+  width: 2.1,
+  "z-index": 6,
+} as const;
 
 const ENTITY_TYPE_ORDER: EntityType[] = [
   "character",
@@ -29,11 +44,8 @@ const ENTITY_TYPE_ORDER: EntityType[] = [
   "rule",
   "foreshadowing",
 ];
-const MEMBERSHIP_RELATION_PATTERN = /소속|조직|구성원|대표|멤버|member|leader|belongs|works/i;
-
-type GraphPosition = { x: number; y: number };
-
 interface GraphViewProps {
+  projectId: number | null;
   graph: GraphPayload;
   selectedEntityId: number | null;
   onSelectEntity: (entity: EntityNode | null) => void;
@@ -111,7 +123,7 @@ function relationTone(label: string) {
   if (/동맹|친구|협력|보호|구함|ally|friend|protect|support|trust/.test(normalized)) {
     return "#54785d";
   }
-  if (/소속|조직|대표|member|leader|works|belongs/.test(normalized)) {
+  if (/소속|조직|대표|관할|산하|휘하|본부|거점|member|leader|works|belongs|contains|affiliated|under/.test(normalized)) {
     return "#626b90";
   }
   if (/소유|아이템|사용|가지|열쇠|own|has|uses|item|possess/.test(normalized)) {
@@ -127,41 +139,6 @@ function relationTone(label: string) {
     return "#6687bd";
   }
   return "#8790a0";
-}
-
-function isMembershipRelation(relation: RelationEdge) {
-  return MEMBERSHIP_RELATION_PATTERN.test(`${relation.type} ${relation.display_label}`);
-}
-
-function buildOrganizationMembership(
-  graph: GraphPayload,
-  entitiesById: Map<number, EntityNode>,
-) {
-  const membershipByOrganizationId = new Map<number, Set<number>>();
-  for (const entity of graph.entities) {
-    if (entity.type === "organization") {
-      membershipByOrganizationId.set(entity.id, new Set());
-    }
-  }
-
-  for (const relation of graph.relations) {
-    if (!isMembershipRelation(relation)) {
-      continue;
-    }
-    const source = entitiesById.get(relation.source_entity_id);
-    const target = entitiesById.get(relation.target_entity_id);
-    if (!source || !target) {
-      continue;
-    }
-    if (source.type === "organization" && target.type !== "organization") {
-      membershipByOrganizationId.get(source.id)?.add(target.id);
-    }
-    if (target.type === "organization" && source.type !== "organization") {
-      membershipByOrganizationId.get(target.id)?.add(source.id);
-    }
-  }
-
-  return { membershipByOrganizationId };
 }
 
 function sortedEntities(
@@ -181,10 +158,11 @@ function sortedEntities(
   });
 }
 
-function buildObsidianPositions(
+export function buildObsidianPositions(
   graph: GraphPayload,
   entitiesById: Map<number, EntityNode>,
   membershipByOrganizationId: Map<number, Set<number>>,
+  parentOrganizationByEntityId: Map<number, number>,
   degreeByEntityId: Map<number, number>,
 ) {
   const positions = new Map<number, GraphPosition>();
@@ -199,34 +177,108 @@ function buildObsidianPositions(
       (degreeByEntityId.get(right.id) ?? 0) - (degreeByEntityId.get(left.id) ?? 0),
   );
 
-  const hubGap = 360;
-  const hubStartX = -((organizations.length - 1) * hubGap) / 2;
-  organizations.forEach((organization, index) => {
-    const hubPosition = {
-      x: hubStartX + index * hubGap,
-      y: index % 2 === 0 ? -60 : 36,
-    };
-    positions.set(organization.id, hubPosition);
-    assignedEntityIds.add(organization.id);
-
+  const organizationDomains = organizations.map((organization) => {
+    const memberIds = membershipByOrganizationId.get(organization.id) ?? new Set();
     const memberEntities = sortedEntities(
-      [...(membershipByOrganizationId.get(organization.id) ?? [])]
+      [...memberIds]
         .map((entityId) => entitiesById.get(entityId))
         .filter((entity): entity is EntityNode => Boolean(entity)),
       degreeByEntityId,
     );
-    const radius = 118 + Math.min(memberEntities.length, 10) * 6;
-    memberEntities.forEach((member, memberIndex) => {
-      const angle = -Math.PI / 2 + (memberIndex / Math.max(memberEntities.length, 1)) * Math.PI * 2;
-      const ringOffset = (memberIndex % 3) * 20;
-      positions.set(member.id, {
-        x: hubPosition.x + Math.cos(angle) * (radius + ringOffset),
-        y: hubPosition.y + Math.sin(angle) * (radius + ringOffset),
-      });
-      assignedEntityIds.add(member.id);
-    });
+    const columnCount = clamp(Math.ceil(Math.sqrt(Math.max(memberEntities.length, 1) * 1.28)), 2, 5);
+    const rowCount = Math.max(1, Math.ceil(memberEntities.length / columnCount));
+    return {
+      organization,
+      memberEntities,
+      columnCount,
+      rowCount,
+      width: Math.max(500, columnCount * 168 + 210),
+      height: Math.max(340, rowCount * 124 + 210),
+    };
   });
 
+  const domainsPerRow = organizations.length <= 1 ? 1 : 2;
+  const rowGap = 260;
+  const columnGap = 260;
+  let cursorY = 0;
+
+  for (let rowStart = 0; rowStart < organizationDomains.length; rowStart += domainsPerRow) {
+    const rowDomains = organizationDomains.slice(rowStart, rowStart + domainsPerRow);
+    const rowWidth =
+      rowDomains.reduce((sum, domain) => sum + domain.width, 0) +
+      Math.max(0, rowDomains.length - 1) * columnGap;
+    const rowHeight = Math.max(...rowDomains.map((domain) => domain.height), 0);
+    let cursorX = -rowWidth / 2;
+
+    for (const domain of rowDomains) {
+      const { organization, memberEntities, columnCount } = domain;
+      const hasMembers = memberEntities.length > 0;
+      const center = {
+        x: cursorX + domain.width / 2,
+        y: cursorY + domain.height / 2,
+      };
+      cursorX += domain.width + columnGap;
+
+      if (!hasMembers || parentOrganizationByEntityId.has(organization.id)) {
+        positions.set(organization.id, center);
+      }
+      assignedEntityIds.add(organization.id);
+
+      const cellWidth = 168;
+      const cellHeight = 124;
+      const gridWidth = (columnCount - 1) * cellWidth;
+      const gridHeight = (Math.max(1, Math.ceil(memberEntities.length / columnCount)) - 1) * cellHeight;
+      const arcLift = Math.min(58, Math.max(0, memberEntities.length - 2) * 7);
+
+      memberEntities.forEach((member, memberIndex) => {
+        const column = memberIndex % columnCount;
+        const row = Math.floor(memberIndex / columnCount);
+        const rowOffset =
+          columnCount > 2 && row % 2 === 1 ? Math.min(44, cellWidth / 4) : 0;
+        const normalizedColumn =
+          columnCount === 1 ? 0 : (column - (columnCount - 1) / 2) / ((columnCount - 1) / 2);
+        const arcY = Math.abs(normalizedColumn) * arcLift;
+        positions.set(member.id, {
+          x: center.x - gridWidth / 2 + column * cellWidth + rowOffset,
+          y: center.y - gridHeight / 2 + row * cellHeight + arcY,
+        });
+        assignedEntityIds.add(member.id);
+      });
+    }
+
+    cursorY += rowHeight + rowGap;
+  }
+
+  const organizationAreaHeight =
+    organizationDomains.length > 0 ? cursorY - rowGap : 0;
+  const organizationCenterOffset = organizationAreaHeight > 0 ? organizationAreaHeight / 2 : 0;
+  for (const [entityId, position] of positions) {
+    positions.set(entityId, {
+      x: position.x,
+      y: position.y - organizationCenterOffset,
+    });
+  }
+
+  organizations.forEach((organization) => {
+    assignedEntityIds.add(organization.id);
+  });
+
+  const standaloneOrganizations = organizations.filter(
+    (organization) => (membershipByOrganizationId.get(organization.id)?.size ?? 0) === 0,
+  );
+  standaloneOrganizations.forEach((organization, index) => {
+    if (!positions.has(organization.id)) {
+      positions.set(organization.id, {
+        x: (index - (standaloneOrganizations.length - 1) / 2) * 260,
+        y: organizationDomains.length > 0 ? organizationAreaHeight / 2 + 160 : -80,
+      });
+    }
+  });
+
+  /*
+   * Unassigned nodes are kept below organization domains by type lanes. They are intentionally
+   * far from the organization rows so cross-links stay readable instead of stacking at center.
+   */
   const looseEntities = sortedEntities(
     graph.entities.filter((entity) => !assignedEntityIds.has(entity.id)),
     degreeByEntityId,
@@ -236,15 +288,15 @@ function buildObsidianPositions(
     entitiesByType.set(entity.type, [...(entitiesByType.get(entity.type) ?? []), entity]);
   }
   const activeTypes = ENTITY_TYPE_ORDER.filter((type) => entitiesByType.has(type));
-  const laneGap = 220;
-  const startY = organizations.length > 0 ? 330 : -130;
+  const laneGap = 260;
+  const startY = organizationDomains.length > 0 ? organizationAreaHeight / 2 + 300 : -150;
   activeTypes.forEach((type, laneIndex) => {
     const laneEntities = entitiesByType.get(type) ?? [];
     const laneX = (laneIndex - (activeTypes.length - 1) / 2) * laneGap;
     laneEntities.forEach((entity, index) => {
       positions.set(entity.id, {
-        x: laneX + (index % 2 === 0 ? -18 : 18),
-        y: startY + Math.floor(index / 2) * 92,
+        x: laneX + (index % 2 === 0 ? -34 : 34),
+        y: startY + Math.floor(index / 2) * 118,
       });
     });
   });
@@ -252,10 +304,41 @@ function buildObsidianPositions(
   return positions;
 }
 
-export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphViewProps) {
+function mergePositions(
+  autoPositions: Map<number, GraphPosition>,
+  savedPositions: Map<number, GraphPosition>,
+) {
+  const merged = new Map(autoPositions);
+  for (const [entityId, position] of savedPositions) {
+    if (merged.has(entityId)) {
+      merged.set(entityId, position);
+    }
+  }
+  return merged;
+}
+
+function collectCurrentNodePositions(cy: Core) {
+  const positions = new Map<number, GraphPosition>();
+  cy.nodes().forEach((node) => {
+    if (node.data("isContainer") === "yes") {
+      return;
+    }
+    const rawId = String(node.id()).replace("entity-", "");
+    const entityId = Number(rawId);
+    if (!Number.isFinite(entityId)) {
+      return;
+    }
+    const position = node.position();
+    positions.set(entityId, { x: position.x, y: position.y });
+  });
+  return positions;
+}
+
+export function GraphView({ projectId, graph, selectedEntityId, onSelectEntity }: GraphViewProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const cyRef = useRef<Core | null>(null);
   const [zoomLabel, setZoomLabel] = useState("100%");
+  const [layoutResetNonce, setLayoutResetNonce] = useState(0);
   const entitiesById = useMemo(
     () => new Map(graph.entities.map((entity) => [entity.id, entity])),
     [graph.entities],
@@ -273,20 +356,31 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
     return degrees;
   }, [graph.entities, graph.relations]);
 
-  const { membershipByOrganizationId } = useMemo(
+  const { membershipByOrganizationId, parentOrganizationByEntityId } = useMemo(
     () => buildOrganizationMembership(graph, entitiesById),
     [entitiesById, graph],
   );
 
-  const nodePositions = useMemo(
+  const autoNodePositions = useMemo(
     () =>
       buildObsidianPositions(
         graph,
         entitiesById,
         membershipByOrganizationId,
+        parentOrganizationByEntityId,
         degreeByEntityId,
       ),
-    [degreeByEntityId, entitiesById, graph, membershipByOrganizationId],
+    [degreeByEntityId, entitiesById, graph, membershipByOrganizationId, parentOrganizationByEntityId],
+  );
+
+  const savedNodePositions = useMemo(
+    () => readGraphPositions(projectId, graph.entities),
+    [graph.entities, layoutResetNonce, projectId],
+  );
+
+  const nodePositions = useMemo(
+    () => mergePositions(autoNodePositions, savedNodePositions),
+    [autoNodePositions, savedNodePositions],
   );
 
   useEffect(() => {
@@ -302,29 +396,36 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
       }
       const elements = [
         ...graph.entities.map((entity) => {
+          const clusterSize = membershipByOrganizationId.get(entity.id)?.size ?? 0;
+          const parentOrganizationId = parentOrganizationByEntityId.get(entity.id);
+          const isContainer = entity.type === "organization" && clusterSize > 0;
           const visual = entityVisual(
             entity,
             degreeByEntityId.get(entity.id) ?? 0,
-            membershipByOrganizationId.get(entity.id)?.size ?? 0,
+            clusterSize,
           );
           return {
             data: {
               id: `entity-${entity.id}`,
+              parent: parentOrganizationId ? `entity-${parentOrganizationId}` : undefined,
               label: shortEntityLabel(entity.name),
               fullLabel: entity.name,
               type: entity.type,
+              isContainer: isContainer ? "yes" : "no",
+              isMember: parentOrganizationId ? "yes" : "no",
               state: entity.appearance_state,
               fill: visual.fill,
               border: visual.border,
               opacity: visual.opacity,
               size: visual.size,
               weight: visual.weight,
-              clusterSize: membershipByOrganizationId.get(entity.id)?.size ?? 0,
+              clusterSize,
             },
-            position: nodePositions.get(entity.id),
+            position: isContainer ? undefined : nodePositions.get(entity.id),
           };
         }),
         ...graph.relations.map((relation) => {
+          const membership = isMembershipRelation(relation);
           const displayLabel = relation.display_label || (relation.type === "co_occurs" ? "" : relation.type);
           const isWeak = relation.is_weak || relation.type === "co_occurs";
           const strength = clamp(relation.strength ?? relation.confidence ?? 0.55, 0.05, 1);
@@ -334,14 +435,15 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
               source: `entity-${relation.source_entity_id}`,
               target: `entity-${relation.target_entity_id}`,
               label: relation.type,
-              displayLabel: displayLabel ? shortRelationLabel(displayLabel) : "",
+              displayLabel: membership ? "" : displayLabel ? shortRelationLabel(displayLabel) : "",
               confidence: clamp(relation.confidence ?? 0.55, 0.05, 1),
               strength,
               weak: isWeak,
               color: relationTone(relation.type),
-              arrowShape: isWeak ? "none" : "triangle",
+              arrowShape: isWeak || membership ? "none" : "triangle",
               lineStyle: relation.is_recent ? "solid" : "dashed",
               aggregate: relation.id < 0 ? "yes" : "no",
+              relationKind: membership ? "membership" : "normal",
             },
           };
         }),
@@ -379,6 +481,7 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
               "text-border-width": 1,
               width: "data(size)",
               height: "data(size)",
+              "z-index": 12,
               "overlay-opacity": 0,
             },
           },
@@ -397,11 +500,41 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
               shape: "round-rectangle",
               color: "#fffdf8",
               "font-size": 13,
-              "font-weight": 850,
+              "font-weight": 800,
               "text-valign": "center",
               "text-margin-y": 0,
               "text-background-opacity": 0,
               "text-border-opacity": 0,
+            },
+          },
+          {
+            selector: "node[isContainer = 'yes']",
+            style: {
+              shape: "round-rectangle",
+              "background-opacity": 0.14,
+              "border-width": 2.4,
+              "border-style": "solid",
+              color: "data(border)",
+              "font-size": 15,
+              "font-weight": 800,
+              "text-valign": "top",
+              "text-halign": "center",
+              "text-margin-y": -18,
+              "text-background-color": "#fffdf8",
+              "text-background-opacity": 0.9,
+              "text-background-padding": "5px",
+              "text-border-color": "#eadfce",
+              "text-border-opacity": 0.8,
+              "text-border-width": 1,
+              padding: "68px",
+              "z-index": 1,
+            },
+          },
+          {
+            selector: "node[isMember = 'yes']",
+            style: {
+              "z-index": 18,
+              "text-background-opacity": 0.94,
             },
           },
           {
@@ -443,6 +576,10 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
               "curve-style": "bezier",
               "control-point-step-size": 42,
             },
+          },
+          {
+            selector: "edge[relationKind = 'membership']",
+            style: MEMBERSHIP_EDGE_STYLE,
           },
           {
             selector: "edge[aggregate = 'yes']",
@@ -496,6 +633,9 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
           onSelectEntity(null);
         }
       });
+      cy.on("dragfree", "node", () => {
+        writeGraphPositions(projectId, collectCurrentNodePositions(cy));
+      });
       cy.on("mouseover", "edge", (event) => event.target.addClass("hover"));
       cy.on("mouseout", "edge", (event) => event.target.removeClass("hover"));
 
@@ -506,7 +646,6 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
       applyFocus(cy, selectedEntityId);
       if (selectedEntityId !== null) {
         cy.$id(`entity-${selectedEntityId}`).select();
-        focusSelectedNode(cy, selectedEntityId);
       }
     });
 
@@ -523,7 +662,16 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
         }
       }
     };
-  }, [degreeByEntityId, entitiesById, graph, membershipByOrganizationId, nodePositions, onSelectEntity]);
+  }, [
+    degreeByEntityId,
+    entitiesById,
+    graph,
+    membershipByOrganizationId,
+    nodePositions,
+    onSelectEntity,
+    parentOrganizationByEntityId,
+    projectId,
+  ]);
 
   useEffect(() => {
     const cy = cyRef.current;
@@ -534,7 +682,6 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
     applyFocus(cy, selectedEntityId);
     if (selectedEntityId !== null) {
       cy.$id(`entity-${selectedEntityId}`).select();
-      focusSelectedNode(cy, selectedEntityId);
     }
   }, [selectedEntityId]);
 
@@ -564,9 +711,14 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
     if (!cy) {
       return;
     }
-    cy.layout(GRAPH_LAYOUT).run();
+    cy.animate({ fit: { eles: cy.elements(), padding: 112 } }, { duration: 180, easing: "ease-out-cubic" });
     applyFocus(cy, selectedEntityId);
   }, [selectedEntityId]);
+
+  const resetGraphLayout = useCallback(() => {
+    clearGraphPositions(projectId);
+    setLayoutResetNonce((current) => current + 1);
+  }, [projectId]);
 
   if (graph.entities.length === 0) {
     return (
@@ -591,6 +743,9 @@ export function GraphView({ graph, selectedEntityId, onSelectEntity }: GraphView
         <button type="button" onClick={fitGraph} title="그래프 맞춤">
           <Maximize2 size={16} />
         </button>
+        <button type="button" onClick={resetGraphLayout} title="자동 배치로 초기화">
+          <RotateCcw size={16} />
+        </button>
       </div>
     </div>
   );
@@ -607,32 +762,12 @@ function applyFocus(cy: Core, selectedEntityId: number | null) {
   }
   const connectedEdges = selected.connectedEdges();
   const connectedNodes = connectedEdges.connectedNodes();
+  const parent = selected.parent();
+  const children = selected.descendants();
+  const siblings = parent.length > 0 ? parent.children() : cy.collection();
+  const focusNodes = selected.union(connectedNodes).union(parent).union(children).union(siblings);
+  const focusEdges = connectedEdges.union(focusNodes.connectedEdges());
   cy.elements().addClass("dimmed");
-  selected.removeClass("dimmed").addClass("spotlight");
-  connectedNodes.removeClass("dimmed").addClass("spotlight");
-  connectedEdges.removeClass("dimmed").addClass("spotlight");
-}
-
-function focusSelectedNode(cy: Core, selectedEntityId: number) {
-  const selected = cy.$id(`entity-${selectedEntityId}`);
-  if (selected.empty()) {
-    return;
-  }
-  const neighborhood = selected.closedNeighborhood();
-  if (neighborhood.nodes().length <= 1) {
-    cy.animate({ fit: { eles: selected, padding: 140 } }, { duration: 220, easing: "ease-out-cubic" });
-    return;
-  }
-  neighborhood
-    .layout({
-      name: "concentric",
-      fit: true,
-      padding: 108,
-      animate: true,
-      animationDuration: 240,
-      minNodeSpacing: 58,
-      concentric: (node: cytoscape.NodeSingular) => (node.id() === selected.id() ? 2 : 1),
-      levelWidth: () => 1,
-    })
-    .run();
+  focusNodes.removeClass("dimmed").addClass("spotlight");
+  focusEdges.removeClass("dimmed").addClass("spotlight");
 }

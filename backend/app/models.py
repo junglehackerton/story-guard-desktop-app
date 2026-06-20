@@ -53,6 +53,10 @@ class DocumentDeleteResult(BaseModel):
     project_id: int
 
 
+class ProjectDeleteResult(BaseModel):
+    project_id: int
+
+
 class StoryDocument(BaseModel):
     id: int
     project_id: int
@@ -125,12 +129,15 @@ class AnalysisStatus(str, Enum):
     running = "running"
     completed = "completed"
     failed = "failed"
+    cancelled = "cancelled"
 
 
 class AnalysisJob(BaseModel):
     id: int
     project_id: int
     status: AnalysisStatus
+    current_step: str = "queued"
+    progress: int = 0
     message: str
     created_at: str
     updated_at: str

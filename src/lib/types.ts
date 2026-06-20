@@ -33,6 +33,10 @@ export interface DocumentDeleteResult {
   project_id: number;
 }
 
+export interface ProjectDeleteResult {
+  project_id: number;
+}
+
 export interface EntityNode {
   id: number;
   project_id: number;
@@ -92,6 +96,19 @@ export interface GraphPayload {
   entities: EntityNode[];
   relations: RelationEdge[];
   issues: ContinuityIssue[];
+}
+
+export type AnalysisStatus = "idle" | "running" | "completed" | "failed" | "cancelled";
+
+export interface AnalysisJob {
+  id: number;
+  project_id: number;
+  status: AnalysisStatus;
+  current_step: string;
+  progress: number;
+  message: string;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface EntityRelationshipDetail {

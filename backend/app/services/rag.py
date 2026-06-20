@@ -95,6 +95,28 @@ class RagService:
             for doc in docs
         ]
 
+    def delete_project_index(self, project_id: int) -> None:
+        marker = self._index_marker(project_id)
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+
+        try:
+            import chromadb
+            from chromadb.config import Settings
+        except ImportError:
+            return
+
+        client = chromadb.PersistentClient(
+            path=str(self.persist_dir),
+            settings=Settings(anonymized_telemetry=False),
+        )
+        try:
+            client.delete_collection(name=f"project_{project_id}")
+        except Exception:
+            return
+
     def _index_marker(self, project_id: int) -> Path:
         return self.persist_dir / f"project_{project_id}.indexed"
 

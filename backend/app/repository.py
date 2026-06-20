@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +54,14 @@ class StoryRepository:
             raise KeyError(f"Project not found: {project_id}")
         return Project(**dict(row))
 
+    def delete_project(self, project_id: int) -> int:
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT id FROM projects WHERE id = ?", (project_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Project not found: {project_id}")
+            connection.execute("DELETE FROM projects WHERE id = ?", (project_id,))
+        return project_id
+
     def add_document(
         self,
         project_id: int,
@@ -96,6 +105,46 @@ class StoryRepository:
                 (project_id,),
             ).fetchall()
         return [StoryDocument(**dict(row)) for row in rows]
+
+    def get_document_analysis_cache(self, document_id: int, content_hash: str) -> dict | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT payload
+                FROM document_analysis_cache
+                WHERE document_id = ? AND content_hash = ?
+                """,
+                (document_id, content_hash),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(str(row["payload"]))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def upsert_document_analysis_cache(
+        self,
+        document_id: int,
+        project_id: int,
+        content_hash: str,
+        payload: dict,
+    ) -> None:
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO document_analysis_cache
+                  (document_id, project_id, content_hash, payload)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                  project_id = excluded.project_id,
+                  content_hash = excluded.content_hash,
+                  payload = excluded.payload,
+                  analyzed_at = CURRENT_TIMESTAMP
+                """,
+                (document_id, project_id, content_hash, encode_json(payload)),
+            )
 
     def delete_document(self, document_id: int) -> int:
         with self.database.connect() as connection:
@@ -336,29 +385,246 @@ class StoryRepository:
             issues.append(ContinuityIssue(**data))
         return GraphPayload(entities=entities, relations=relations, issues=issues)
 
-    def create_job(self, project_id: int, status: AnalysisStatus, message: str) -> AnalysisJob:
+    def create_job(
+        self,
+        project_id: int,
+        status: AnalysisStatus,
+        message: str,
+        current_step: str = "queued",
+        progress: int = 0,
+    ) -> AnalysisJob:
+        progress = clamp_progress(progress)
         with self.database.connect() as connection:
             cursor = connection.execute(
-                "INSERT INTO analysis_jobs (project_id, status, message) VALUES (?, ?, ?)",
-                (project_id, status.value, message),
+                """
+                INSERT INTO analysis_jobs (project_id, status, current_step, progress, message)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (project_id, status.value, current_step, progress, message),
             )
             row = connection.execute(
                 "SELECT * FROM analysis_jobs WHERE id = ?", (cursor.lastrowid,)
             ).fetchone()
         return AnalysisJob(**dict(row))
 
-    def update_job(self, job_id: int, status: AnalysisStatus, message: str) -> AnalysisJob:
+    def create_running_analysis_job(
+        self,
+        project_id: int,
+        message: str,
+        current_step: str = "queued",
+        progress: int = 0,
+    ) -> AnalysisJob:
+        progress = clamp_progress(progress)
+        with self.database.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            running = connection.execute(
+                """
+                SELECT *
+                FROM analysis_jobs
+                WHERE project_id = ? AND status = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (project_id, AnalysisStatus.running.value),
+            ).fetchone()
+            if running is not None:
+                raise RuntimeError("이미 분석이 진행 중입니다. 완료되거나 취소된 뒤 다시 실행해 주세요.")
+            cursor = connection.execute(
+                """
+                INSERT INTO analysis_jobs (project_id, status, current_step, progress, message)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (project_id, AnalysisStatus.running.value, current_step, progress, message),
+            )
+            row = connection.execute(
+                "SELECT * FROM analysis_jobs WHERE id = ?", (cursor.lastrowid,)
+            ).fetchone()
+        return AnalysisJob(**dict(row))
+
+    def update_job(
+        self,
+        job_id: int,
+        status: AnalysisStatus,
+        message: str,
+        current_step: str | None = None,
+        progress: int | None = None,
+    ) -> AnalysisJob:
+        progress_value = clamp_progress(progress) if progress is not None else None
         with self.database.connect() as connection:
             connection.execute(
                 """
                 UPDATE analysis_jobs
-                SET status = ?, message = ?, updated_at = CURRENT_TIMESTAMP
+                SET status = ?,
+                    message = ?,
+                    current_step = COALESCE(?, current_step),
+                    progress = COALESCE(?, progress),
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
                 """,
-                (status.value, message, job_id),
+                (status.value, message, current_step, progress_value, job_id),
             )
             row = connection.execute("SELECT * FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
         return AnalysisJob(**dict(row))
+
+    def update_running_job(
+        self,
+        job_id: int,
+        status: AnalysisStatus,
+        message: str,
+        current_step: str | None = None,
+        progress: int | None = None,
+    ) -> AnalysisJob:
+        progress_value = clamp_progress(progress) if progress is not None else None
+        with self.database.connect() as connection:
+            connection.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = ?,
+                    message = ?,
+                    current_step = COALESCE(?, current_step),
+                    progress = COALESCE(?, progress),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND status = ?
+                """,
+                (
+                    status.value,
+                    message,
+                    current_step,
+                    progress_value,
+                    job_id,
+                    AnalysisStatus.running.value,
+                ),
+            )
+            row = connection.execute("SELECT * FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"Analysis job not found: {job_id}")
+        return AnalysisJob(**dict(row))
+
+    def get_job(self, job_id: int) -> AnalysisJob | None:
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT * FROM analysis_jobs WHERE id = ?", (job_id,)).fetchone()
+        return AnalysisJob(**dict(row)) if row is not None else None
+
+    def latest_analysis_job(self, project_id: int) -> AnalysisJob | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM analysis_jobs
+                WHERE project_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (project_id,),
+            ).fetchone()
+        return AnalysisJob(**dict(row)) if row is not None else None
+
+    def running_analysis_job(self, project_id: int) -> AnalysisJob | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM analysis_jobs
+                WHERE project_id = ? AND status = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (project_id, AnalysisStatus.running.value),
+            ).fetchone()
+        return AnalysisJob(**dict(row)) if row is not None else None
+
+    def mark_running_jobs_interrupted(self) -> int:
+        message = "이전 실행이 종료되어 분석이 중단되었습니다. 다시 분석을 실행해 주세요."
+        with self.database.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE analysis_jobs
+                SET status = ?,
+                    current_step = ?,
+                    progress = ?,
+                    message = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE status = ?
+                """,
+                (
+                    AnalysisStatus.failed.value,
+                    "failed",
+                    100,
+                    message,
+                    AnalysisStatus.running.value,
+                ),
+            )
+        return int(cursor.rowcount or 0)
+
+    def cancel_analysis(self, project_id: int) -> AnalysisJob:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM analysis_jobs
+                WHERE project_id = ? AND status = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (project_id, AnalysisStatus.running.value),
+            ).fetchone()
+            if row is None:
+                latest = connection.execute(
+                    """
+                    SELECT *
+                    FROM analysis_jobs
+                    WHERE project_id = ?
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (project_id,),
+                ).fetchone()
+                if latest is not None and latest["status"] == AnalysisStatus.cancelled.value:
+                    job_id = int(latest["id"])
+                else:
+                    cursor = connection.execute(
+                        """
+                        INSERT INTO analysis_jobs (project_id, status, current_step, progress, message)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            project_id,
+                            AnalysisStatus.cancelled.value,
+                            "cancelled",
+                            100,
+                            "분석이 취소되어 생성 중이던 내용이 삭제되었습니다.",
+                        ),
+                    )
+                    job_id = int(cursor.lastrowid)
+            else:
+                job_id = int(row["id"])
+                connection.execute(
+                    """
+                    UPDATE analysis_jobs
+                    SET status = ?,
+                        current_step = ?,
+                        progress = ?,
+                        message = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE project_id = ? AND status = ?
+                    """,
+                    (
+                        AnalysisStatus.cancelled.value,
+                        "cancelled",
+                        100,
+                        "분석이 취소되어 생성 중이던 내용이 삭제되었습니다.",
+                        project_id,
+                        AnalysisStatus.running.value,
+                    ),
+                )
+            connection.execute("DELETE FROM relations WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM issues WHERE project_id = ?", (project_id,))
+            cancelled = connection.execute(
+                "SELECT * FROM analysis_jobs WHERE id = ?",
+                (job_id,),
+            ).fetchone()
+        return AnalysisJob(**dict(cancelled))
 
     def get_setting(self, key: str, default: str = "") -> str:
         with self.database.connect() as connection:
@@ -385,6 +651,10 @@ def re_split_query(query: str) -> list[str]:
     return [part.strip() for part in re.split(r"[\s,.;:!?()\[\]{}\"'“”‘’]+", query) if part.strip()]
 
 
+def clamp_progress(progress: int) -> int:
+    return max(0, min(100, int(progress)))
+
+
 def normalize_relation_type(relation_type: str) -> str:
     value = relation_type.strip()
     normalized = value.casefold()
@@ -404,8 +674,11 @@ def normalize_relation_type(relation_type: str) -> str:
         term in value for term in ("적대", "대립", "의심", "배신", "對立", "对立", "懷疑", "怀疑")
     ):
         return "적대/의심"
-    if any(term in normalized for term in ("member", "belongs", "organization", "leader")) or any(
-        term in value for term in ("소속", "조직", "대표", "所屬", "所属")
+    if any(
+        term in normalized
+        for term in ("member", "belongs", "organization", "leader", "contains", "affiliated", "under")
+    ) or any(
+        term in value for term in ("소속", "조직", "대표", "관할", "산하", "휘하", "본부", "거점", "所屬", "所属")
     ):
         return "소속/조직"
     if any(term in normalized for term in ("place", "located", "visit", "appear")) or any(

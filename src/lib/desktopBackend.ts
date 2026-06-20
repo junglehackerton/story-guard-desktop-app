@@ -4,8 +4,10 @@ import { api, setApiToken } from "./api";
 
 let backendProcess: Child | null = null;
 let startPromise: Promise<string> | null = null;
+let stopPromise: Promise<void> | null = null;
 const BACKEND_READY_TIMEOUT_MS = 60_000;
 const BACKEND_READY_INTERVAL_MS = 250;
+const BACKEND_SHUTDOWN_TIMEOUT_MS = 900;
 
 export function isTauriRuntime() {
   return "__TAURI_INTERNALS__" in window;
@@ -24,6 +26,9 @@ export async function ensureDesktopBackend(): Promise<string> {
   if (startPromise) {
     return startPromise;
   }
+  if (await isExistingBackendReady()) {
+    return "기존 데스크톱 backend 재사용";
+  }
 
   startPromise = startSidecar(token).catch((error) => {
     startPromise = null;
@@ -34,11 +39,13 @@ export async function ensureDesktopBackend(): Promise<string> {
 
 async function startSidecar(token: string): Promise<string> {
   const appDataDir = await invoke<string>("app_data_dir");
+  const parentPid = await invoke<number>("app_process_id");
   const command = Command.sidecar("binaries/story-guard-backend", [], {
     env: {
       STORY_GUARD_DATA_DIR: appDataDir,
       STORY_GUARD_BACKEND_PORT: "8765",
       STORY_GUARD_API_TOKEN: token,
+      STORY_GUARD_PARENT_PID: String(parentPid),
     },
   });
   command.stdout.on("data", (line) => console.info(`[story-guard-backend] ${line}`));
@@ -52,6 +59,44 @@ async function startSidecar(token: string): Promise<string> {
   return `데스크톱 backend sidecar 시작: pid ${backendProcess.pid}`;
 }
 
+export async function stopDesktopBackend(): Promise<void> {
+  if (stopPromise) {
+    return stopPromise;
+  }
+  stopPromise = stopDesktopBackendOnce().finally(() => {
+    stopPromise = null;
+  });
+  return stopPromise;
+}
+
+async function stopDesktopBackendOnce(): Promise<void> {
+  const child = backendProcess;
+  backendProcess = null;
+  startPromise = null;
+
+  await withTimeout(api.shutdown(), BACKEND_SHUTDOWN_TIMEOUT_MS).catch(() => undefined);
+  if (!child) {
+    return;
+  }
+  await child.kill().catch((error) => {
+    console.warn("[story-guard-backend] sidecar kill failed", error);
+  });
+}
+
+async function isExistingBackendReady(): Promise<boolean> {
+  try {
+    await api.ready();
+    return true;
+  } catch (error) {
+    if (isBackendVersionOrAuthConflict(error)) {
+      throw new Error(
+        "데스크톱 backend 버전 또는 인증이 맞지 않습니다. Story Guard 관련 프로세스를 완전히 종료한 뒤 다시 실행해 주세요.",
+      );
+    }
+    return false;
+  }
+}
+
 export async function waitForBackendReady(
   timeoutMs = BACKEND_READY_TIMEOUT_MS,
   intervalMs = BACKEND_READY_INTERVAL_MS,
@@ -60,10 +105,17 @@ export async function waitForBackendReady(
   let lastError: unknown = null;
   while (Date.now() < deadline) {
     try {
-      await api.health();
+      await api.ready();
       return;
     } catch (error) {
       lastError = error;
+      if (
+        isBackendVersionOrAuthConflict(error)
+      ) {
+        throw new Error(
+          "데스크톱 backend 버전 또는 인증이 맞지 않습니다. Story Guard 관련 프로세스를 완전히 종료한 뒤 다시 실행해 주세요.",
+        );
+      }
       await delay(intervalMs);
     }
   }
@@ -73,4 +125,29 @@ export async function waitForBackendReady(
 
 function delay(ms: number) {
   return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timeoutId = globalThis.setTimeout(() => {
+      reject(new Error("backend shutdown timed out"));
+    }, timeoutMs);
+    promise.then(
+      (value) => {
+        globalThis.clearTimeout(timeoutId);
+        resolve(value);
+      },
+      (error) => {
+        globalThis.clearTimeout(timeoutId);
+        reject(error);
+      },
+    );
+  });
+}
+
+function isBackendVersionOrAuthConflict(error: unknown) {
+  return (
+    error instanceof Error &&
+    (error.message.includes("인증 토큰") || error.message.includes("Not Found"))
+  );
 }
