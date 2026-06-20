@@ -236,6 +236,10 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.") from error
 
+    existing_documents = repository.list_documents(payload.project_id)
+    next_chapter_index = (
+        max((document.chapter_index for document in existing_documents), default=-1) + 1
+    )
     document = repository.add_document(
         project_id=payload.project_id,
         path=path,
@@ -243,6 +247,7 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
         file_format=file_format,
         content_hash=content_hash,
         content=content,
+        chapter_index=next_chapter_index,
     )
     settings = get_settings()
     request_rag = RagService(chroma_path(), embedding_model=settings.embedding_model)
@@ -252,20 +257,37 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
     repository.clear_analysis(payload.project_id)
     if chunks:
         asyncio.create_task(
-            index_document_chunks(payload.project_id, chunk_ids, chunks, settings.embedding_model)
+            index_document_chunks(
+                payload.project_id,
+                document.id,
+                document.chapter_index,
+                chunk_ids,
+                chunks,
+                settings.embedding_model,
+            )
         )
     return document
 
 
 async def index_document_chunks(
     project_id: int,
+    document_id: int,
+    chapter_index: int,
     chunk_ids: list[int],
     chunks: list[str],
     embedding_model: str,
 ) -> None:
     try:
         request_rag = RagService(chroma_path(), embedding_model=embedding_model)
-        await asyncio.to_thread(request_rag.index_chunks, project_id, chunk_ids, chunks)
+        await asyncio.to_thread(
+            request_rag.index_chunks,
+            project_id,
+            chunk_ids,
+            chunks,
+            document_id,
+            chapter_index,
+            list(range(len(chunks))),
+        )
     except Exception:
         return
 
@@ -326,8 +348,12 @@ def cancel_analysis(project_id: int) -> AnalysisJob:
 
 
 @app.get("/projects/{project_id}/graph", response_model=GraphPayload)
-def project_graph(project_id: int) -> GraphPayload:
-    return repository.graph(project_id)
+def project_graph(
+    project_id: int,
+    start_chapter: int | None = None,
+    end_chapter: int | None = None,
+) -> GraphPayload:
+    return repository.graph(project_id, start_chapter=start_chapter, end_chapter=end_chapter)
 
 
 @app.patch("/issues/{issue_id}/status", response_model=ContinuityIssue)

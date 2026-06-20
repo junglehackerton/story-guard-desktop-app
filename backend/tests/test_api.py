@@ -229,6 +229,56 @@ def test_issue_evidence_endpoint_returns_chunks(tmp_path: Path) -> None:
     assert "충돌" in response.json()[0]["text"]
 
 
+def test_graph_endpoint_accepts_chapter_range(tmp_path: Path) -> None:
+    client = TestClient(app)
+    project = client.post("/projects", json={"title": "범위 그래프 API 테스트"}).json()
+    first_story = tmp_path / "range-01.md"
+    second_story = tmp_path / "range-02.md"
+    first_story.write_text("이서하는 강도윤과 동행했다.", encoding="utf-8")
+    second_story.write_text("이서하는 강도윤을 의심했다.", encoding="utf-8")
+    first = client.post("/documents/import", json={"project_id": project["id"], "path": str(first_story)}).json()
+    second = client.post("/documents/import", json={"project_id": project["id"], "path": str(second_story)}).json()
+    first_chunks = [chunk["id"] for chunk in repository.list_chunks(project["id"]) if chunk["document_id"] == first["id"]]
+    second_chunks = [chunk["id"] for chunk in repository.list_chunks(project["id"]) if chunk["document_id"] == second["id"]]
+    seoha = repository.upsert_entity(project["id"], "character", "이서하", [], "기록관", first["id"])
+    doyun = repository.upsert_entity(project["id"], "character", "강도윤", [], "호위", first["id"])
+    repository.add_relation(project["id"], seoha.id, doyun.id, "동행/협력", 0.8, first_chunks)
+    repository.add_relation(project["id"], seoha.id, doyun.id, "적대/의심", 0.8, second_chunks)
+    repository.replace_episode_analysis(
+        project["id"],
+        first["id"],
+        first["content_hash"],
+        {
+            "entities": [
+                {"type": "character", "name": "이서하", "summary": "기록관", "aliases": []},
+                {"type": "character", "name": "강도윤", "summary": "호위", "aliases": []},
+            ],
+            "relations": [{"source": "이서하", "target": "강도윤", "type": "동행/협력", "confidence": 0.8}],
+            "issues": [],
+        },
+    )
+    repository.replace_episode_analysis(
+        project["id"],
+        second["id"],
+        second["content_hash"],
+        {
+            "entities": [
+                {"type": "character", "name": "이서하", "summary": "기록관", "aliases": []},
+                {"type": "character", "name": "강도윤", "summary": "호위", "aliases": []},
+            ],
+            "relations": [{"source": "이서하", "target": "강도윤", "type": "적대/의심", "confidence": 0.8}],
+            "issues": [],
+        },
+    )
+
+    response = client.get(f"/projects/{project['id']}/graph?start_chapter=0&end_chapter=0")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["range"]["document_count"] == 1
+    assert {relation["type"] for relation in body["relations"]} == {"동행/협력"}
+
+
 def test_analyze_requires_installed_local_llm(tmp_path: Path) -> None:
     client = TestClient(app)
     project = client.post("/projects", json={"title": "LLM 필요 테스트"}).json()

@@ -457,6 +457,29 @@ select:focus-visible {
   white-space: nowrap;
 }
 
+.document-analysis {
+  width: fit-content;
+  padding: 3px 7px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  color: #c7baac;
+  background: rgba(255, 255, 255, 0.05);
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.document-analysis.is-analyzed {
+  color: #9fd2ae;
+  border-color: rgba(149, 200, 166, 0.2);
+  background: rgba(95, 144, 117, 0.16);
+}
+
+.document-analysis.is-stale {
+  color: #f0c26e;
+  border-color: rgba(228, 181, 103, 0.24);
+  background: rgba(183, 131, 67, 0.16);
+}
+
 .document-delete {
   width: 32px;
   min-width: 32px;
@@ -849,6 +872,75 @@ select:focus-visible {
   background: rgba(255, 253, 248, 0.72);
 }
 
+.range-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(242, 234, 223, 0.72);
+}
+
+.range-controls > div {
+  display: grid;
+  gap: 2px;
+  min-width: 130px;
+}
+
+.range-controls strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.range-controls button,
+.range-controls select {
+  min-height: 31px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink-soft);
+  background: rgba(255, 253, 248, 0.82);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.range-controls button {
+  padding: 0 11px;
+  cursor: pointer;
+}
+
+.range-controls button.active {
+  color: #fffdf8;
+  border-color: transparent;
+  background: var(--desk-3);
+}
+
+.range-controls label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.range-controls select {
+  max-width: 150px;
+  padding: 0 8px;
+}
+
+.range-message {
+  flex: 1 1 220px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 750;
+  line-height: 1.4;
+}
+
+.range-message.ready {
+  color: #4f725f;
+}
+
 .relation-scope {
   display: inline-flex;
   gap: 4px;
@@ -1146,6 +1238,44 @@ select:focus-visible {
   border-left: 4px solid var(--muted);
   border-radius: 8px;
   background: rgba(255, 253, 248, 0.74);
+}
+
+.change-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(102, 135, 189, 0.28);
+  border-left: 4px solid var(--blue);
+  border-radius: 8px;
+  background: rgba(255, 253, 248, 0.74);
+}
+
+.change-card strong {
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.change-card p {
+  margin: 0;
+  color: var(--ink-soft);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.change-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.change-types span {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--ink-soft);
+  background: var(--paper-muted);
+  font-size: 12px;
+  font-weight: 800;
 }
 
 .issue-card p {

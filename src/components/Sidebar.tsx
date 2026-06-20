@@ -1,6 +1,12 @@
 import { FilePlus2, Play, Plus, RefreshCw, Trash2 } from "lucide-react";
 import type { AppSettings, LocalAiHealth, Project, StoryDocument } from "../lib/types";
 
+const DOCUMENT_ANALYSIS_LABELS: Record<StoryDocument["analysis_status"], string> = {
+  pending: "분석 대기",
+  analyzed: "분석 완료",
+  stale: "재분석 필요",
+};
+
 interface SidebarProps {
   projects: Project[];
   selectedProject: Project | null;
@@ -115,7 +121,15 @@ export function Sidebar({
             <div key={document.id} className="document-row">
               <div className="document-main">
                 <strong>{document.title}</strong>
-                <span>{document.format}</span>
+                <span>
+                  {document.chapter_index + 1}화 · {document.format}
+                </span>
+                <span className={`document-analysis is-${document.analysis_status}`}>
+                  {DOCUMENT_ANALYSIS_LABELS[document.analysis_status]}
+                  {document.analysis_status === "analyzed"
+                    ? ` · ${document.analysis_entity_count} nodes/${document.analysis_relation_count} links`
+                    : ""}
+                </span>
               </div>
               <button
                 type="button"

@@ -67,6 +67,11 @@ class StoryDocument(BaseModel):
     content_hash: str
     content: str
     created_at: str
+    analysis_status: Literal["pending", "analyzed", "stale"] = "pending"
+    analyzed_at: str | None = None
+    analysis_entity_count: int = 0
+    analysis_relation_count: int = 0
+    analysis_claim_count: int = 0
 
 
 class EntityNode(BaseModel):
@@ -116,12 +121,40 @@ class EvidenceChunk(BaseModel):
     project_id: int
     chunk_index: int
     text: str
+    start_offset: int = 0
+    end_offset: int = 0
+
+
+class RelationChange(BaseModel):
+    id: int
+    project_id: int
+    source_entity_id: int
+    target_entity_id: int
+    source_name: str
+    target_name: str
+    previous_type: str
+    current_type: str
+    previous_document_id: int
+    current_document_id: int
+    description: str
+    evidence_chunk_ids: list[int] = []
+
+
+class GraphRange(BaseModel):
+    start_chapter: int | None = None
+    end_chapter: int | None = None
+    document_ids: list[int] = []
+    document_count: int = 0
+    continuity_ready: bool = False
+    message: str = ""
 
 
 class GraphPayload(BaseModel):
     entities: list[EntityNode]
     relations: list[RelationEdge]
     issues: list[ContinuityIssue]
+    changes: list[RelationChange] = []
+    range: GraphRange = Field(default_factory=GraphRange)
 
 
 class AnalysisStatus(str, Enum):

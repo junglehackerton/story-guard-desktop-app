@@ -3,7 +3,9 @@ import type {
   EntityNode,
   EntityRelationshipDetail,
   EvidenceChunk,
+  GraphRange,
   IssueStatus,
+  RelationChange,
 } from "../lib/types";
 import { ENTITY_TYPE_LABELS, ISSUE_CATEGORY_LABELS, ISSUE_STATUS_LABELS } from "../lib/labels";
 
@@ -11,6 +13,8 @@ interface InspectorProps {
   entity: EntityNode | null;
   relationships: EntityRelationshipDetail[];
   issues: ContinuityIssue[];
+  changes: RelationChange[];
+  graphRange: GraphRange;
   evidenceByIssueId: Record<number, EvidenceChunk[]>;
   onIssueStatus: (issueId: number, status: IssueStatus) => void;
 }
@@ -26,6 +30,8 @@ export function Inspector({
   entity,
   relationships,
   issues,
+  changes,
+  graphRange,
   evidenceByIssueId,
   onIssueStatus,
 }: InspectorProps) {
@@ -75,11 +81,38 @@ export function Inspector({
 
       <section className="panel issue-panel">
         <div className="panel-title-row">
+          <h2>관계 변화</h2>
+          <span>{changes.length}</span>
+        </div>
+        <div className="issue-list">
+          {changes.length === 0 ? (
+            <p className="muted">선택 범위에서 뚜렷한 관계 변화가 없습니다.</p>
+          ) : (
+            changes.map((change) => (
+              <article key={change.id} className="change-card">
+                <strong>
+                  {change.source_name} - {change.target_name}
+                </strong>
+                <p>{change.description}</p>
+                <div className="change-types">
+                  <span>{change.previous_type}</span>
+                  <span>{change.current_type}</span>
+                </div>
+              </article>
+            ))
+          )}
+        </div>
+      </section>
+
+      <section className="panel issue-panel">
+        <div className="panel-title-row">
           <h2>설정 붕괴 리포트</h2>
           <span>{issues.length}</span>
         </div>
         <div className="issue-list">
-          {issues.length === 0 ? (
+          {!graphRange.continuity_ready ? (
+            <p className="muted">{graphRange.message}</p>
+          ) : issues.length === 0 ? (
             <p className="muted">열린 이슈가 없습니다.</p>
           ) : (
             issues.map((issue) => (

@@ -33,6 +33,15 @@ const EMPTY_GRAPH: GraphPayload = {
   entities: [],
   relations: [],
   issues: [],
+  changes: [],
+  range: {
+    start_chapter: null,
+    end_chapter: null,
+    document_ids: [],
+    document_count: 0,
+    continuity_ready: false,
+    message: "분석된 원고가 없습니다.",
+  },
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
@@ -51,6 +60,7 @@ const ENTITY_TYPES: EntityType[] = [
 ];
 
 type RelationScope = "core" | "all";
+type ChapterRange = { startChapter: number | null; endChapter: number | null };
 const SELECTED_PROJECT_STORAGE_KEY = "storyGuard.selectedProjectId";
 const INITIAL_STARTUP_STATUS: StartupStatus = {
   visible: true,
@@ -243,6 +253,10 @@ export default function App() {
   const [documentPathModalOpen, setDocumentPathModalOpen] = useState(false);
   const [documentPathDraft, setDocumentPathDraft] = useState("");
   const [documents, setDocuments] = useState<StoryDocument[]>([]);
+  const [chapterRange, setChapterRange] = useState<ChapterRange>({
+    startChapter: null,
+    endChapter: null,
+  });
   const [graph, setGraph] = useState<GraphPayload>(EMPTY_GRAPH);
   const [selectedEntity, setSelectedEntity] = useState<EntityNode | null>(null);
   const [relationScope, setRelationScope] = useState<RelationScope>("core");
@@ -265,6 +279,27 @@ export default function App() {
     () => graph.issues.filter((issue) => issue.status !== "ignored"),
     [graph.issues],
   );
+
+  const chapterOptions = useMemo(
+    () =>
+      documents.map((document) => ({
+        value: document.chapter_index,
+        label: `${document.chapter_index + 1}화 · ${document.title}`,
+      })),
+    [documents],
+  );
+
+  const graphRangeLabel = useMemo(() => {
+    if (documents.length === 0) {
+      return "원고 없음";
+    }
+    if (chapterRange.startChapter === null && chapterRange.endChapter === null) {
+      return `전체 누적 · ${documents.length}편`;
+    }
+    const startLabel = chapterRange.startChapter === null ? 1 : chapterRange.startChapter + 1;
+    const endLabel = chapterRange.endChapter === null ? documents.length : chapterRange.endChapter + 1;
+    return `${startLabel}화-${endLabel}화`;
+  }, [chapterRange.endChapter, chapterRange.startChapter, documents.length]);
 
   const filteredGraph = useMemo(() => {
     const entities = graph.entities.filter((entity) => visibleTypes.has(entity.type));
@@ -348,7 +383,7 @@ export default function App() {
     }
   }, []);
 
-  const refreshProjectData = useCallback(async (project: Project | null) => {
+  const refreshProjectData = useCallback(async (project: Project | null, range = chapterRange) => {
     const requestId = dataRequestIdRef.current + 1;
     dataRequestIdRef.current = requestId;
     if (!project) {
@@ -361,12 +396,12 @@ export default function App() {
       return;
     }
     setDocuments(nextDocuments);
-    const nextGraph = await api.graph(project.id);
+    const nextGraph = await api.graph(project.id, range);
     if (dataRequestIdRef.current !== requestId) {
       return;
     }
     setGraph(nextGraph);
-  }, []);
+  }, [chapterRange]);
 
   const refreshProjects = useCallback(async (preferredProjectId?: number | null) => {
     const nextProjects = await api.listProjects();
@@ -487,6 +522,13 @@ export default function App() {
   }, [refreshAll]);
 
   useEffect(() => {
+    if (!selectedProject) {
+      return;
+    }
+    void refreshProjectData(selectedProject, chapterRange);
+  }, [chapterRange, refreshProjectData, selectedProject]);
+
+  useEffect(() => {
     setProjectTitleDraft(selectedProject?.title ?? "");
     setEditingProjectTitle(false);
   }, [selectedProject?.id, selectedProject?.title]);
@@ -582,12 +624,39 @@ export default function App() {
     });
   }
 
+  function selectAllChapters() {
+    setChapterRange({ startChapter: null, endChapter: null });
+  }
+
+  function updateRangeStart(value: string) {
+    const startChapter = value === "all" ? null : Number(value);
+    setChapterRange((current) => ({
+      startChapter,
+      endChapter:
+        startChapter !== null && current.endChapter !== null && current.endChapter < startChapter
+          ? startChapter
+          : current.endChapter,
+    }));
+  }
+
+  function updateRangeEnd(value: string) {
+    const endChapter = value === "all" ? null : Number(value);
+    setChapterRange((current) => ({
+      startChapter:
+        endChapter !== null && current.startChapter !== null && current.startChapter > endChapter
+          ? endChapter
+          : current.startChapter,
+      endChapter,
+    }));
+  }
+
   function selectProject(project: Project) {
     window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, String(project.id));
     setSelectedProject(project);
     setSelectedEntity(null);
     setDocuments([]);
     setGraph(EMPTY_GRAPH);
+    setChapterRange({ startChapter: null, endChapter: null });
     setAnalysisJob(null);
     void refreshProjectData(project);
   }
@@ -611,6 +680,7 @@ export default function App() {
       window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, String(project.id));
       setDocuments([]);
       setGraph(EMPTY_GRAPH);
+      setChapterRange({ startChapter: null, endChapter: null });
       setSelectedEntity(null);
       setAnalysisJob(null);
       setProjectModalOpen(false);
@@ -667,6 +737,7 @@ export default function App() {
       setSelectedProject(null);
       setDocuments([]);
       setGraph(EMPTY_GRAPH);
+      setChapterRange({ startChapter: null, endChapter: null });
       setSelectedEntity(null);
       setAnalysisJob(null);
       const nextSelectedProject = await refreshProjects(null);
@@ -695,6 +766,7 @@ export default function App() {
         current.some((item) => item.id === document.id) ? current : [...current, document],
       );
       setGraph(EMPTY_GRAPH);
+      setChapterRange({ startChapter: null, endChapter: null });
       setSelectedEntity(null);
       setAnalysisJob(null);
       setNotice(`원고 추가: ${document.title} · 분석을 다시 실행하세요.`);
@@ -748,6 +820,7 @@ export default function App() {
       await api.deleteDocument(document.id);
       setDocuments((current) => current.filter((item) => item.id !== document.id));
       setGraph(EMPTY_GRAPH);
+      setChapterRange({ startChapter: null, endChapter: null });
       setSelectedEntity(null);
       setAnalysisJob(null);
       await refreshProjectData(selectedProject);
@@ -941,6 +1014,53 @@ export default function App() {
         {analysisJob && analysisJob.status !== "idle" && (
           <AnalysisProgressPanel job={analysisJob} />
         )}
+        <div className="range-controls" aria-label="회차 분석 범위">
+          <div>
+            <span className="label">분석 범위</span>
+            <strong>{graphRangeLabel}</strong>
+          </div>
+          <button
+            type="button"
+            className={chapterRange.startChapter === null && chapterRange.endChapter === null ? "active" : ""}
+            onClick={selectAllChapters}
+            disabled={documents.length === 0}
+          >
+            전체 누적
+          </button>
+          <label>
+            시작
+            <select
+              value={chapterRange.startChapter ?? "all"}
+              onChange={(event) => updateRangeStart(event.target.value)}
+              disabled={documents.length === 0}
+            >
+              <option value="all">1화</option>
+              {chapterOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label>
+            끝
+            <select
+              value={chapterRange.endChapter ?? "all"}
+              onChange={(event) => updateRangeEnd(event.target.value)}
+              disabled={documents.length === 0}
+            >
+              <option value="all">마지막</option>
+              {chapterOptions.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          <span className={graph.range.continuity_ready ? "range-message ready" : "range-message"}>
+            {graph.range.message}
+          </span>
+        </div>
         <div className="graph-controls">
           <div className="relation-scope" aria-label="관계 표시 범위">
             <button
@@ -979,6 +1099,8 @@ export default function App() {
         entity={selectedEntity}
         relationships={selectedRelationshipDetails}
         issues={openIssues}
+        changes={graph.changes}
+        graphRange={graph.range}
         evidenceByIssueId={evidenceByIssueId}
         onIssueStatus={updateIssueStatus}
       />

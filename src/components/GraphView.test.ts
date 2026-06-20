@@ -38,9 +38,25 @@ function relation(id: number, source: number, target: number, type: string): Rel
   };
 }
 
+function graphFixture(payload: Pick<GraphPayload, "entities" | "relations">): GraphPayload {
+  return {
+    ...payload,
+    issues: [],
+    changes: [],
+    range: {
+      start_chapter: null,
+      end_chapter: null,
+      document_ids: [1],
+      document_count: 1,
+      continuity_ready: false,
+      message: "테스트 범위",
+    },
+  };
+}
+
 describe("organization graph membership", () => {
   it("treats organization scope relations as set containment", () => {
-    const graph: GraphPayload = {
+    const graph = graphFixture({
       entities: [
         entity(1, "organization", "백야단"),
         entity(2, "character", "한서윤"),
@@ -52,8 +68,7 @@ describe("organization graph membership", () => {
         relation(2, 1, 3, "본부/거점"),
         relation(3, 1, 4, "관할"),
       ],
-      issues: [],
-    };
+    });
     const entitiesById = new Map(graph.entities.map((node) => [node.id, node]));
 
     const membership = buildOrganizationMembership(graph, entitiesById);
@@ -78,7 +93,7 @@ describe("organization graph membership", () => {
   });
 
   it("places organization domains with enough room between their member clusters", () => {
-    const graph: GraphPayload = {
+    const graph = graphFixture({
       entities: [
         entity(1, "organization", "백야단"),
         entity(2, "character", "한서윤"),
@@ -97,8 +112,7 @@ describe("organization graph membership", () => {
         relation(5, 5, 7, "본부/거점"),
         relation(6, 5, 8, "관할"),
       ],
-      issues: [],
-    };
+    });
     const entitiesById = new Map(graph.entities.map((node) => [node.id, node]));
     const degreeByEntityId = new Map(graph.entities.map((node) => [node.id, 0]));
     for (const edge of graph.relations) {

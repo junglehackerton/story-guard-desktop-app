@@ -94,7 +94,17 @@ export const api = {
     request<AnalysisJob>(`/projects/${projectId}/analysis/cancel`, {
       method: "POST",
     }),
-  graph: (projectId: number) => request<GraphPayload>(`/projects/${projectId}/graph`),
+  graph: (projectId: number, range?: { startChapter: number | null; endChapter: number | null }) => {
+    const params = new URLSearchParams();
+    if (range?.startChapter !== null && range?.startChapter !== undefined) {
+      params.set("start_chapter", String(range.startChapter));
+    }
+    if (range?.endChapter !== null && range?.endChapter !== undefined) {
+      params.set("end_chapter", String(range.endChapter));
+    }
+    const query = params.toString();
+    return request<GraphPayload>(`/projects/${projectId}/graph${query ? `?${query}` : ""}`);
+  },
   updateIssueStatus: (issueId: number, status: IssueStatus) =>
     request<ContinuityIssue>(`/issues/${issueId}/status`, {
       method: "PATCH",

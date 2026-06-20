@@ -35,7 +35,9 @@ CREATE TABLE IF NOT EXISTS chunks (
   document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   chunk_index INTEGER NOT NULL,
-  text TEXT NOT NULL
+  text TEXT NOT NULL,
+  start_offset INTEGER NOT NULL DEFAULT 0,
+  end_offset INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS entities (
@@ -85,8 +87,50 @@ CREATE TABLE IF NOT EXISTS document_analysis_cache (
   document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   content_hash TEXT NOT NULL,
+  model_name TEXT NOT NULL DEFAULT '',
+  prompt_version TEXT NOT NULL DEFAULT '',
   payload TEXT NOT NULL,
   analyzed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS episode_entity_mentions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  entity_type TEXT NOT NULL,
+  name TEXT NOT NULL,
+  aliases TEXT NOT NULL DEFAULT '[]',
+  summary TEXT NOT NULL DEFAULT '',
+  confidence REAL NOT NULL DEFAULT 0.7,
+  evidence_chunk_ids TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(document_id, entity_type, name)
+);
+
+CREATE TABLE IF NOT EXISTS episode_relations (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  source_name TEXT NOT NULL,
+  target_name TEXT NOT NULL,
+  type TEXT NOT NULL,
+  confidence REAL NOT NULL DEFAULT 0.7,
+  evidence_chunk_ids TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(document_id, source_name, target_name, type)
+);
+
+CREATE TABLE IF NOT EXISTS episode_claims (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  subject TEXT NOT NULL,
+  claim_type TEXT NOT NULL,
+  value TEXT NOT NULL DEFAULT '',
+  description TEXT NOT NULL DEFAULT '',
+  confidence REAL NOT NULL DEFAULT 0.7,
+  evidence_chunk_ids TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
 CREATE TABLE IF NOT EXISTS settings (
@@ -127,6 +171,30 @@ class Database:
                 "analysis_jobs",
                 "progress",
                 "INTEGER NOT NULL DEFAULT 0",
+            )
+            ensure_column(
+                connection,
+                "chunks",
+                "start_offset",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            ensure_column(
+                connection,
+                "chunks",
+                "end_offset",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            ensure_column(
+                connection,
+                "document_analysis_cache",
+                "model_name",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            ensure_column(
+                connection,
+                "document_analysis_cache",
+                "prompt_version",
+                "TEXT NOT NULL DEFAULT ''",
             )
 
 

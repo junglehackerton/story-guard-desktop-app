@@ -10,8 +10,10 @@ from backend.app.models import (
     AnalysisStatus,
     ContinuityIssue,
     EntityNode,
+    GraphRange,
     GraphPayload,
     Project,
+    RelationChange,
     RelationEdge,
     StoryDocument,
 )
@@ -104,17 +106,73 @@ class StoryRepository:
                 "SELECT * FROM documents WHERE project_id = ? ORDER BY chapter_index, id",
                 (project_id,),
             ).fetchall()
-        return [StoryDocument(**dict(row)) for row in rows]
+            cache_rows = connection.execute(
+                """
+                SELECT
+                  documents.id AS document_id,
+                  document_analysis_cache.content_hash AS analyzed_hash,
+                  document_analysis_cache.analyzed_at AS analyzed_at,
+                  COUNT(DISTINCT episode_entity_mentions.id) AS entity_count,
+                  COUNT(DISTINCT episode_relations.id) AS relation_count,
+                  COUNT(DISTINCT episode_claims.id) AS claim_count
+                FROM documents
+                LEFT JOIN document_analysis_cache
+                  ON document_analysis_cache.document_id = documents.id
+                LEFT JOIN episode_entity_mentions
+                  ON episode_entity_mentions.document_id = documents.id
+                LEFT JOIN episode_relations
+                  ON episode_relations.document_id = documents.id
+                LEFT JOIN episode_claims
+                  ON episode_claims.document_id = documents.id
+                WHERE documents.project_id = ?
+                GROUP BY documents.id
+                """,
+                (project_id,),
+            ).fetchall()
+        status_by_document = {int(row["document_id"]): dict(row) for row in cache_rows}
+        documents: list[StoryDocument] = []
+        for row in rows:
+            data = dict(row)
+            status = status_by_document.get(int(data["id"]), {})
+            analyzed_hash = str(status.get("analyzed_hash") or "")
+            if not analyzed_hash:
+                analysis_status = "pending"
+            elif analyzed_hash == data["content_hash"]:
+                analysis_status = "analyzed"
+            else:
+                analysis_status = "stale"
+            data.update(
+                {
+                    "analysis_status": analysis_status,
+                    "analyzed_at": status.get("analyzed_at"),
+                    "analysis_entity_count": int(status.get("entity_count") or 0),
+                    "analysis_relation_count": int(status.get("relation_count") or 0),
+                    "analysis_claim_count": int(status.get("claim_count") or 0),
+                }
+            )
+            documents.append(StoryDocument(**data))
+        return documents
 
-    def get_document_analysis_cache(self, document_id: int, content_hash: str) -> dict | None:
+    def get_document_analysis_cache(
+        self,
+        document_id: int,
+        content_hash: str,
+        model_name: str = "",
+        prompt_version: str = "",
+    ) -> dict | None:
+        query = """
+            SELECT payload
+            FROM document_analysis_cache
+            WHERE document_id = ? AND content_hash = ?
+        """
+        parameters: list[str | int] = [document_id, content_hash]
+        if model_name or prompt_version:
+            query += " AND model_name = ? AND prompt_version = ?"
+            parameters.extend([model_name, prompt_version])
         with self.database.connect() as connection:
             row = connection.execute(
-                """
-                SELECT payload
-                FROM document_analysis_cache
-                WHERE document_id = ? AND content_hash = ?
-                """,
-                (document_id, content_hash),
+                query,
+                parameters,
             ).fetchone()
         if row is None:
             return None
@@ -130,20 +188,24 @@ class StoryRepository:
         project_id: int,
         content_hash: str,
         payload: dict,
+        model_name: str = "",
+        prompt_version: str = "",
     ) -> None:
         with self.database.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO document_analysis_cache
-                  (document_id, project_id, content_hash, payload)
-                VALUES (?, ?, ?, ?)
+                  (document_id, project_id, content_hash, model_name, prompt_version, payload)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(document_id) DO UPDATE SET
                   project_id = excluded.project_id,
                   content_hash = excluded.content_hash,
+                  model_name = excluded.model_name,
+                  prompt_version = excluded.prompt_version,
                   payload = excluded.payload,
                   analyzed_at = CURRENT_TIMESTAMP
                 """,
-                (document_id, project_id, content_hash, encode_json(payload)),
+                (document_id, project_id, content_hash, model_name, prompt_version, encode_json(payload)),
             )
 
     def delete_document(self, document_id: int) -> int:
@@ -166,15 +228,25 @@ class StoryRepository:
 
     def replace_chunks(self, project_id: int, document_id: int, chunks: list[str]) -> list[int]:
         with self.database.connect() as connection:
+            document_row = connection.execute(
+                "SELECT content FROM documents WHERE id = ?", (document_id,)
+            ).fetchone()
+            document_content = str(document_row["content"]) if document_row is not None else ""
             connection.execute("DELETE FROM chunks WHERE document_id = ?", (document_id,))
             ids: list[int] = []
+            search_from = 0
             for index, text in enumerate(chunks):
+                start_offset = document_content.find(text, search_from) if document_content else -1
+                if start_offset < 0:
+                    start_offset = search_from
+                end_offset = start_offset + len(text)
+                search_from = max(end_offset, search_from)
                 cursor = connection.execute(
                     """
-                    INSERT INTO chunks (document_id, project_id, chunk_index, text)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO chunks (document_id, project_id, chunk_index, text, start_offset, end_offset)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (document_id, project_id, index, text),
+                    (document_id, project_id, index, text, start_offset, end_offset),
                 )
                 ids.append(int(cursor.lastrowid))
         return ids
@@ -217,6 +289,242 @@ class StoryRepository:
             connection.execute("DELETE FROM relations WHERE project_id = ?", (project_id,))
             connection.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
             connection.execute("DELETE FROM issues WHERE project_id = ?", (project_id,))
+
+    def clear_episode_analysis(self, project_id: int) -> None:
+        with self.database.connect() as connection:
+            connection.execute("DELETE FROM episode_claims WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM episode_relations WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM episode_entity_mentions WHERE project_id = ?", (project_id,))
+            connection.execute("DELETE FROM document_analysis_cache WHERE project_id = ?", (project_id,))
+
+    def replace_episode_analysis(
+        self,
+        project_id: int,
+        document_id: int,
+        content_hash: str,
+        payload: dict[str, Any],
+        model_name: str = "",
+        prompt_version: str = "",
+    ) -> None:
+        with self.database.connect() as connection:
+            chunk_rows = connection.execute(
+                "SELECT id FROM chunks WHERE document_id = ? ORDER BY chunk_index",
+                (document_id,),
+            ).fetchall()
+            default_evidence = [int(row["id"]) for row in chunk_rows]
+            connection.execute("DELETE FROM episode_claims WHERE document_id = ?", (document_id,))
+            connection.execute("DELETE FROM episode_relations WHERE document_id = ?", (document_id,))
+            connection.execute("DELETE FROM episode_entity_mentions WHERE document_id = ?", (document_id,))
+
+            for raw_entity in payload.get("entities", []):
+                if not isinstance(raw_entity, dict):
+                    continue
+                name = str(raw_entity.get("name", "")).strip()
+                entity_type = str(raw_entity.get("type", "")).strip()
+                if not name or not entity_type:
+                    continue
+                aliases = raw_entity.get("aliases", [])
+                clean_aliases = [str(alias).strip() for alias in aliases if str(alias).strip()] if isinstance(aliases, list) else []
+                confidence = _coerce_confidence(raw_entity.get("confidence", 0.7))
+                evidence_ids = _coerce_int_list(raw_entity.get("evidence_chunk_ids")) or default_evidence[:2]
+                connection.execute(
+                    """
+                    INSERT INTO episode_entity_mentions
+                      (project_id, document_id, entity_type, name, aliases, summary, confidence, evidence_chunk_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(document_id, entity_type, name) DO UPDATE SET
+                      aliases = excluded.aliases,
+                      summary = excluded.summary,
+                      confidence = excluded.confidence,
+                      evidence_chunk_ids = excluded.evidence_chunk_ids
+                    """,
+                    (
+                        project_id,
+                        document_id,
+                        entity_type,
+                        name[:80],
+                        encode_json(clean_aliases),
+                        str(raw_entity.get("summary", ""))[:400],
+                        confidence,
+                        encode_json(evidence_ids),
+                    ),
+                )
+
+            for raw_relation in payload.get("relations", []):
+                if not isinstance(raw_relation, dict):
+                    continue
+                source = str(raw_relation.get("source", "")).strip()
+                target = str(raw_relation.get("target", "")).strip()
+                relation_type = normalize_relation_type(str(raw_relation.get("type", "")).strip())
+                if not source or not target or source == target or not relation_type:
+                    continue
+                evidence_ids = _coerce_int_list(raw_relation.get("evidence_chunk_ids")) or default_evidence[:2]
+                connection.execute(
+                    """
+                    INSERT INTO episode_relations
+                      (project_id, document_id, source_name, target_name, type, confidence, evidence_chunk_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(document_id, source_name, target_name, type) DO UPDATE SET
+                      confidence = excluded.confidence,
+                      evidence_chunk_ids = excluded.evidence_chunk_ids
+                    """,
+                    (
+                        project_id,
+                        document_id,
+                        source[:80],
+                        target[:80],
+                        relation_type,
+                        _coerce_confidence(raw_relation.get("confidence", 0.7)),
+                        encode_json(evidence_ids),
+                    ),
+                )
+
+            for raw_issue in payload.get("issues", []):
+                if not isinstance(raw_issue, dict):
+                    continue
+                title = str(raw_issue.get("title", "")).strip()
+                description = str(raw_issue.get("description", "")).strip()
+                if not title and not description:
+                    continue
+                evidence_ids = _coerce_int_list(raw_issue.get("evidence_chunk_ids")) or default_evidence[:2]
+                connection.execute(
+                    """
+                    INSERT INTO episode_claims
+                      (project_id, document_id, subject, claim_type, value, description, confidence, evidence_chunk_ids)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        project_id,
+                        document_id,
+                        title[:120] or "설정 주장",
+                        str(raw_issue.get("category", "contradiction"))[:80],
+                        str(raw_issue.get("severity", "medium"))[:80],
+                        description[:1000],
+                        _coerce_confidence(raw_issue.get("confidence", 0.7)),
+                        encode_json(evidence_ids),
+                    ),
+                )
+
+            connection.execute(
+                """
+                INSERT INTO document_analysis_cache
+                  (document_id, project_id, content_hash, model_name, prompt_version, payload)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id) DO UPDATE SET
+                  project_id = excluded.project_id,
+                  content_hash = excluded.content_hash,
+                  model_name = excluded.model_name,
+                  prompt_version = excluded.prompt_version,
+                  payload = excluded.payload,
+                  analyzed_at = CURRENT_TIMESTAMP
+                """,
+                (document_id, project_id, content_hash, model_name, prompt_version, encode_json(payload)),
+            )
+
+    def episode_payload(
+        self,
+        project_id: int,
+        start_chapter: int | None = None,
+        end_chapter: int | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        where, parameters = self._document_range_filter(project_id, start_chapter, end_chapter)
+        with self.database.connect() as connection:
+            entity_rows = connection.execute(
+                f"""
+                SELECT episode_entity_mentions.*, documents.chapter_index
+                FROM episode_entity_mentions
+                JOIN documents ON documents.id = episode_entity_mentions.document_id
+                WHERE {where}
+                ORDER BY documents.chapter_index, documents.id, episode_entity_mentions.id
+                """,
+                parameters,
+            ).fetchall()
+            relation_rows = connection.execute(
+                f"""
+                SELECT episode_relations.*, documents.chapter_index
+                FROM episode_relations
+                JOIN documents ON documents.id = episode_relations.document_id
+                WHERE {where}
+                ORDER BY documents.chapter_index, documents.id, episode_relations.id
+                """,
+                parameters,
+            ).fetchall()
+            claim_rows = connection.execute(
+                f"""
+                SELECT episode_claims.*, documents.chapter_index
+                FROM episode_claims
+                JOIN documents ON documents.id = episode_claims.document_id
+                WHERE {where}
+                ORDER BY documents.chapter_index, documents.id, episode_claims.id
+                """,
+                parameters,
+            ).fetchall()
+
+        entities_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in entity_rows:
+            data = dict(row)
+            key = (str(data["entity_type"]), str(data["name"]))
+            aliases = decode_json(data["aliases"])
+            evidence_ids = decode_json(data["evidence_chunk_ids"])
+            if key not in entities_by_key:
+                entities_by_key[key] = {
+                    "type": data["entity_type"],
+                    "name": data["name"],
+                    "summary": data["summary"],
+                    "aliases": aliases,
+                    "confidence": float(data["confidence"] or 0.7),
+                    "_first_seen_document_id": int(data["document_id"]),
+                    "_document_ids": [int(data["document_id"])],
+                    "evidence_chunk_ids": evidence_ids,
+                }
+                continue
+            existing = entities_by_key[key]
+            existing_aliases = existing.setdefault("aliases", [])
+            for alias in aliases:
+                if alias not in existing_aliases:
+                    existing_aliases.append(alias)
+            if int(data["document_id"]) not in existing["_document_ids"]:
+                existing["_document_ids"].append(int(data["document_id"]))
+            for evidence_id in evidence_ids:
+                if evidence_id not in existing["evidence_chunk_ids"]:
+                    existing["evidence_chunk_ids"].append(evidence_id)
+            existing["confidence"] = max(float(existing.get("confidence", 0.7)), float(data["confidence"] or 0.7))
+
+        relations: list[dict[str, Any]] = []
+        for row in relation_rows:
+            data = dict(row)
+            relations.append(
+                {
+                    "source": data["source_name"],
+                    "target": data["target_name"],
+                    "type": data["type"],
+                    "confidence": float(data["confidence"] or 0.7),
+                    "_document_id": int(data["document_id"]),
+                    "evidence_chunk_ids": decode_json(data["evidence_chunk_ids"]),
+                }
+            )
+
+        claims = []
+        for row in claim_rows:
+            data = dict(row)
+            claims.append(
+                {
+                    "subject": data["subject"],
+                    "type": data["claim_type"],
+                    "value": data["value"],
+                    "description": data["description"],
+                    "confidence": float(data["confidence"] or 0.7),
+                    "_document_id": int(data["document_id"]),
+                    "evidence_chunk_ids": decode_json(data["evidence_chunk_ids"]),
+                }
+            )
+
+        return {
+            "entities": list(entities_by_key.values()),
+            "relations": relations,
+            "claims": claims,
+            "issues": [],
+        }
 
     def upsert_entity(
         self,
@@ -343,7 +651,13 @@ class StoryRepository:
         data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
         return ContinuityIssue(**data)
 
-    def graph(self, project_id: int) -> GraphPayload:
+    def graph(
+        self,
+        project_id: int,
+        start_chapter: int | None = None,
+        end_chapter: int | None = None,
+    ) -> GraphPayload:
+        range_where, range_parameters = self._document_range_filter(project_id, start_chapter, end_chapter)
         with self.database.connect() as connection:
             entity_rows = connection.execute(
                 "SELECT * FROM entities WHERE project_id = ? ORDER BY type, name",
@@ -358,9 +672,28 @@ class StoryRepository:
                 (project_id,),
             ).fetchall()
             document_rows = connection.execute(
-                "SELECT id, content FROM documents WHERE project_id = ? ORDER BY chapter_index, id",
-                (project_id,),
+                f"""
+                SELECT id, content, chapter_index
+                FROM documents
+                WHERE {range_where}
+                ORDER BY chapter_index, id
+                """,
+                range_parameters,
             ).fetchall()
+            chunk_rows = connection.execute(
+                f"""
+                SELECT chunks.id, chunks.document_id
+                FROM chunks
+                JOIN documents ON documents.id = chunks.document_id
+                WHERE {range_where}
+                ORDER BY documents.chapter_index, chunks.chunk_index
+                """,
+                range_parameters,
+            ).fetchall()
+        selected_document_ids = [int(row["id"]) for row in document_rows]
+        selected_chunk_ids = {int(row["id"]) for row in chunk_rows}
+        has_range_filter = start_chapter is not None or end_chapter is not None
+
         entities = []
         entity_payloads: list[dict[str, Any]] = []
         for row in entity_rows:
@@ -370,20 +703,151 @@ class StoryRepository:
         entity_metrics = _entity_story_metrics(entity_payloads, [dict(row) for row in document_rows])
         for data in entity_payloads:
             data.update(entity_metrics.get(int(data["id"]), {}))
+            if has_range_filter and data.get("document_count", 0) <= 0:
+                continue
             entities.append(EntityNode(**data))
+        visible_entity_ids = {entity.id for entity in entities}
         relations = []
         for row in relation_rows:
             data = dict(row)
             data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
+            if has_range_filter:
+                evidence_ids = set(_coerce_int_list(data["evidence_chunk_ids"]))
+                if evidence_ids and not (evidence_ids & selected_chunk_ids):
+                    continue
+                if int(data["source_entity_id"]) not in visible_entity_ids or int(data["target_entity_id"]) not in visible_entity_ids:
+                    continue
             data["type"] = normalize_relation_type(str(data["type"]))
             data.update(_relation_story_metrics(data, entity_metrics, len(document_rows)))
             relations.append(RelationEdge(**data))
         issues = []
-        for row in issue_rows:
+        if not document_rows or len(document_rows) >= 5:
+            for row in issue_rows:
+                data = dict(row)
+                data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
+                if has_range_filter:
+                    evidence_ids = set(_coerce_int_list(data["evidence_chunk_ids"]))
+                    if evidence_ids and not (evidence_ids & selected_chunk_ids):
+                        continue
+                issues.append(ContinuityIssue(**data))
+        changes = self._relation_changes(project_id, selected_document_ids, visible_entity_ids)
+        graph_range = GraphRange(
+            start_chapter=start_chapter,
+            end_chapter=end_chapter,
+            document_ids=selected_document_ids,
+            document_count=len(selected_document_ids),
+            continuity_ready=len(selected_document_ids) >= 5,
+            message=(
+                "선택 범위가 5편 이상이라 설정 붕괴 후보를 판단합니다."
+                if len(selected_document_ids) >= 5
+                else "설정 붕괴 후보는 최소 5편 이상 누적된 뒤 판단합니다."
+            ),
+        )
+        return GraphPayload(
+            entities=entities,
+            relations=relations,
+            issues=issues,
+            changes=changes,
+            range=graph_range,
+        )
+
+    def _relation_changes(
+        self,
+        project_id: int,
+        document_ids: list[int],
+        visible_entity_ids: set[int],
+    ) -> list[RelationChange]:
+        if len(document_ids) < 2:
+            return []
+        placeholders = ",".join("?" for _ in document_ids)
+        with self.database.connect() as connection:
+            entity_rows = connection.execute(
+                "SELECT id, name, aliases FROM entities WHERE project_id = ?",
+                (project_id,),
+            ).fetchall()
+            relation_rows = connection.execute(
+                f"""
+                SELECT
+                  episode_relations.*,
+                  documents.chapter_index
+                FROM episode_relations
+                JOIN documents ON documents.id = episode_relations.document_id
+                WHERE episode_relations.project_id = ?
+                  AND episode_relations.document_id IN ({placeholders})
+                ORDER BY documents.chapter_index, documents.id, episode_relations.id
+                """,
+                [project_id, *document_ids],
+            ).fetchall()
+        entity_ids_by_term: dict[str, int] = {}
+        names_by_id: dict[int, str] = {}
+        for row in entity_rows:
+            entity_id = int(row["id"])
+            name = str(row["name"])
+            names_by_id[entity_id] = name
+            entity_ids_by_term[name] = entity_id
+            for alias in decode_json(row["aliases"]):
+                entity_ids_by_term.setdefault(str(alias), entity_id)
+
+        latest_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
+        changes: list[RelationChange] = []
+        for row in relation_rows:
             data = dict(row)
-            data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
-            issues.append(ContinuityIssue(**data))
-        return GraphPayload(entities=entities, relations=relations, issues=issues)
+            source_id = entity_ids_by_term.get(str(data["source_name"]))
+            target_id = entity_ids_by_term.get(str(data["target_name"]))
+            if source_id is None or target_id is None:
+                continue
+            if source_id not in visible_entity_ids or target_id not in visible_entity_ids:
+                continue
+            pair_key = (source_id, target_id)
+            relation_type = normalize_relation_type(str(data["type"]))
+            previous = latest_by_pair.get(pair_key)
+            if previous is not None and previous["type"] != relation_type:
+                evidence_ids = [
+                    *_coerce_int_list(previous.get("evidence_chunk_ids")),
+                    *_coerce_int_list(data.get("evidence_chunk_ids")),
+                ]
+                changes.append(
+                    RelationChange(
+                        id=len(changes) + 1,
+                        project_id=project_id,
+                        source_entity_id=source_id,
+                        target_entity_id=target_id,
+                        source_name=names_by_id.get(source_id, str(data["source_name"])),
+                        target_name=names_by_id.get(target_id, str(data["target_name"])),
+                        previous_type=str(previous["type"]),
+                        current_type=relation_type,
+                        previous_document_id=int(previous["document_id"]),
+                        current_document_id=int(data["document_id"]),
+                        description=(
+                            f"{names_by_id.get(source_id, data['source_name'])}와 "
+                            f"{names_by_id.get(target_id, data['target_name'])}의 관계가 "
+                            f"{previous['type']}에서 {relation_type}(으)로 바뀌었습니다."
+                        ),
+                        evidence_chunk_ids=list(dict.fromkeys(evidence_ids)),
+                    )
+                )
+            latest_by_pair[pair_key] = {
+                "type": relation_type,
+                "document_id": int(data["document_id"]),
+                "evidence_chunk_ids": decode_json(data["evidence_chunk_ids"]),
+            }
+        return changes
+
+    def _document_range_filter(
+        self,
+        project_id: int,
+        start_chapter: int | None,
+        end_chapter: int | None,
+    ) -> tuple[str, list[int]]:
+        clauses = ["documents.project_id = ?"]
+        parameters = [project_id]
+        if start_chapter is not None:
+            clauses.append("documents.chapter_index >= ?")
+            parameters.append(start_chapter)
+        if end_chapter is not None:
+            clauses.append("documents.chapter_index <= ?")
+            parameters.append(end_chapter)
+        return " AND ".join(clauses), parameters
 
     def create_job(
         self,
@@ -653,6 +1117,31 @@ def re_split_query(query: str) -> list[str]:
 
 def clamp_progress(progress: int) -> int:
     return max(0, min(100, int(progress)))
+
+
+def _coerce_confidence(value: Any) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = 0.7
+    return max(0.0, min(confidence, 1.0))
+
+
+def _coerce_int_list(value: Any) -> list[int]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(value, list):
+        return []
+    result: list[int] = []
+    for item in value:
+        try:
+            result.append(int(item))
+        except (TypeError, ValueError):
+            continue
+    return result
 
 
 def normalize_relation_type(relation_type: str) -> str:

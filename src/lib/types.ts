@@ -27,6 +27,11 @@ export interface StoryDocument {
   content_hash: string;
   content: string;
   created_at: string;
+  analysis_status: "pending" | "analyzed" | "stale";
+  analyzed_at: string | null;
+  analysis_entity_count: number;
+  analysis_relation_count: number;
+  analysis_claim_count: number;
 }
 
 export interface DocumentDeleteResult {
@@ -90,12 +95,40 @@ export interface EvidenceChunk {
   project_id: number;
   chunk_index: number;
   text: string;
+  start_offset: number;
+  end_offset: number;
+}
+
+export interface RelationChange {
+  id: number;
+  project_id: number;
+  source_entity_id: number;
+  target_entity_id: number;
+  source_name: string;
+  target_name: string;
+  previous_type: string;
+  current_type: string;
+  previous_document_id: number;
+  current_document_id: number;
+  description: string;
+  evidence_chunk_ids: number[];
+}
+
+export interface GraphRange {
+  start_chapter: number | null;
+  end_chapter: number | null;
+  document_ids: number[];
+  document_count: number;
+  continuity_ready: boolean;
+  message: string;
 }
 
 export interface GraphPayload {
   entities: EntityNode[];
   relations: RelationEdge[];
   issues: ContinuityIssue[];
+  changes: RelationChange[];
+  range: GraphRange;
 }
 
 export type AnalysisStatus = "idle" | "running" | "completed" | "failed" | "cancelled";

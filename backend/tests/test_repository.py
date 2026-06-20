@@ -123,3 +123,78 @@ def test_mark_running_jobs_interrupted_closes_stale_jobs(tmp_path: Path) -> None
     assert job.status == "failed"
     assert job.current_step == "failed"
     assert "이전 실행" in job.message
+
+
+def test_episode_analysis_status_range_graph_and_relation_changes(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("회차 범위 테스트")
+    first = repository.add_document(
+        project.id,
+        tmp_path / "episode-01.md",
+        "1화",
+        "md",
+        "hash-1",
+        "이서하는 강도윤과 동행했다.",
+        chapter_index=0,
+    )
+    second = repository.add_document(
+        project.id,
+        tmp_path / "episode-02.md",
+        "2화",
+        "md",
+        "hash-2",
+        "이서하는 강도윤을 의심했다.",
+        chapter_index=1,
+    )
+    first_chunks = repository.replace_chunks(project.id, first.id, ["이서하는 강도윤과 동행했다."])
+    second_chunks = repository.replace_chunks(project.id, second.id, ["이서하는 강도윤을 의심했다."])
+
+    seoha = repository.upsert_entity(project.id, "character", "이서하", [], "기록관", first.id)
+    doyun = repository.upsert_entity(project.id, "character", "강도윤", [], "호위", first.id)
+    repository.add_relation(project.id, seoha.id, doyun.id, "동행/협력", 0.8, first_chunks)
+    repository.add_relation(project.id, seoha.id, doyun.id, "적대/의심", 0.82, second_chunks)
+    repository.replace_episode_analysis(
+        project.id,
+        first.id,
+        first.content_hash,
+        {
+            "entities": [
+                {"type": "character", "name": "이서하", "summary": "기록관", "aliases": []},
+                {"type": "character", "name": "강도윤", "summary": "호위", "aliases": []},
+            ],
+            "relations": [
+                {"source": "이서하", "target": "강도윤", "type": "동행/협력", "confidence": 0.8},
+            ],
+            "issues": [],
+        },
+        model_name="fake.gguf",
+        prompt_version="test-v1",
+    )
+    repository.replace_episode_analysis(
+        project.id,
+        second.id,
+        second.content_hash,
+        {
+            "entities": [
+                {"type": "character", "name": "이서하", "summary": "기록관", "aliases": []},
+                {"type": "character", "name": "강도윤", "summary": "호위", "aliases": []},
+            ],
+            "relations": [
+                {"source": "이서하", "target": "강도윤", "type": "적대/의심", "confidence": 0.82},
+            ],
+            "issues": [],
+        },
+        model_name="fake.gguf",
+        prompt_version="test-v1",
+    )
+
+    documents = repository.list_documents(project.id)
+    first_range = repository.graph(project.id, start_chapter=0, end_chapter=0)
+    full_graph = repository.graph(project.id)
+
+    assert [document.analysis_status for document in documents] == ["analyzed", "analyzed"]
+    assert {relation.type for relation in first_range.relations} == {"동행/협력"}
+    assert first_range.range.continuity_ready is False
+    assert len(full_graph.changes) == 1
+    assert full_graph.changes[0].previous_type == "동행/협력"
+    assert full_graph.changes[0].current_type == "적대/의심"

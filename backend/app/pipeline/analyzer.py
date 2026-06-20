@@ -7,7 +7,7 @@ from typing_extensions import TypedDict
 
 from backend.app.models import AnalysisStatus
 from backend.app.repository import StoryRepository
-from backend.app.services.local_llm import LocalLlmExtractor
+from backend.app.services.local_llm import LocalLlmExtractor, sanitize_story_payload
 from backend.app.services.parser import split_chunks
 from backend.app.services.rag import RagService
 
@@ -36,6 +36,7 @@ MIN_DOCUMENTS_FOR_CONTINUITY_ISSUES = 5
 MAX_ANALYSIS_SEGMENT_CHARS = 2400
 ANALYSIS_SEGMENT_OVERLAP_CHARS = 180
 MAX_ANALYSIS_CONTEXT_CHARS = 1400
+ANALYSIS_PROMPT_VERSION = "episode-facts-v4"
 
 
 @dataclass
@@ -165,17 +166,36 @@ class StoryAnalyzer:
             raise RuntimeError("로컬 LLM 모델이 준비되지 않았습니다. 환경 설정에서 모델 설치를 실행해 주세요.")
 
         self._raise_if_cancelled(job_id, project_id)
-        payload: dict[str, list[dict[str, Any]]] = {"entities": [], "relations": [], "issues": []}
+        model_name = str(getattr(self.llm, "model", "local-llm"))
+        payload: dict[str, list[dict[str, Any]]] = {"entities": [], "relations": [], "issues": [], "claims": []}
         processed_units = 0
         total_units = sum(max(len(self._analysis_inputs([document])), 1) for document in documents)
         for document_index, document in enumerate(documents, start=1):
-            cached_payload = self.repository.get_document_analysis_cache(document.id, document.content_hash)
+            cached_payload = self.repository.get_document_analysis_cache(
+                document.id,
+                document.content_hash,
+                model_name=model_name,
+                prompt_version=ANALYSIS_PROMPT_VERSION,
+            )
             if cached_payload is not None:
+                cached_payload = sanitize_story_payload(
+                    cached_payload,
+                    known_entity_names=self._entity_names(payload),
+                    story_text=document.content,
+                )
+                self.repository.replace_episode_analysis(
+                    project_id,
+                    document.id,
+                    document.content_hash,
+                    cached_payload,
+                    model_name=model_name,
+                    prompt_version=ANALYSIS_PROMPT_VERSION,
+                )
                 self._merge_payloads(payload, cached_payload, document.id)
                 processed_units += max(len(self._analysis_inputs([document])), 1)
                 continue
 
-            document_payload: dict[str, list[dict[str, Any]]] = {"entities": [], "relations": [], "issues": []}
+            document_payload: dict[str, list[dict[str, Any]]] = {"entities": [], "relations": [], "issues": [], "claims": []}
             analysis_inputs = self._analysis_inputs([document], document_index=document_index)
             for analysis_input in analysis_inputs:
                 self._raise_if_cancelled(job_id, project_id)
@@ -194,17 +214,35 @@ class StoryAnalyzer:
                     context=self._analysis_context(payload),
                     known_entity_names=self._entity_names(payload),
                 )
+                segment_payload = sanitize_story_payload(
+                    segment_payload,
+                    known_entity_names=self._entity_names(payload),
+                    story_text=analysis_input["text"],
+                )
+                evidence_ids = self._chunk_ids_for_document(chunks, document.id)
+                self._attach_segment_evidence(segment_payload, evidence_ids)
                 self._merge_payloads(payload, segment_payload, document.id)
                 self._merge_payloads(document_payload, segment_payload, document.id)
                 processed_units += 1
             if document_payload["entities"] or document_payload["relations"] or document_payload["issues"]:
-                self.repository.upsert_document_analysis_cache(
-                    document.id,
+                self.repository.replace_episode_analysis(
                     project_id,
+                    document.id,
                     document.content_hash,
                     document_payload,
+                    model_name=model_name,
+                    prompt_version=ANALYSIS_PROMPT_VERSION,
                 )
 
+        payload = sanitize_story_payload(
+            self.repository.episode_payload(project_id),
+            story_text="\n\n".join(str(document.content) for document in documents),
+        )
+        payload["issues"] = (
+            self._issues_from_claims(payload.get("claims", []))
+            if len(documents) >= MIN_DOCUMENTS_FOR_CONTINUITY_ISSUES
+            else []
+        )
         self._detect_continuity_issues(project_id, documents, payload, job_id)
         self._raise_if_cancelled(job_id, project_id)
         self._progress(job_id, "relations", 62, "LLM이 추출한 관계를 저장 가능한 형태로 정리하는 중입니다.")
@@ -251,7 +289,7 @@ class StoryAnalyzer:
             for alias in entity.aliases:
                 entities_by_name.setdefault(alias, entity.id)
 
-        default_evidence = [chunks[0]["id"]] if chunks else []
+        seen_relation_keys: set[tuple[int, int, str]] = set()
         for raw_relation in payload.get("relations", []):
             self._raise_if_cancelled(job_id, project_id)
             if not isinstance(raw_relation, dict):
@@ -260,13 +298,24 @@ class StoryAnalyzer:
             target_id = entities_by_name.get(str(raw_relation.get("target", "")).strip())
             if not source_id or not target_id or source_id == target_id:
                 continue
+            relation_type = str(raw_relation.get("type", "related_to"))[:80]
+            relation_key = (source_id, target_id, relation_type)
+            if relation_key in seen_relation_keys:
+                continue
+            seen_relation_keys.add(relation_key)
+            evidence_chunk_ids = self._payload_evidence_ids(raw_relation)
+            if not evidence_chunk_ids:
+                document_id = int(raw_relation.get("_document_id") or 0)
+                evidence_chunk_ids = self._chunk_ids_for_document(chunks, document_id)[:2]
+            if not evidence_chunk_ids and chunks:
+                evidence_chunk_ids = [int(chunks[0]["id"])]
             self.repository.add_relation(
                 project_id=project_id,
                 source_entity_id=source_id,
                 target_entity_id=target_id,
-                relation_type=str(raw_relation.get("type", "related_to"))[:80],
+                relation_type=relation_type,
                 confidence=float(raw_relation.get("confidence", 0.7) or 0.7),
-                evidence_chunk_ids=default_evidence,
+                evidence_chunk_ids=evidence_chunk_ids,
             )
 
         if len(documents) < MIN_DOCUMENTS_FOR_CONTINUITY_ISSUES:
@@ -278,13 +327,16 @@ class StoryAnalyzer:
                 continue
             severity = str(raw_issue.get("severity", "medium"))
             category = str(raw_issue.get("category", "contradiction"))
+            evidence_chunk_ids = self._payload_evidence_ids(raw_issue)
+            if not evidence_chunk_ids and chunks:
+                evidence_chunk_ids = [int(chunks[0]["id"])]
             self.repository.add_issue(
                 project_id=project_id,
                 severity=severity if severity in ALLOWED_SEVERITIES else "medium",
                 category=category if category in ALLOWED_ISSUE_CATEGORIES else "contradiction",
                 title=str(raw_issue.get("title", "설정 점검 후보"))[:120],
                 description=str(raw_issue.get("description", ""))[:1000],
-                evidence_chunk_ids=default_evidence,
+                evidence_chunk_ids=evidence_chunk_ids,
             )
 
     def _detect_continuity_issues(
@@ -349,6 +401,61 @@ class StoryAnalyzer:
                     }
                 )
         return analysis_inputs
+
+    def _chunk_ids_for_document(self, chunks: list[dict], document_id: int) -> list[int]:
+        return [
+            int(chunk["id"])
+            for chunk in chunks
+            if int(chunk.get("document_id") or 0) == int(document_id)
+        ]
+
+    def _attach_segment_evidence(self, payload: dict[str, Any], evidence_chunk_ids: list[int]) -> None:
+        if not evidence_chunk_ids:
+            return
+        for key in ("entities", "relations", "issues", "claims"):
+            values = payload.get(key, [])
+            if not isinstance(values, list):
+                continue
+            for value in values:
+                if isinstance(value, dict) and not value.get("evidence_chunk_ids"):
+                    value["evidence_chunk_ids"] = evidence_chunk_ids[:2]
+
+    def _payload_evidence_ids(self, payload: dict[str, Any]) -> list[int]:
+        raw_ids = payload.get("evidence_chunk_ids", [])
+        if not isinstance(raw_ids, list):
+            return []
+        evidence_ids: list[int] = []
+        for raw_id in raw_ids:
+            try:
+                evidence_ids.append(int(raw_id))
+            except (TypeError, ValueError):
+                continue
+        return list(dict.fromkeys(evidence_ids))
+
+    def _issues_from_claims(self, claims: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        issues: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            title = str(claim.get("subject", "")).strip()
+            description = str(claim.get("description", "")).strip()
+            if not title and not description:
+                continue
+            key = (title, description)
+            if key in seen:
+                continue
+            seen.add(key)
+            issues.append(
+                {
+                    "severity": str(claim.get("value", "medium")) or "medium",
+                    "category": str(claim.get("type", "contradiction")) or "contradiction",
+                    "title": title or "설정 점검 후보",
+                    "description": description,
+                    "evidence_chunk_ids": claim.get("evidence_chunk_ids", []),
+                }
+            )
+        return issues
 
     def _merge_payloads(
         self,
@@ -423,6 +530,28 @@ class StoryAnalyzer:
                 continue
             aggregate["issues"].append(dict(raw_issue))
             issue_keys.add(key)
+
+        claim_keys = {
+            (
+                str(claim.get("subject", "")),
+                str(claim.get("type", "")),
+                str(claim.get("description", "")),
+            )
+            for claim in aggregate.get("claims", [])
+        }
+        for raw_claim in payload.get("claims", []):
+            if not isinstance(raw_claim, dict):
+                continue
+            subject = str(raw_claim.get("subject", "")).strip()
+            claim_type = str(raw_claim.get("type", "")).strip()
+            description = str(raw_claim.get("description", "")).strip()
+            if not subject and not description:
+                continue
+            key = (subject, claim_type, description)
+            if key in claim_keys:
+                continue
+            aggregate.setdefault("claims", []).append(dict(raw_claim))
+            claim_keys.add(key)
 
     def _analysis_context(self, payload: dict[str, list[dict[str, Any]]]) -> str:
         lines: list[str] = []

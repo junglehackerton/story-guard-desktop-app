@@ -4,7 +4,7 @@ import pytest
 
 from backend.app.database import Database
 from backend.app.models import AnalysisStatus
-from backend.app.pipeline.analyzer import StoryAnalyzer
+from backend.app.pipeline.analyzer import ANALYSIS_PROMPT_VERSION, StoryAnalyzer
 from backend.app.repository import StoryRepository
 from backend.app.services.parser import read_document, split_chunks
 
@@ -100,6 +100,21 @@ class SparseLlmExtractor:
         known_entity_names: list[str] | None = None,
     ) -> dict:
         return {"entities": [], "relations": [], "issues": []}
+
+
+class CacheOnlyLlmExtractor:
+    model = "cache-only-model.gguf"
+
+    def enabled(self) -> bool:
+        return True
+
+    def extract_story_facts(
+        self,
+        text: str,
+        context: str = "",
+        known_entity_names: list[str] | None = None,
+    ) -> dict:
+        raise AssertionError("cached analysis should be sanitized without calling the LLM")
 
 
 class RecordingLlmExtractor(FakeLlmExtractor):
@@ -330,7 +345,7 @@ def test_analyzer_processes_documents_sequentially_with_previous_context(tmp_pat
     assert "기존 엔티티" in llm.calls[1]["context"]
     assert "이서하" in llm.calls[1]["context"]
     assert "이서하" in llm.calls[2]["known_entity_names"]
-    assert {entity.name for entity in graph.entities} == {"이서하", "강도윤", "류하진"}
+    assert {entity.name for entity in graph.entities} == {"이서하", "강도윤", "류하진", "회백원"}
     assert {relation.type for relation in graph.relations} == {"동행/협력"}
 
 
@@ -373,6 +388,7 @@ def test_analyzer_reuses_cached_document_analysis_when_chapters_are_added(tmp_pa
 
     StoryAnalyzer(repository, llm=second_llm).analyze_project(project.id)
     graph = repository.graph(project.id)
+    documents = repository.list_documents(project.id)
 
     assert len(first_llm.calls) == 3
     assert len(second_llm.calls) == 3
@@ -381,6 +397,69 @@ def test_analyzer_reuses_cached_document_analysis_when_chapters_are_added(tmp_pa
     assert "이서하" in second_llm.calls[0]["context"]
     assert "이서하" in second_llm.calls[0]["known_entity_names"]
     assert {entity.name for entity in graph.entities} == {"이서하", "강도윤", "류하진", "백유라", "오문석", "마리안"}
+    assert [document.analysis_status for document in documents] == ["analyzed"] * 6
+    assert all(document.analysis_entity_count == 1 for document in documents)
+
+
+def test_analyzer_sanitizes_cached_episode_payload_before_projecting_graph(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("캐시 정규화 작품")
+    story = """
+이서하는 회백원 지하 서고의 문을 닫았다.
+강도윤은 회백원 경비대장답게 계단을 내려왔다.
+백유라는 해무상단의 장부 관리인이었다.
+접견실에는 청린 감찰국의 푸른 제복이 서 있었다. 류하진은 젖은 모자를 벗었다.
+접견실 창밖에서 백유라가 문턱을 넘지 않은 채 웃었다.
+""".strip()
+    story_path = tmp_path / "episode-01.txt"
+    story_path.write_text(story, encoding="utf-8")
+    parsed, file_format, digest = read_document(story_path)
+    document = repository.add_document(
+        project_id=project.id,
+        path=story_path,
+        title="episode-01",
+        file_format=file_format,
+        content_hash=digest,
+        content=parsed,
+        chapter_index=0,
+    )
+    repository.replace_chunks(project.id, document.id, split_chunks(parsed))
+    bad_payload = {
+        "entities": [
+            {"type": "character", "name": "서하", "summary": "기록관", "aliases": []},
+            {"type": "item", "name": "접견실", "summary": "접견 공간", "aliases": []},
+            {"type": "item", "name": "접견실 창", "summary": "창", "aliases": []},
+            {"type": "item", "name": "접견실 창 밖의 문턱", "summary": "문턱", "aliases": []},
+            {"type": "item", "name": "접견실 창 밖의 문턱을 넘지 않은 채 웃었다", "summary": "문턱", "aliases": []},
+        ],
+        "relations": [
+            {"source": "서하", "target": "접견실 창", "type": "관찰", "confidence": 0.8},
+            {"source": "접견실 창", "target": "접견실 창 밖의 문턱", "type": "관계", "confidence": 0.7},
+        ],
+        "issues": [],
+    }
+    repository.replace_episode_analysis(
+        project.id,
+        document.id,
+        digest,
+        bad_payload,
+        model_name=CacheOnlyLlmExtractor.model,
+        prompt_version=ANALYSIS_PROMPT_VERSION,
+    )
+
+    StoryAnalyzer(repository, llm=CacheOnlyLlmExtractor()).analyze_project(project.id)
+    graph = repository.graph(project.id)
+
+    entity_types = {entity.name: entity.type for entity in graph.entities}
+    assert entity_types["접견실"] == "place"
+    assert "접견실 창" not in entity_types
+    assert "접견실 창 밖의 문턱" not in entity_types
+    assert not [name for name in entity_types if "넘지 않은" in name]
+    assert entity_types["회백원"] == "organization"
+    assert entity_types["회백원 경비대"] == "organization"
+    assert entity_types["해무상단"] == "organization"
+    assert entity_types["청린 감찰국"] == "organization"
+    assert graph.relations[0].target_entity_id == next(entity.id for entity in graph.entities if entity.name == "접견실")
 
 
 def test_analyzer_runs_dedicated_continuity_issue_detection_after_five_documents(tmp_path: Path) -> None:
