@@ -284,6 +284,210 @@ END
     assert ("회백원", "항로 장부") in relation_pairs
 
 
+def test_local_llm_drops_unsupported_issue_without_conflict_language(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "test-model.gguf"
+    model_path.write_bytes(b"placeholder")
+    fake_llm = FakeChatLlm(
+        [
+            """
+ENTITY|character|점순|마을 소녀|
+ISSUE|high|world_rule|동백꽃 점순네 수탉 장면|점순네 수탉이 우리 수탉을 쪼았다.
+ISSUE|medium|contradiction|점순이가 닭을 패하는 중|점순이가 닭을 패하는 장면이다.
+END
+""".strip(),
+            "END",
+        ]
+    )
+    monkeypatch.setattr(local_llm, "llama_cpp_available", lambda: True)
+
+    payload = FakeLoadLocalLlmExtractor(fake_llm, model_path).extract_story_facts(
+        "점순네 수탉이 우리 수탉을 쪼았다. 점순이는 감자를 내밀었다."
+    )
+
+    assert payload["issues"] == []
+
+
+def test_local_llm_drops_unsupported_dedicated_continuity_issue(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "test-model.gguf"
+    model_path.write_bytes(b"placeholder")
+    fake_llm = FakeChatLlm(
+        """
+ISSUE|medium|contradiction|점순이가 닭을 패하는 중|점순이가 닭을 패하는 장면이다.
+END
+""".strip()
+    )
+    monkeypatch.setattr(local_llm, "llama_cpp_available", lambda: True)
+
+    issues = FakeLoadLocalLlmExtractor(fake_llm, model_path).detect_continuity_issues(
+        "점순네 수탉이 우리 수탉을 쪼았다. 점순이는 감자를 내밀었다.",
+        context="",
+        known_entity_names=["점순", "우리 수탉", "점순네 수탉"],
+    )
+
+    assert issues == []
+
+
+def test_local_llm_drops_scene_conflict_without_continuity_context(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "test-model.gguf"
+    model_path.write_bytes(b"placeholder")
+    fake_llm = FakeChatLlm(
+        """
+ISSUE|high|world_rule|점순네 수탉과 우리 수탉의 충돌|점순네 수탉이 우리 수탉을 해내는 장면이다.
+END
+""".strip()
+    )
+    monkeypatch.setattr(local_llm, "llama_cpp_available", lambda: True)
+
+    issues = FakeLoadLocalLlmExtractor(fake_llm, model_path).detect_continuity_issues(
+        "점순네 수탉이 우리 수탉을 쪼았다. 점순이는 감자를 내밀었다.",
+        context="기존 엔티티: character:나, character:점순",
+        known_entity_names=["점순", "우리 수탉", "점순네 수탉"],
+    )
+
+    assert issues == []
+
+
+def test_local_llm_keeps_common_item_headword_as_canonical_name() -> None:
+    payload = local_llm.sanitize_story_payload(
+        {
+            "entities": [
+                {"type": "item", "name": "감자", "summary": "먹을거리", "aliases": []},
+                {"type": "item", "name": "나귀", "summary": "짐승", "aliases": []},
+            ],
+            "relations": [],
+            "issues": [],
+        },
+        story_text="점순이는 굵은 감자를 내밀었다. 허 생원은 대단한 나귀를 몰았다.",
+    )
+
+    entity_names = {entity["name"] for entity in payload["entities"]}
+    assert "감자" in entity_names
+    assert "나귀" in entity_names
+    assert "굵은 감자" not in entity_names
+    assert "대단한 나귀" not in entity_names
+
+
+def test_local_llm_drops_weak_organizations_body_part_items_and_invalid_ownership_sources() -> None:
+    payload = local_llm.sanitize_story_payload(
+        {
+            "entities": [
+                {"type": "character", "name": "나", "summary": "화자", "aliases": ["킥", "aliases", "고추장"]},
+                {"type": "character", "name": "점순", "summary": "마을 소녀", "aliases": []},
+                {"type": "item", "name": "우리 수탉", "summary": "화자의 닭", "aliases": []},
+                {"type": "item", "name": "점순네 수탉", "summary": "점순네 닭", "aliases": []},
+                {"type": "place", "name": "울타리", "summary": "장소", "aliases": []},
+                {"type": "organization", "name": "거지반", "summary": "잘못 잡은 조직", "aliases": []},
+                {"type": "organization", "name": "소나무 삭정", "summary": "잘못 잡은 조직", "aliases": []},
+                {"type": "item", "name": "붉은 선혈", "summary": "몸 상태", "aliases": []},
+                {"type": "item", "name": "않은 면두", "summary": "닭 신체 부위", "aliases": ["면두"]},
+                {"type": "item", "name": "푸드득하고 모가지", "summary": "닭 신체 부위", "aliases": ["모가지"]},
+                {"type": "item", "name": "닭도 고추장", "summary": "먹이 묘사", "aliases": ["고추장"]},
+            ],
+            "relations": [
+                {"source": "나", "target": "우리 수탉", "type": "소유/사용", "confidence": 0.8},
+                {"source": "점순", "target": "점순네 수탉", "type": "소유/사용", "confidence": 0.8},
+                {"source": "점순", "target": "우리 수탉", "type": "소유/사용", "confidence": 0.8},
+                {"source": "나", "target": "점순네 수탉", "type": "소유/사용", "confidence": 0.8},
+                {"source": "울타리", "target": "우리 수탉", "type": "소유/사용", "confidence": 0.8},
+                {"source": "점순네 수탉", "target": "우리 수탉", "type": "소유/사용", "confidence": 0.8},
+            ],
+            "issues": [],
+        },
+        story_text=(
+            "나는 울타리 옆에서 우리 수탉을 보았다. 점순은 점순네 수탉을 불렀다. "
+            "붉은 선혈이 떨어지고 모가지를 쪼았다. 닭도 고추장을 먹었다."
+        ),
+    )
+
+    entity_names = {entity["name"] for entity in payload["entities"]}
+    relation_tuples = {
+        (relation["source"], relation["target"], relation["type"])
+        for relation in payload["relations"]
+    }
+    assert "거지반" not in entity_names
+    assert "소나무 삭정" not in entity_names
+    assert "붉은 선혈" not in entity_names
+    assert "않은 면두" not in entity_names
+    assert "푸드득하고 모가지" not in entity_names
+    assert "닭도 고추장" not in entity_names
+    narrator = next(entity for entity in payload["entities"] if entity["name"] == "나")
+    assert "킥" not in narrator["aliases"]
+    assert "aliases" not in narrator["aliases"]
+    assert "고추장" not in narrator["aliases"]
+    assert ("나", "우리 수탉", "소유/사용") in relation_tuples
+    assert ("점순", "점순네 수탉", "소유/사용") in relation_tuples
+    assert ("점순", "우리 수탉", "소유/사용") not in relation_tuples
+    assert ("나", "점순네 수탉", "소유/사용") not in relation_tuples
+    assert ("울타리", "우리 수탉", "소유/사용") not in relation_tuples
+    assert ("점순네 수탉", "우리 수탉", "소유/사용") not in relation_tuples
+
+
+def test_local_llm_merges_classic_title_aliases_and_recovers_family_relations(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "test-model.gguf"
+    model_path.write_bytes(b"placeholder")
+    fake_llm = FakeChatLlm(
+        [
+            """
+ENTITY|character|홍길동|서자 영웅|길동, aliases:길동
+ENTITY|character|길동|홍길동 별칭|
+ENTITY|character|승상|홍길동의 부친|
+ENTITY|character|부인|홍씨 집안 부인|aliases:부인
+ENTITY|character|춘섬|길동의 생모|
+ENTITY|organization|백야단|원문에 없는 환각 조직|
+ENTITY|item|모자|착용 물건|
+ENTITY|item|검|무기|
+END
+""".strip(),
+            """
+REL|승상|길동|관계|0.9
+REL|길동|홍길동|관계/관계|0.8
+REL|길동|부인|관계|0.8
+REL|길동|부인|소속/조직|0.9
+REL|춘섬|길동|관계|0.8
+REL|홍길동|검|소유/사용|0.78
+END
+""".strip(),
+        ]
+    )
+    monkeypatch.setattr(local_llm, "llama_cpp_available", lambda: True)
+    story = """
+조선국 세종대왕 즉위 십오년에 홍회문 밖에 한 재상이 있으되, 성은 홍이요, 명은 문이니.
+이조판서로 좌의정을 하게 하시니, 승상이 집에 돌아와 부인에게 말하였다.
+춘섬이 태기 있어 기남자를 낳으니, 삼일 후에 승상이 들어와 보시고 이름을 길동이라 하니라.
+길동은 어려서 부친을 부친이라 못하고 형을 형이라 못하여 한탄하였다.
+길동이 대감께 아뢰기를 소인은 대감의 정기를 타 당당한 남자가 되었사오나 아비를 아비라 부르지 못하옵니다.
+모친은 소자와 전생연분으로 차생에 모자 되오니 이별을 슬퍼하지 말라 하였다.
+홍길동은 검을 들고 문밖으로 나섰다.
+""".strip()
+
+    payload = FakeLoadLocalLlmExtractor(fake_llm, model_path).extract_story_facts(story)
+
+    entities = {entity["name"]: entity for entity in payload["entities"]}
+    assert "홍길동" in entities
+    assert "홍문" in entities
+    assert "춘섬" in entities
+    assert "길동" not in entities
+    assert "승상" not in entities
+    assert "우승상" not in entities
+    assert "무아부인" not in entities
+    assert "모자" not in entities
+    assert "백야단" not in entities
+    assert "길동" in entities["홍길동"]["aliases"]
+    assert {"승상", "대감", "재상"} <= set(entities["홍문"]["aliases"])
+    assert all(not alias.startswith("aliases:") for entity in entities.values() for alias in entity["aliases"])
+
+    relation_tuples = {
+        (relation["source"], relation["target"], relation["type"])
+        for relation in payload["relations"]
+    }
+    assert ("홍문", "홍길동", "부자/부친") in relation_tuples
+    assert ("춘섬", "홍길동", "모자/생모") in relation_tuples
+    assert ("홍길동", "홍길동", "관계/관계") not in relation_tuples
+    assert ("홍길동", "부인", "관계") not in relation_tuples
+    assert ("홍길동", "부인", "소속/조직") not in relation_tuples
+    assert ("홍길동", "검", "소유/사용") in relation_tuples
+
+
 def test_local_llm_bounds_prompt_size_and_includes_previous_context(monkeypatch, tmp_path: Path) -> None:
     model_path = tmp_path / "test-model.gguf"
     model_path.write_bytes(b"placeholder")

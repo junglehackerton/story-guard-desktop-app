@@ -6,6 +6,7 @@ from typing import Any
 from typing_extensions import TypedDict
 
 from backend.app.models import AnalysisStatus
+from backend.app.pipeline.candidates import collect_story_candidates
 from backend.app.repository import StoryRepository
 from backend.app.services.local_llm import LocalLlmExtractor, sanitize_story_payload
 from backend.app.services.parser import split_chunks
@@ -32,7 +33,6 @@ ALLOWED_ISSUE_CATEGORIES = {
 }
 
 ALLOWED_SEVERITIES = {"low", "medium", "high"}
-MIN_DOCUMENTS_FOR_CONTINUITY_ISSUES = 5
 MAX_ANALYSIS_SEGMENT_CHARS = 2400
 ANALYSIS_SEGMENT_OVERLAP_CHARS = 180
 MAX_ANALYSIS_CONTEXT_CHARS = 1400
@@ -111,6 +111,16 @@ class StoryAnalyzer:
             self._progress(job_id, "parse", 12, "원고와 청크를 불러오는 중입니다.")
             return state
 
+        def collect_candidates(state: AnalysisState) -> AnalysisState:
+            self._raise_if_cancelled(job_id, state["project_id"])
+            self._progress(job_id, "candidates", 18, "원문에서 인물/장소/관계 후보를 수집하는 중입니다.")
+            return state
+
+        def classify_candidates(state: AnalysisState) -> AnalysisState:
+            self._raise_if_cancelled(job_id, state["project_id"])
+            self._progress(job_id, "classify", 22, "후보를 정규화하고 LLM 판정 범위를 좁히는 중입니다.")
+            return state
+
         def extract_entities(state: AnalysisState) -> AnalysisState:
             state["result"] = self._analyze_with_llm(state["project_id"], job_id)
             return state
@@ -139,13 +149,17 @@ class StoryAnalyzer:
 
         graph = StateGraph(AnalysisState)
         graph.add_node("parse", parse)
+        graph.add_node("collect_candidates", collect_candidates)
+        graph.add_node("classify_candidates", classify_candidates)
         graph.add_node("extract_entities", extract_entities)
         graph.add_node("extract_relations", extract_relations)
         graph.add_node("detect_issues", detect_issues)
         graph.add_node("retrieve_evidence", retrieve_evidence)
         graph.add_node("persist", persist)
         graph.set_entry_point("parse")
-        graph.add_edge("parse", "extract_entities")
+        graph.add_edge("parse", "collect_candidates")
+        graph.add_edge("collect_candidates", "classify_candidates")
+        graph.add_edge("classify_candidates", "extract_entities")
         graph.add_edge("extract_entities", "extract_relations")
         graph.add_edge("extract_relations", "detect_issues")
         graph.add_edge("detect_issues", "retrieve_evidence")
@@ -178,10 +192,10 @@ class StoryAnalyzer:
                 prompt_version=ANALYSIS_PROMPT_VERSION,
             )
             if cached_payload is not None:
-                cached_payload = sanitize_story_payload(
+                cached_payload = self._augment_with_story_candidates(
+                    document.content,
                     cached_payload,
                     known_entity_names=self._entity_names(payload),
-                    story_text=document.content,
                 )
                 self.repository.replace_episode_analysis(
                     project_id,
@@ -209,15 +223,36 @@ class StoryAnalyzer:
                         f"{analysis_input['segment_index']}/{analysis_input['segment_count']}구간을 분석 중입니다."
                     ),
                 )
-                segment_payload = self.llm.extract_story_facts(
-                    analysis_input["text"],
-                    context=self._analysis_context(payload),
-                    known_entity_names=self._entity_names(payload),
+                candidate_payload = collect_story_candidates(analysis_input["text"])
+                known_entity_names = self._known_names(
+                    self._entity_names(payload),
+                    self._entity_names(candidate_payload),
                 )
-                segment_payload = sanitize_story_payload(
+                try:
+                    segment_payload = self.llm.extract_story_facts(
+                        analysis_input["text"],
+                        context=self._analysis_context(payload),
+                        known_entity_names=known_entity_names,
+                    )
+                except RuntimeError as error:
+                    if not self._is_recoverable_llm_output_error(error):
+                        raise
+                    self._progress(
+                        job_id,
+                        "extract",
+                        progress,
+                        (
+                            f"LLM 출력 형식이 불완전한 {document_index}/{len(documents)}화 "
+                            f"{analysis_input['segment_index']}/{analysis_input['segment_count']}구간은 "
+                            "원문 후보로 보정하고 계속합니다."
+                        ),
+                    )
+                    segment_payload = {"entities": [], "relations": [], "issues": [], "claims": []}
+                segment_payload = self._augment_with_story_candidates(
+                    analysis_input["text"],
                     segment_payload,
                     known_entity_names=self._entity_names(payload),
-                    story_text=analysis_input["text"],
+                    candidate_payload=candidate_payload,
                 )
                 evidence_ids = self._chunk_ids_for_document(chunks, document.id)
                 self._attach_segment_evidence(segment_payload, evidence_ids)
@@ -238,11 +273,7 @@ class StoryAnalyzer:
             self.repository.episode_payload(project_id),
             story_text="\n\n".join(str(document.content) for document in documents),
         )
-        payload["issues"] = (
-            self._issues_from_claims(payload.get("claims", []))
-            if len(documents) >= MIN_DOCUMENTS_FOR_CONTINUITY_ISSUES
-            else []
-        )
+        payload["issues"] = self._issues_from_claims(payload.get("claims", []))
         self._detect_continuity_issues(project_id, documents, payload, job_id)
         self._raise_if_cancelled(job_id, project_id)
         self._progress(job_id, "relations", 62, "LLM이 추출한 관계를 저장 가능한 형태로 정리하는 중입니다.")
@@ -257,6 +288,41 @@ class StoryAnalyzer:
             entity_count=len(graph.entities),
             relation_count=len(graph.relations),
             issue_count=len(graph.issues),
+        )
+
+    def _is_recoverable_llm_output_error(self, error: RuntimeError) -> bool:
+        message = str(error)
+        return (
+            "분석 결과 형식" in message
+            or "형식을 완성하지" in message
+            or "JSON 응답" in message
+        )
+
+    def _augment_with_story_candidates(
+        self,
+        story_text: str,
+        payload: dict,
+        known_entity_names: list[str],
+        candidate_payload: dict[str, list[dict[str, Any]]] | None = None,
+    ) -> dict[str, list[dict[str, Any]]]:
+        candidates = candidate_payload or collect_story_candidates(story_text)
+        combined = {
+            "entities": [
+                *candidates.get("entities", []),
+                *[entity for entity in payload.get("entities", []) if isinstance(entity, dict)],
+            ],
+            "relations": [
+                *candidates.get("relations", []),
+                *[relation for relation in payload.get("relations", []) if isinstance(relation, dict)],
+            ],
+            "issues": [issue for issue in payload.get("issues", []) if isinstance(issue, dict)],
+        }
+        if isinstance(payload.get("claims"), list):
+            combined["claims"] = [claim for claim in payload["claims"] if isinstance(claim, dict)]
+        return sanitize_story_payload(
+            combined,
+            known_entity_names=known_entity_names,
+            story_text=story_text,
         )
 
     def _persist_llm_payload(
@@ -318,9 +384,6 @@ class StoryAnalyzer:
                 evidence_chunk_ids=evidence_chunk_ids,
             )
 
-        if len(documents) < MIN_DOCUMENTS_FOR_CONTINUITY_ISSUES:
-            return
-
         for raw_issue in payload.get("issues", []):
             self._raise_if_cancelled(job_id, project_id)
             if not isinstance(raw_issue, dict):
@@ -346,8 +409,6 @@ class StoryAnalyzer:
         payload: dict[str, list[dict[str, Any]]],
         job_id: int,
     ) -> None:
-        if len(documents) < MIN_DOCUMENTS_FOR_CONTINUITY_ISSUES:
-            return
         detector = getattr(self.llm, "detect_continuity_issues", None)
         if not callable(detector):
             return
@@ -386,11 +447,7 @@ class StoryAnalyzer:
                 segments = [document.content.strip()[:MAX_ANALYSIS_SEGMENT_CHARS]]
             for segment_index, segment in enumerate(segments, start=1):
                 title = str(getattr(document, "title", f"{document_index}화")).strip()
-                text = (
-                    f"문서: {title}\n"
-                    f"구간: {segment_index}/{len(segments)}\n\n"
-                    f"{segment}"
-                ).strip()
+                text = segment.strip()
                 analysis_inputs.append(
                     {
                         "document_id": document.id,
@@ -607,6 +664,14 @@ class StoryAnalyzer:
                     alias_value = str(alias).strip()
                     if alias_value and alias_value not in names:
                         names.append(alias_value)
+        return names
+
+    def _known_names(self, *groups: list[str]) -> list[str]:
+        names: list[str] = []
+        for group in groups:
+            for name in group:
+                if name and name not in names:
+                    names.append(name)
         return names
 
     def _progress(self, job_id: int, current_step: str, progress: int, message: str) -> None:

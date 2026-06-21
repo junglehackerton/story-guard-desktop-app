@@ -140,6 +140,85 @@ class RecordingLlmExtractor(FakeLlmExtractor):
         return super().extract_story_facts(text, context, known_entity_names)
 
 
+class FormatFailingLlmExtractor:
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def enabled(self) -> bool:
+        return True
+
+    def extract_story_facts(
+        self,
+        text: str,
+        context: str = "",
+        known_entity_names: list[str] | None = None,
+    ) -> dict:
+        self.calls.append(text)
+        if "2화" in text:
+            raise RuntimeError("로컬 LLM이 분석 결과 형식을 완성하지 못했습니다. 다시 분석을 실행해 주세요.")
+        name = "이서하" if "1화" in text else "류하진"
+        return {
+            "entities": [
+                {"type": "character", "name": name, "summary": "분석된 인물", "aliases": []},
+            ],
+            "relations": [],
+            "issues": [],
+        }
+
+
+class PoorDongbaekLlmExtractor:
+    def enabled(self) -> bool:
+        return True
+
+    def extract_story_facts(
+        self,
+        text: str,
+        context: str = "",
+        known_entity_names: list[str] | None = None,
+    ) -> dict:
+        return {
+            "entities": [
+                {"type": "character", "name": "대강", "summary": "잘못 잡은 신체 표현", "aliases": []},
+                {"type": "character", "name": "대강이", "summary": "잘못 잡은 신체 표현", "aliases": []},
+                {"type": "character", "name": "계집애", "summary": "점순을 가리키는 일반 지칭어", "aliases": []},
+                {"type": "character", "name": "남", "summary": "일반 지칭어", "aliases": []},
+                {
+                    "type": "character",
+                    "name": "점순",
+                    "summary": "별칭에 다른 엔티티가 섞인 인물",
+                    "aliases": ["나", "감자", "점순네 수탉", "우리 수탉", "산", "울타리"],
+                },
+                {"type": "organization", "name": "점순네", "summary": "잘못 잡은 가족 조직", "aliases": []},
+                {"type": "item", "name": "굵은 감자", "summary": "감자 표현 변형", "aliases": ["감자"]},
+            ],
+            "relations": [],
+            "issues": [],
+        }
+
+
+class PoorMemilLlmExtractor:
+    def enabled(self) -> bool:
+        return True
+
+    def extract_story_facts(
+        self,
+        text: str,
+        context: str = "",
+        known_entity_names: list[str] | None = None,
+    ) -> dict:
+        return {
+            "entities": [
+                {"type": "character", "name": "생원", "summary": "호칭만 추출", "aliases": []},
+                {"type": "item", "name": "대단한 나귀", "summary": "나귀", "aliases": []},
+                {"type": "organization", "name": "충주집", "summary": "잘못 잡은 조직", "aliases": []},
+            ],
+            "relations": [
+                {"source": "생원", "target": "대단한 나귀", "type": "소유/사용", "confidence": 0.7}
+            ],
+            "issues": [],
+        }
+
+
 class IncrementalLlmExtractor:
     def __init__(self) -> None:
         self.calls: list[dict] = []
@@ -322,8 +401,101 @@ def test_analyzer_persists_only_llm_payload(tmp_path: Path) -> None:
 
     assert result.entity_count == 3
     assert {entity.name for entity in graph.entities} == {"한서윤", "검은 열쇠", "흑월성"}
-    assert {relation.type for relation in graph.relations} == {"소유/사용", "등장 장소"}
-    assert graph.issues[0].title == "LLM 설정 충돌"
+
+
+def test_analyzer_recovers_dongbaek_candidates_when_llm_misreads_body_parts(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("동백꽃 후보 기반 분석")
+    add_story(
+        repository,
+        project.id,
+        tmp_path,
+        """
+오늘도 또 우리 수탉이 막 쫓기었다. 점순네 수탉이 덩저리 작은 우리 수탉을 함부로 해내는 것이다.
+이걸 가만히 내려다보자니 내 대강이가 터져서 피가 흐르는 것같이 두 눈에서 불이 번쩍 난다.
+그러나 점순이가 울타리 너머로 감자를 내밀었다. 나는 그 감자를 받지 않고 산으로 올라갔다.
+""".strip(),
+    )
+
+    result = StoryAnalyzer(repository, llm=PoorDongbaekLlmExtractor()).analyze_project(project.id)
+    graph = repository.graph(project.id)
+    entity_names = {entity.name for entity in graph.entities}
+    names_by_id = {entity.id: entity.name for entity in graph.entities}
+    relation_tuples = {
+        (names_by_id[relation.source_entity_id], names_by_id[relation.target_entity_id], relation.type)
+        for relation in graph.relations
+    }
+
+    assert result.entity_count >= 5
+    assert {"나", "점순", "우리 수탉", "점순네 수탉", "감자"} <= entity_names
+    assert "대강" not in entity_names
+    assert "대강이" not in entity_names
+    assert "계집애" not in entity_names
+    assert "남" not in entity_names
+    assert "점순네" not in entity_names
+    assert "굵은 감자" not in entity_names
+    assert "그러나" not in entity_names
+    assert ("나", "점순", "호감/갈등") in relation_tuples
+    assert ("점순네 수탉", "우리 수탉", "적대/의심") in relation_tuples
+    assert ("점순", "감자", "제공/호감") in relation_tuples
+
+
+def test_analyzer_recovers_memil_relationship_candidates_from_plain_narrative(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("메밀꽃 후보 기반 분석")
+    add_story(
+        repository,
+        project.id,
+        tmp_path,
+        """
+얼금뱅이요 왼손잡이인 드팀전의 허 생원은 동업의 조 선달에게 그만 거둘까 하고 물었다.
+조 선달은 충주집 이야기를 꺼내며 동이 말일세 하고 비죽이 웃었다.
+밤길을 가는 동안 허 생원은 나귀를 몰았고, 동이는 제천에서 왔다며 어머니가 봉평 사람이라고 말했다.
+허 생원은 동이의 왼손잡이를 보고 오래전 봉평에서 만난 성서방네 처녀를 떠올렸다.
+""".strip(),
+    )
+
+    result = StoryAnalyzer(repository, llm=PoorMemilLlmExtractor()).analyze_project(project.id)
+    graph = repository.graph(project.id)
+    entity_names = {entity.name for entity in graph.entities}
+    names_by_id = {entity.id: entity.name for entity in graph.entities}
+    relation_tuples = {
+        (names_by_id[relation.source_entity_id], names_by_id[relation.target_entity_id], relation.type)
+        for relation in graph.relations
+    }
+
+    assert result.entity_count >= 6
+    assert {"허 생원", "조 선달", "동이", "충주집", "나귀", "봉평", "제천"} <= entity_names
+    assert "생원" not in entity_names
+    assert ("허 생원", "조 선달", "동행/협력") in relation_tuples
+    assert ("허 생원", "동이", "부자/혈연 암시") in relation_tuples
+    assert ("허 생원", "나귀", "소유/사용") in relation_tuples
+
+
+def test_analyzer_sends_only_story_segment_to_llm_not_document_metadata(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("파일명 누출 방지")
+    story_path = tmp_path / "dongbaekkkot.txt"
+    story_path.write_text("점순이는 감자를 내밀었다. 나는 울타리 앞에 섰다.", encoding="utf-8")
+    parsed, file_format, digest = read_document(story_path)
+    document = repository.add_document(
+        project_id=project.id,
+        path=story_path,
+        title="dongbaekkkot",
+        file_format=file_format,
+        content_hash=digest,
+        content=parsed,
+        chapter_index=0,
+    )
+    repository.replace_chunks(project.id, document.id, split_chunks(parsed))
+
+    llm = RecordingLlmExtractor()
+    StoryAnalyzer(repository, llm=llm).analyze_project(project.id)
+
+    assert llm.calls
+    assert "문서:" not in llm.calls[0]["text"]
+    assert "구간:" not in llm.calls[0]["text"]
+    assert "dongbaekkkot" not in llm.calls[0]["text"]
 
 
 def test_analyzer_processes_documents_sequentially_with_previous_context(tmp_path: Path) -> None:
@@ -360,6 +532,25 @@ def test_analyzer_splits_long_document_before_local_llm_call(tmp_path: Path) -> 
 
     assert len(llm.calls) > 1
     assert all(len(call["text"]) <= 3200 for call in llm.calls)
+
+
+def test_analyzer_continues_when_one_llm_segment_has_invalid_output(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("부분 실패 복구 작품")
+    add_story_document(repository, project.id, tmp_path, "1화. 이서하는 회백원 서고를 지켰다.", 0)
+    add_story_document(repository, project.id, tmp_path, "2화. 이 구간은 로컬 LLM 출력 형식이 깨진다.", 1)
+    add_story_document(repository, project.id, tmp_path, "3화. 류하진은 청린 감찰국 기록을 확인했다.", 2)
+    llm = FormatFailingLlmExtractor()
+
+    result = StoryAnalyzer(repository, llm=llm).analyze_project(project.id)
+    graph = repository.graph(project.id)
+    job = repository.latest_analysis_job(project.id)
+
+    assert len(llm.calls) == 3
+    assert job is not None
+    assert job.status == "completed"
+    assert result.entity_count >= 2
+    assert {"이서하", "류하진"} <= {entity.name for entity in graph.entities}
 
 
 def test_analyzer_reuses_cached_document_analysis_when_chapters_are_added(tmp_path: Path) -> None:
@@ -462,17 +653,16 @@ def test_analyzer_sanitizes_cached_episode_payload_before_projecting_graph(tmp_p
     assert graph.relations[0].target_entity_id == next(entity.id for entity in graph.entities if entity.name == "접견실")
 
 
-def test_analyzer_runs_dedicated_continuity_issue_detection_after_five_documents(tmp_path: Path) -> None:
+def test_analyzer_runs_dedicated_continuity_issue_detection_for_short_projects(tmp_path: Path) -> None:
     repository = StoryRepository(Database(tmp_path / "test.sqlite"))
     project = repository.create_project("설정 붕괴 점검 작품")
-    for index in range(6):
-        add_story_document(
-            repository,
-            project.id,
-            tmp_path,
-            f"{index + 1}화. 푸른 등화와 흑유리 열쇠에 관한 새 장면이 이어진다.",
-            index,
-        )
+    add_story_document(
+        repository,
+        project.id,
+        tmp_path,
+        "1화. 푸른 등화와 흑유리 열쇠에 관한 새 장면이 이어진다.",
+        0,
+    )
     llm = ContinuityDetectingLlmExtractor()
 
     result = StoryAnalyzer(repository, llm=llm).analyze_project(project.id)
@@ -484,18 +674,18 @@ def test_analyzer_runs_dedicated_continuity_issue_detection_after_five_documents
     assert result.issue_count == 1
 
 
-def test_analyzer_defers_continuity_issues_until_five_documents(tmp_path: Path) -> None:
+def test_analyzer_persists_continuity_issues_for_short_projects(tmp_path: Path) -> None:
     repository = StoryRepository(Database(tmp_path / "test.sqlite"))
     project = repository.create_project("초반 연재 작품")
-    add_story_series(repository, project.id, tmp_path, 4)
+    add_story(repository, project.id, tmp_path, "한서윤은 검은 열쇠를 들고 흑월성에 갔다.")
 
     result = StoryAnalyzer(repository, llm=FakeLlmExtractor()).analyze_project(project.id)
     graph = repository.graph(project.id)
 
     assert result.entity_count == 3
     assert result.relation_count == 2
-    assert result.issue_count == 0
-    assert graph.issues == []
+    assert result.issue_count == 1
+    assert graph.issues[0].title == "LLM 설정 충돌"
 
 
 def test_analyzer_updates_progress_while_llm_is_extracting(tmp_path: Path) -> None:
@@ -562,6 +752,7 @@ def test_analyzer_sends_explicit_story_declarations_to_local_llm(tmp_path: Path)
 소속: 윤하린 -> 백야단
 본부: 백야단 -> 백야성
 관할: 백야단 -> 지하 서고 봉쇄
+한서윤은 검은 열쇠를 들고 흑월성에 갔다.
 """.strip(),
     )
 

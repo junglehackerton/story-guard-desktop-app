@@ -194,7 +194,8 @@ def test_episode_analysis_status_range_graph_and_relation_changes(tmp_path: Path
 
     assert [document.analysis_status for document in documents] == ["analyzed", "analyzed"]
     assert {relation.type for relation in first_range.relations} == {"동행/협력"}
-    assert first_range.range.continuity_ready is False
+    assert first_range.range.continuity_ready is True
+    assert first_range.range.message == "선택 범위의 설정 붕괴 후보를 판단합니다."
     assert len(full_graph.changes) == 1
     assert full_graph.changes[0].previous_type == "동행/협력"
     assert full_graph.changes[0].current_type == "적대/의심"

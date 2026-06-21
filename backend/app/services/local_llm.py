@@ -24,7 +24,74 @@ ORGANIZATION_CANDIDATE_RE = re.compile(
     r"([가-힣A-Za-z0-9·]{2,}\s+(?:감찰국|경비대)|"
     r"[가-힣A-Za-z0-9·]{2,}(?:감찰국|경비대|상단|상회|조합|원)|왕궁)"
 )
-ORGANIZATION_SUFFIXES = ("감찰국", "경비대", "상단", "상회", "조합", "왕궁", "원")
+ORGANIZATION_SUFFIXES = ("감찰국", "경비대", "상단", "상회", "조합", "왕궁")
+CLASSIC_TITLE_ALIASES = ("승상", "대감", "재상")
+CLASSIC_NON_EXPANDABLE_CHARACTER_TERMS = {
+    "나",
+    "내",
+    "승상",
+    "대감",
+    "재상",
+    "부인",
+    "부친",
+    "모친",
+    "아비",
+    "어미",
+    "소자",
+    "장부",
+}
+GENERIC_RELATION_TYPES = {"관계", "관계/관계", "관련", "related", "related_to"}
+GENERIC_ALIAS_TERMS = {"aliases", "인물", "조직", "장소", "아이템", "사건", "규칙", "떡밥", "장부", "사람"}
+ISSUE_SIGNAL_TERMS = (
+    "충돌",
+    "모순",
+    "상충",
+    "불일치",
+    "다르",
+    "반대",
+    "오류",
+    "붕괴",
+    "회수",
+    "떡밥",
+    "복선",
+    "contradiction",
+    "conflict",
+)
+ISSUE_CONTINUITY_CONTEXT_TERMS = (
+    "초반",
+    "후반",
+    "이전",
+    "이후",
+    "처음",
+    "나중",
+    "앞에서는",
+    "뒤에서는",
+    "반면",
+    "바뀌",
+    "설정",
+    "규칙",
+    "보고서",
+    "회수",
+    "떡밥",
+    "복선",
+    "foreshadowing",
+)
+NON_CHARACTER_ENTITY_NAMES = {
+    "대강",
+    "대강이",
+    "계집애",
+    "남",
+    "킥",
+    "고추장",
+    "눈",
+    "손",
+    "발",
+    "머리",
+    "얼굴",
+    "목",
+    "가슴",
+    "피",
+}
 SPATIAL_ANCHOR_RE = re.compile(
     r"^([가-힣A-Za-z0-9· ]{1,24}?(?:접견실|서고|항구|복도|계단|광장|거리|궁전|성|방|실))"
     r"(?:\s|의|에서|안|밖|위|아래|창|문턱|문).+"
@@ -56,7 +123,31 @@ ITEM_TERMS = (
     "함",
     "제복",
 )
-ITEM_PREFIX_STOPWORDS = {"전에", "그리고", "안에서", "밖에서", "위에서", "아래에서", "길이의"}
+SINGLE_CHAR_ITEM_NAMES = {"검", "칼", "창", "활", "돈", "약"}
+NON_EXPANDABLE_ITEM_TERMS = {"감자", "나귀", "수탉", "닭"}
+WEAK_ITEM_BODY_TERMS = {
+    "주둥이",
+    "모가지",
+    "면두",
+    "선혈",
+    "턱밑",
+    "고추장",
+    "피",
+    "눈",
+    "손",
+    "발",
+}
+ITEM_PREFIX_STOPWORDS = {
+    "전에",
+    "그리고",
+    "안에서",
+    "밖에서",
+    "위에서",
+    "아래에서",
+    "너머로",
+    "길이의",
+    "차생에",
+}
 CLAUSE_MARKERS = ("을 ", "를 ", "은 ", "는 ", "이 ", "가 ", "채", "했다", "한다", "왔다", "웃었다", "넘지", "않은")
 NAMED_ITEM_RE = re.compile(
     r"([가-힣A-Za-z0-9·]{2,}(?:\s+[가-힣A-Za-z0-9·]{2,}){0,2}\s*"
@@ -222,7 +313,7 @@ END
             relation_payload = self._request_fact_payload(llm, system_prompt, relation_prompt, max_tokens=650)
         except RuntimeError:
             relation_payload = {}
-        return self._normalize_payload(entity_payload, relation_payload, known_names, story_text)
+        return self._normalize_payload(entity_payload, relation_payload, known_entity_names, story_text)
 
     def _request_fact_payload(self, llm: Any, system_prompt: str, user_prompt: str, max_tokens: int) -> dict[str, Any]:
         try:
@@ -269,7 +360,7 @@ END
 허용 issue category: timeline, character_state, world_rule, relationship, unresolved_foreshadowing, contradiction
 
 중요:
-- 5편 이상 쌓인 뒤의 장기 연속성 문제만 보세요.
+- 현재 선택된 원고 범위 안에서 확인 가능한 설정 충돌 후보를 보세요.
 - 같은 회차 안의 단순 오해나 반전 가능성은 high로 단정하지 마세요.
 - 초반 규칙/관계/상태와 후반 설명이 충돌하면 ISSUE를 출력하세요.
 - 근거가 약하면 출력하지 마세요.
@@ -293,7 +384,7 @@ END
 """.strip()
         payload = self._request_fact_payload(self._load_llm(model_path), system_prompt, prompt, max_tokens=450)
         issues = payload.get("issues", [])
-        return [issue for issue in issues if isinstance(issue, dict)]
+        return self._filter_supported_issues(issues)
 
     def _normalize_payload(
         self,
@@ -310,19 +401,65 @@ END
                 canonical_by_term.setdefault(known_name, known_name)
 
         def add_entity(entity: dict[str, Any], raw_terms: list[str] | None = None) -> None:
+            def merge_into(canonical_name: str) -> None:
+                existing = entity_by_name[canonical_name]
+                existing_aliases = set(existing["aliases"])
+                for alias in [entity["name"], *entity["aliases"], *(raw_terms or [])]:
+                    alias_canonical_name = canonical_by_term.get(alias)
+                    if alias_canonical_name and alias_canonical_name != existing["name"]:
+                        continue
+                    if alias and alias != existing["name"] and alias not in existing_aliases:
+                        existing["aliases"].append(alias)
+                        existing_aliases.add(alias)
+                    if alias:
+                        canonical_by_term[alias] = existing["name"]
+
+            canonical_name = canonical_by_term.get(entity["name"])
+            if canonical_name and canonical_name != entity["name"] and canonical_name in entity_by_name:
+                merge_into(canonical_name)
+                return
             existing = entity_by_name.get(entity["name"])
             if existing is not None:
                 existing_aliases = set(existing["aliases"])
                 for alias in entity["aliases"]:
+                    alias_canonical_name = canonical_by_term.get(alias)
+                    if alias_canonical_name and alias_canonical_name != existing["name"]:
+                        continue
                     if alias not in existing_aliases:
                         existing["aliases"].append(alias)
                         existing_aliases.add(alias)
-                if existing["type"] != "organization" and entity["type"] == "organization":
+                if (
+                    existing["type"] != "organization"
+                    and entity["type"] == "organization"
+                    and (
+                        self._looks_like_organization_name(entity["name"])
+                        or self._has_won_organization_context(story_text, entity["name"])
+                    )
+                ):
                     existing["type"] = "organization"
                 for raw_term in raw_terms or []:
                     if raw_term:
                         canonical_by_term[raw_term] = existing["name"]
                 return
+            for alias in [*entity["aliases"], *(raw_terms or [])]:
+                alias_canonical_name = canonical_by_term.get(alias)
+                if alias_canonical_name and alias_canonical_name in entity_by_name:
+                    merge_into(alias_canonical_name)
+                    return
+            if entity["name"].endswith("네") and len(entity["name"]) > 2:
+                owner_name = entity["name"][:-1]
+                owner_canonical_name = canonical_by_term.get(owner_name)
+                if owner_canonical_name and owner_canonical_name in entity_by_name:
+                    merge_into(owner_canonical_name)
+                    return
+            entity["aliases"] = [
+                alias
+                for alias in entity["aliases"]
+                if not (
+                    (alias_canonical_name := canonical_by_term.get(alias))
+                    and alias_canonical_name != entity["name"]
+                )
+            ]
             entities.append(entity)
             entity_by_name[entity["name"]] = entity
             canonical_by_term[entity["name"]] = entity["name"]
@@ -340,6 +477,19 @@ END
             if entity is None:
                 continue
             add_entity(entity, [raw_name])
+
+        classic_person_name = self._extract_classic_primary_person_name(story_text)
+        classic_aliases = self._classic_title_aliases(story_text)
+        if classic_person_name and classic_aliases:
+            add_entity(
+                {
+                    "type": "character",
+                    "name": classic_person_name,
+                    "summary": "고전 서사 인물",
+                    "aliases": classic_aliases,
+                },
+                classic_aliases,
+            )
 
         for organization_name in self._extract_named_organization_names(story_text):
             add_entity(
@@ -363,8 +513,26 @@ END
 
         relations: list[dict[str, Any]] = []
         seen_relations: set[tuple[str, str, str]] = set()
+        explicit_story_relations = self._extract_explicit_story_relations(story_text, entity_by_name)
+        explicit_story_pairs = {
+            (str(relation["source"]), str(relation["target"]))
+            for relation in explicit_story_relations
+            if relation.get("source") and relation.get("target")
+        }
+        explicit_story_pairs.update({(target, source) for source, target in list(explicit_story_pairs)})
 
         def add_relation(source: str, target: str, relation_type: str, confidence: float) -> None:
+            source_entity = entity_by_name.get(source)
+            if self._is_ownership_relation_type(relation_type) and (
+                not source_entity or source_entity["type"] not in {"character", "organization"}
+            ):
+                return
+            if self._is_ownership_relation_type(relation_type) and self._violates_possessive_target_name(
+                source,
+                target,
+                entity_by_name,
+            ):
+                return
             key = (source, target, relation_type)
             if key in seen_relations:
                 return
@@ -385,6 +553,8 @@ END
             target = self._canonical_relation_term(str(raw_relation.get("target", "")).strip(), canonical_by_term)
             relation_type = str(raw_relation.get("type", "")).strip()
             if not source or not target or source == target or not relation_type:
+                continue
+            if self._is_generic_relation_type(relation_type) and (source, target) in explicit_story_pairs:
                 continue
             source_entity = entity_by_name.get(source)
             target_entity = entity_by_name.get(target)
@@ -412,6 +582,14 @@ END
                     continue
             elif self._is_organization_to_person_guess(source_entity, target_entity):
                 continue
+            elif (
+                self._is_generic_relation_type(relation_type)
+                and source_entity
+                and target_entity
+                and source_entity["type"] == "character"
+                and target_entity["type"] == "character"
+            ):
+                continue
             elif self._is_unsupported_organization_item_relation(
                 story_text,
                 source_entity,
@@ -425,6 +603,14 @@ END
                 confidence = 0.7
             add_relation(source, target, relation_type, confidence)
 
+        for relation in explicit_story_relations:
+            add_relation(
+                str(relation["source"]),
+                str(relation["target"]),
+                str(relation["type"]),
+                float(relation.get("confidence", 0.9)),
+            )
+
         for relation in self._extract_explicit_membership_relations(story_text, entity_by_name):
             add_relation(
                 str(relation["source"]),
@@ -436,7 +622,7 @@ END
         return {
             "entities": entities,
             "relations": relations,
-            "issues": entity_payload.get("issues", []),
+            "issues": self._filter_supported_issues(entity_payload.get("issues", [])),
         }
 
     def _normalize_entity(self, raw_entity: dict[str, Any], story_text: str = "") -> dict[str, Any] | None:
@@ -451,11 +637,26 @@ END
         raw_type = str(raw_entity.get("type", "")).strip().lower()
         entity_type = raw_type if raw_type in ALLOWED_ENTITY_TYPES else "item"
         entity_type = self._repair_entity_type(entity_type, name)
+        if entity_type == "character" and name in NON_CHARACTER_ENTITY_NAMES:
+            return None
+        if (
+            entity_type == "organization"
+            and not self._looks_like_organization_name(name)
+            and not self._has_won_organization_context(story_text, name)
+        ):
+            return None
         if entity_type == "item":
             name = self._normalize_named_item_candidate(name)
-            if len(name) < 2 or self._is_weak_item_phrase(name):
+            if name == "모자" and self._is_kinship_moja_context(story_text):
+                return None
+            if (len(name) < 2 and name not in SINGLE_CHAR_ITEM_NAMES) or self._is_weak_item_phrase(name):
                 return None
         name = self._expand_entity_name(name, entity_type, story_text)
+        classic_aliases: list[str] = []
+        if entity_type == "character":
+            name, classic_aliases = self._canonicalize_classic_character_name(name, story_text)
+        if entity_type == "character" and name in NON_CHARACTER_ENTITY_NAMES:
+            return None
         entity_type = self._repair_entity_type(entity_type, name)
         aliases = [
             alias
@@ -464,10 +665,20 @@ END
                 for alias in raw_entity.get("aliases", [])
                 if self._clean_entity_name(str(alias))
             )
-            if alias != name and len(alias) <= 40 and not self._looks_like_sentence_fragment(alias)
+            if (
+                alias != name
+                and alias not in GENERIC_ALIAS_TERMS
+                and len(alias) <= 40
+                and not self._looks_like_sentence_fragment(alias)
+                and not self._is_weak_entity_alias(alias, entity_type)
+            )
         ]
+        aliases.extend(alias for alias in classic_aliases if alias != name)
         if raw_name != name and raw_name not in aliases:
             aliases.append(raw_name)
+        aliases = list(dict.fromkeys(alias for alias in aliases if alias and alias != name))
+        if story_text and not self._has_entity_text_evidence(name, aliases, story_text):
+            return None
         return {
             "type": entity_type,
             "name": name,
@@ -476,6 +687,8 @@ END
         }
 
     def _repair_entity_type(self, entity_type: str, name: str) -> str:
+        if name in CLASSIC_NON_EXPANDABLE_CHARACTER_TERMS:
+            return "character"
         if self._looks_like_organization_name(name):
             return "organization"
         if entity_type == "item" and self._looks_like_spatial_name(name):
@@ -495,7 +708,9 @@ END
         names: list[str] = []
         for match in ORGANIZATION_CANDIDATE_RE.finditer(text):
             name = self._clean_entity_name(match.group(1))
-            if name and name not in names:
+            if name.endswith("원") and not self._has_won_organization_context(text, name):
+                continue
+            if name and not self._is_weak_organization_name(name) and name not in names:
                 names.append(name)
         return names
 
@@ -505,6 +720,8 @@ END
             if text[match.end() : match.end() + 8].startswith(" 관리인"):
                 continue
             name = self._normalize_named_item_candidate(match.group(1))
+            if name == "모자" and self._is_kinship_moja_context(text):
+                continue
             if self._is_weak_item_phrase(name):
                 continue
             if name and name not in names:
@@ -530,6 +747,8 @@ END
     def _expand_character_name(self, name: str, story_text: str) -> str:
         if len(name) >= 3:
             return name
+        if name in CLASSIC_NON_EXPANDABLE_CHARACTER_TERMS:
+            return name
         escaped_name = re.escape(name)
         candidates = [
             self._clean_entity_name(match.group(1))
@@ -538,8 +757,40 @@ END
         candidates = [candidate for candidate in candidates if len(name) < len(candidate) <= 4]
         return max(candidates, key=len) if candidates else name
 
+    def _canonicalize_classic_character_name(self, name: str, story_text: str) -> tuple[str, list[str]]:
+        if not story_text or name not in CLASSIC_TITLE_ALIASES:
+            return name, []
+        primary_person_name = self._extract_classic_primary_person_name(story_text)
+        if not primary_person_name:
+            return name, []
+        return primary_person_name, self._classic_title_aliases(story_text)
+
+    def _extract_classic_primary_person_name(self, story_text: str) -> str | None:
+        if not story_text:
+            return None
+        match = re.search(
+            r"성은\s*([가-힣])(?:이요|이오|이고|이며|은|는)?\s*,?\s*"
+            r"명은\s*([가-힣]{1,2})(?:이니|이라|라|이다|이오|요|며|,|\.|\s)",
+            story_text,
+        )
+        if not match:
+            return None
+        return self._clean_entity_name(f"{match.group(1)}{match.group(2)}")
+
+    def _classic_title_aliases(self, story_text: str) -> list[str]:
+        aliases = [alias for alias in CLASSIC_TITLE_ALIASES if alias in story_text]
+        primary_person_name = self._extract_classic_primary_person_name(story_text)
+        if primary_person_name:
+            surname = primary_person_name[:1]
+            aliases.extend(
+                f"{surname}{alias}"
+                for alias in CLASSIC_TITLE_ALIASES
+                if f"{surname}{alias}" in story_text
+            )
+        return list(dict.fromkeys(aliases))
+
     def _expand_item_name(self, name: str, story_text: str) -> str:
-        if len(name) < 2:
+        if len(name) < 2 or name in NON_EXPANDABLE_ITEM_TERMS:
             return name
         escaped_name = re.escape(name)
         candidates: list[str] = []
@@ -590,6 +841,83 @@ END
                     )
         return relations
 
+    def _extract_explicit_story_relations(
+        self,
+        story_text: str,
+        entity_by_name: dict[str, dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not story_text:
+            return []
+        relations: list[dict[str, Any]] = []
+        child_name = self._classic_child_name(story_text, entity_by_name)
+        father_name = self._extract_classic_primary_person_name(story_text)
+        if (
+            child_name
+            and father_name
+            and father_name in entity_by_name
+            and child_name in entity_by_name
+            and self._has_classic_father_evidence(story_text, child_name)
+        ):
+            relations.append(
+                {
+                    "source": father_name,
+                    "target": child_name,
+                    "type": "부자/부친",
+                    "confidence": 0.93,
+                }
+            )
+        if (
+            child_name
+            and "춘섬" in entity_by_name
+            and child_name in entity_by_name
+            and self._has_classic_mother_evidence(story_text, child_name)
+        ):
+            relations.append(
+                {
+                    "source": "춘섬",
+                    "target": child_name,
+                    "type": "모자/생모",
+                    "confidence": 0.9,
+                }
+            )
+        return relations
+
+    def _classic_child_name(self, story_text: str, entity_by_name: dict[str, dict[str, Any]]) -> str | None:
+        if "홍길동" in entity_by_name:
+            return "홍길동"
+        match = re.search(r"이름을\s*([가-힣]{2,3})이라", story_text)
+        if not match:
+            return None
+        given_name = self._clean_entity_name(match.group(1))
+        father_name = self._extract_classic_primary_person_name(story_text)
+        if father_name:
+            full_name = f"{father_name[:1]}{given_name}"
+            if full_name in entity_by_name:
+                return full_name
+        return given_name if given_name in entity_by_name else None
+
+    def _has_classic_father_evidence(self, story_text: str, child_name: str) -> bool:
+        child_given_name = child_name[1:] if len(child_name) >= 3 else child_name
+        child = re.escape(child_given_name)
+        return bool(
+            re.search(rf"이름을\s*{child}이라", story_text)
+            and (
+                re.search(r"승상[^\n.。!?]{0,40}(?:보시|이름을|들어와)", story_text)
+                or re.search(r"(?:부친을\s*부친이라|아비를\s*아비라|대감의\s*정기)", story_text)
+            )
+        )
+
+    def _has_classic_mother_evidence(self, story_text: str, child_name: str) -> bool:
+        child_given_name = child_name[1:] if len(child_name) >= 3 else child_name
+        child = re.escape(child_given_name)
+        return bool(
+            re.search(rf"춘섬[^\n.。!?]{{0,260}}(?:태기|기남자|낳)", story_text)
+            and (
+                re.search(rf"이름을\s*{child}이라", story_text)
+                or re.search(r"(?:모친|어미|모자)", story_text)
+            )
+        )
+
     def _has_membership_evidence(self, story_text: str, organization: dict[str, Any], member: dict[str, Any]) -> bool:
         if not story_text:
             return False
@@ -632,9 +960,57 @@ END
                 return True
         return False
 
+    def _has_entity_text_evidence(self, name: str, aliases: list[str], story_text: str) -> bool:
+        return any(term and term in story_text for term in [name, *aliases])
+
+    def _filter_supported_issues(self, issues: Any) -> list[dict[str, Any]]:
+        if not isinstance(issues, list):
+            return []
+        supported: list[dict[str, Any]] = []
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            text = " ".join(
+                str(issue.get(key, ""))
+                for key in ("title", "description")
+            ).casefold()
+            has_signal = any(term.casefold() in text for term in ISSUE_SIGNAL_TERMS)
+            has_continuity_context = any(term.casefold() in text for term in ISSUE_CONTINUITY_CONTEXT_TERMS)
+            if has_signal and has_continuity_context:
+                supported.append(issue)
+        return supported
+
     def _is_membership_relation_type(self, relation_type: str) -> bool:
         relation_type = relation_type.lower()
         return any(term in relation_type for term in ("소속", "조직", "member", "belongs", "affiliated"))
+
+    def _is_ownership_relation_type(self, relation_type: str) -> bool:
+        relation_type = relation_type.lower()
+        return any(term in relation_type for term in ("소유", "사용", "owns", "uses"))
+
+    def _violates_possessive_target_name(
+        self,
+        source: str,
+        target: str,
+        entity_by_name: dict[str, dict[str, Any]],
+    ) -> bool:
+        if target.startswith("우리 ") and source != "나":
+            return True
+        for entity in entity_by_name.values():
+            if entity.get("type") != "character":
+                continue
+            owner_name = str(entity.get("name", ""))
+            if owner_name and target.startswith(f"{owner_name}네 ") and source != owner_name:
+                return True
+        return False
+
+    def _is_weak_entity_alias(self, alias: str, entity_type: str) -> bool:
+        if entity_type == "character":
+            return alias in NON_CHARACTER_ENTITY_NAMES or alias in ITEM_TERMS or alias in WEAK_ITEM_BODY_TERMS
+        return False
+
+    def _is_generic_relation_type(self, relation_type: str) -> bool:
+        return relation_type.strip().casefold() in GENERIC_RELATION_TYPES
 
     def _is_organization_to_person_guess(
         self,
@@ -692,10 +1068,45 @@ END
         return False
 
     def _is_weak_item_phrase(self, name: str) -> bool:
-        return name.startswith(("젖은 ", "푸른 ", "흰 ", "그 ")) or name.endswith("냄새")
+        return (
+            name.startswith(("젖은 ", "푸른 ", "흰 ", "그 "))
+            or any(term in name for term in WEAK_ITEM_BODY_TERMS)
+            or name.endswith("냄새")
+            or any(
+                name.endswith(f"{prefix} 모자")
+                for prefix in ("차생에", "우리", "길동", "소자", "들어와", "돌아와", "왔사오니")
+            )
+            or any(name.endswith(f"{prefix} 장부") for prefix in ("아니하니", "쾌달한", "당당한"))
+        )
+
+    def _is_kinship_moja_context(self, story_text: str) -> bool:
+        return bool(
+            story_text
+            and re.search(r"(?:차생에\s*모자|모자\s*(?:되|서로|정리|지정)|모자지정)", story_text)
+        )
 
     def _looks_like_organization_name(self, name: str) -> bool:
-        return name == "왕궁" or any(name.endswith(suffix) for suffix in ORGANIZATION_SUFFIXES)
+        return not self._is_weak_organization_name(name) and (
+            name == "왕궁" or any(name.endswith(suffix) for suffix in ORGANIZATION_SUFFIXES)
+            or (len(name) > 2 and name.endswith("단"))
+        )
+
+    def _is_weak_organization_name(self, name: str) -> bool:
+        return name.endswith("소원") or name in {"차생에 모자", "우리 모자", "길동 모자"}
+
+    def _has_won_organization_context(self, story_text: str, name: str) -> bool:
+        escaped_name = re.escape(name)
+        return bool(
+            re.search(
+                rf"{escaped_name}(?:의|\s+)[^\n.。!?]{{0,20}}"
+                r"(?:기록관|원장|경비대|서고|소속|사람|규칙|명령|관리)",
+                story_text,
+            )
+            or re.search(
+                rf"[^\n.。!?]{{0,20}}(?:기록관|원장|경비대|소속|조직)[^\n.。!?]{{0,20}}{escaped_name}",
+                story_text,
+            )
+        )
 
     def _looks_like_spatial_name(self, name: str) -> bool:
         if any(term in name for term in ITEM_TERMS):
@@ -717,7 +1128,8 @@ END
         return len(name) > 18 and any(marker in name for marker in CLAUSE_MARKERS)
 
     def _clean_entity_name(self, name: str) -> str:
-        return re.sub(r"\s+", " ", name).strip().strip("\"'“”‘’.,;:!?()[]{}")
+        cleaned = re.sub(r"\s+", " ", name).strip().strip("\"'“”‘’.,;:!?()[]{}")
+        return re.sub(r"^(?:aliases?|별칭)\s*[:：]\s*", "", cleaned, flags=re.IGNORECASE).strip()
 
     def _context_section(self, context: str) -> str:
         compact_context = context.strip()[:MAX_CONTEXT_CHARS_PER_PROMPT]

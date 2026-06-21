@@ -721,27 +721,22 @@ class StoryRepository:
             data.update(_relation_story_metrics(data, entity_metrics, len(document_rows)))
             relations.append(RelationEdge(**data))
         issues = []
-        if not document_rows or len(document_rows) >= 5:
-            for row in issue_rows:
-                data = dict(row)
-                data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
-                if has_range_filter:
-                    evidence_ids = set(_coerce_int_list(data["evidence_chunk_ids"]))
-                    if evidence_ids and not (evidence_ids & selected_chunk_ids):
-                        continue
-                issues.append(ContinuityIssue(**data))
+        for row in issue_rows:
+            data = dict(row)
+            data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
+            if has_range_filter:
+                evidence_ids = set(_coerce_int_list(data["evidence_chunk_ids"]))
+                if evidence_ids and not (evidence_ids & selected_chunk_ids):
+                    continue
+            issues.append(ContinuityIssue(**data))
         changes = self._relation_changes(project_id, selected_document_ids, visible_entity_ids)
         graph_range = GraphRange(
             start_chapter=start_chapter,
             end_chapter=end_chapter,
             document_ids=selected_document_ids,
             document_count=len(selected_document_ids),
-            continuity_ready=len(selected_document_ids) >= 5,
-            message=(
-                "선택 범위가 5편 이상이라 설정 붕괴 후보를 판단합니다."
-                if len(selected_document_ids) >= 5
-                else "설정 붕괴 후보는 최소 5편 이상 누적된 뒤 판단합니다."
-            ),
+            continuity_ready=True,
+            message="선택 범위의 설정 붕괴 후보를 판단합니다.",
         )
         return GraphPayload(
             entities=entities,

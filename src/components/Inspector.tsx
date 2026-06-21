@@ -110,9 +110,7 @@ export function Inspector({
           <span>{issues.length}</span>
         </div>
         <div className="issue-list">
-          {!graphRange.continuity_ready ? (
-            <p className="muted">{graphRange.message}</p>
-          ) : issues.length === 0 ? (
+          {issues.length === 0 ? (
             <p className="muted">열린 이슈가 없습니다.</p>
           ) : (
             issues.map((issue) => (

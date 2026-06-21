@@ -39,7 +39,7 @@ const EMPTY_GRAPH: GraphPayload = {
     end_chapter: null,
     document_ids: [],
     document_count: 0,
-    continuity_ready: false,
+    continuity_ready: true,
     message: "분석된 원고가 없습니다.",
   },
 };

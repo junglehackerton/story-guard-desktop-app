@@ -48,7 +48,7 @@ function graphFixture(payload: Pick<GraphPayload, "entities" | "relations">): Gr
       end_chapter: null,
       document_ids: [1],
       document_count: 1,
-      continuity_ready: false,
+      continuity_ready: true,
       message: "테스트 범위",
     },
   };
