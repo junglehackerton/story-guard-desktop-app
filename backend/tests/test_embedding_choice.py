@@ -47,3 +47,20 @@ def test_gemma_worker_cleanup_terminates_live_processes():
  GemmaEmbeddings._cleanup_workers()
  assert process.terminated is True
  assert GemmaEmbeddings._workers == {}
+
+
+def test_gemma_batch_reduces_after_memory_error(tmp_path, monkeypatch):
+ import numpy as np
+ model=_LocalGemmaEmbeddings(model_dir=tmp_path)
+ calls=[]
+ class Fake:
+  max_seq_length=2048
+  prompts={'document':'d: ','query':'q: '}
+  tokenizer=lambda self,text,**kw:{'input_ids':[1,2]}
+  def encode_document(self,texts,**kwargs):
+   calls.append(kwargs['batch_size'])
+   if kwargs['batch_size'] > 2: raise RuntimeError('out of memory')
+   return np.tile(np.ones(768)/np.sqrt(768),(len(texts),1))
+ monkeypatch.setattr(model,'_model',lambda:Fake())
+ assert len(model.embed_documents(['a','b']))==2
+ assert calls == [4, 2]

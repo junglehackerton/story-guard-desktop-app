@@ -82,9 +82,17 @@ class _LocalGemmaEmbeddings:
                     torch.set_num_threads(max(1, min(int(os.getenv('STORY_GUARD_EMBED_THREADS', '4')), 4)))
                 except ValueError:
                     torch.set_num_threads(4)
+            requested_dtype = os.getenv('STORY_GUARD_GEMMA_DTYPE', 'float32').lower()
+            low_memory = os.getenv('STORY_GUARD_LOW_MEMORY', '').lower() in {'1', 'true', 'yes'}
+            if requested_dtype == 'float16' or (requested_dtype == 'auto' and low_memory and device in {'mps', 'cuda'}):
+                dtype = torch.float16
+            elif requested_dtype == 'bfloat16':
+                dtype = torch.bfloat16
+            else:
+                dtype = torch.float32
             self._cache.clear()
             self._cache[key]=SentenceTransformer(str(self.path),device=device,local_files_only=True,
-                trust_remote_code=False,model_kwargs={'torch_dtype':torch.float32})
+                trust_remote_code=False,model_kwargs={'torch_dtype':dtype})
         return self._cache[key]
     def _validate(self, model, texts, kind):
         for text in texts:
@@ -100,7 +108,15 @@ class _LocalGemmaEmbeddings:
             except ValueError:
                 requested_batch = 4
             batch_size = max(1, min(requested_batch, 8))
-            return self._vectors(model.encode_document(texts,batch_size=batch_size,show_progress_bar=False,convert_to_numpy=True))
+            while True:
+                try:
+                    values = model.encode_document(texts,batch_size=batch_size,show_progress_bar=False,convert_to_numpy=True)
+                    return self._vectors(values)
+                except (MemoryError, RuntimeError) as error:
+                    message = str(error).lower()
+                    if batch_size == 1 or not any(token in message for token in ('out of memory', 'memory', 'mps')):
+                        raise
+                    batch_size = max(1, batch_size // 2)
     def embed_query(self,text):
         with self._lock:
             model=self._model();self._validate(model,[text],'query')
