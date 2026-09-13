@@ -8,6 +8,7 @@ import queue
 import shutil
 import subprocess
 import threading
+import tempfile
 
 
 def isolated_environment(home: Path) -> dict[str, str]:
@@ -33,6 +34,13 @@ def find_codex() -> str:
 class CodexTransport:
     def __init__(self, home: Path):
         self.home = home
+        # The app keeps the durable auth.json in ``home``.  Codex app-server
+        # also creates several SQLite state databases under CODEX_HOME; using
+        # the auth directory directly makes it collide with a running desktop
+        # Codex process.  Give each bridge its own runtime directory and
+        # expose only the persisted auth file to it.
+        self.runtime_home: Path | None = None
+        self._runtime_auth_is_copy = False
         self.callback = lambda method, params: None
         self._process = None
         self._lock = threading.RLock()
@@ -46,12 +54,27 @@ class CodexTransport:
             if self._process is not None and self._process.poll() is None:
                 return
             self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            if self.runtime_home is None:
+                self.runtime_home = Path(tempfile.mkdtemp(prefix='storyguard-codex-'))
+                self.runtime_home.chmod(0o700)
+            auth_file = self.home / 'auth.json'
+            runtime_auth = self.runtime_home / 'auth.json'
+            if auth_file.exists() and not runtime_auth.exists():
+                try:
+                    runtime_auth.symlink_to(auth_file)
+                    self._runtime_auth_is_copy = False
+                except OSError:
+                    # Windows may not permit symlink creation.  The fallback
+                    # is synchronized back in close(), preserving login state.
+                    shutil.copy2(auth_file, runtime_auth)
+                    runtime_auth.chmod(0o600)
+                    self._runtime_auth_is_copy = True
             process = subprocess.Popen(
                 [find_codex(), 'app-server', '-c', 'cli_auth_credentials_store="file"',
                  '-c', 'forced_login_method="chatgpt"'],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                text=True, encoding='utf-8', bufsize=1, cwd=str(self.home),
-                env=isolated_environment(self.home),
+                text=True, encoding='utf-8', bufsize=1, cwd=str(self.runtime_home),
+                env=isolated_environment(self.runtime_home),
             )
             self._process = process
             threading.Thread(target=self._read, args=(process,), daemon=True).start()
@@ -130,4 +153,16 @@ class CodexTransport:
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=3)
+        if self._runtime_auth_is_copy and self.runtime_home is not None:
+            runtime_auth = self.runtime_home / 'auth.json'
+            auth_file = self.home / 'auth.json'
+            if runtime_auth.exists():
+                temporary = auth_file.with_suffix('.json.tmp')
+                shutil.copy2(runtime_auth, temporary)
+                temporary.chmod(0o600)
+                temporary.replace(auth_file)
+            self._runtime_auth_is_copy = False
+        if self.runtime_home is not None:
+            shutil.rmtree(self.runtime_home, ignore_errors=True)
+            self.runtime_home = None
         self._process = None
