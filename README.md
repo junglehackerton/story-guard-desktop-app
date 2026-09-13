@@ -2,6 +2,24 @@
 
 Story Guard는 웹소설, 장편 소설, 드라마 시나리오처럼 설정과 관계가 길게 누적되는 작품을 위한 로컬 우선 데스크톱 앱입니다. 작가의 원고를 로컬에서 분석해 인물, 장소, 조직, 아이템, 사건, 규칙, 떡밥의 관계를 그래프로 보여주고, 설정 충돌이나 미회수 떡밥 후보를 리포트로 정리합니다.
 
+해커톤 저장소: <https://github.com/wanted-storyguard/StoryGaurd>
+
+## 빠른 시작
+
+```bash
+git clone https://github.com/wanted-storyguard/StoryGaurd.git
+cd StoryGaurd
+npm install
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -r backend/requirements.txt
+npm test -- --run
+.venv/bin/python -m pytest -q
+npm run build
+```
+
+자세한 개발·패키징 절차는 아래의 `개발 환경 실행`과 `데스크톱 앱 빌드`를 따릅니다. 모델 바이너리와 개인 원고는 저장소에 커밋하지 않습니다.
+
 원고와 분석 데이터는 사용자 컴퓨터 안에 저장됩니다. 사용자가 선택해 연결한 GPT 계정으로 분석할 때만 필요한 원문 구간이 해당 제공자에 전송되며, 팀 공용 API 키를 사용하지 않습니다.
 
 ## 주요 기능
