@@ -4,6 +4,8 @@ import json, resource, sys, time
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+import os
+os.environ['STORY_GUARD_DATA_DIR'] = '/tmp/storyguard-long-local-20260913'
 from backend.app.database import Database
 from backend.app.repository import StoryRepository
 from backend.app.services.rag import RagService
@@ -14,6 +16,8 @@ data = Path('/tmp/storyguard-long-local-20260913')
 import shutil
 shutil.rmtree(data, ignore_errors=True)
 data.mkdir(parents=True)
+(data / 'models' / GEMMA_MODEL).parent.mkdir(parents=True, exist_ok=True)
+(data / 'models' / GEMMA_MODEL).symlink_to(ROOT / '.cache/embedding-bench-models' / GEMMA_MODEL)
 repo = StoryRepository(Database(data / 'story.sqlite'))
 project = repo.create_project('장편 10회 로컬 부하 검증')
 splitter = RagService.__new__(RagService)
