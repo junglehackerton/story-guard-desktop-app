@@ -4,6 +4,7 @@ import platform
 import threading
 from collections.abc import Callable
 
+from backend.app.services.embedding_models import GEMMA_MODEL, gemma_ready, download_gemma
 from backend.app.config import models_path
 from backend.app.models import (
     AppSettings,
@@ -15,8 +16,8 @@ from backend.app.services.local_ai import (
     DEFAULT_EMBEDDING_MODEL,
     DEFAULT_GENERATION_MODEL,
     DEFAULT_MODEL_REPO,
-    default_model_path,
     download_default_model,
+    download_embedding_model,
     llama_cpp_available,
     list_local_models,
     local_models_dir,
@@ -49,6 +50,8 @@ class EnvironmentSetupManager:
         runtime_ready = llama_cpp_available()
         generation_ready = runtime_ready and resolve_model_path(generation_model, model_dir) is not None
 
+        embedding_ready = (gemma_ready(model_dir) if embedding_model == GEMMA_MODEL else runtime_ready and resolve_model_path(embedding_model, model_dir) is not None)
+
         return EnvironmentStatus(
             platform=platform.system().lower() or "unknown",
             runtime_installed=runtime_ready,
@@ -56,13 +59,14 @@ class EnvironmentSetupManager:
             model_dir=str(model_dir),
             embedding_model=embedding_model,
             generation_model=generation_model,
-            embedding_model_ready=generation_ready,
+            embedding_model_ready=embedding_ready,
             generation_model_ready=generation_ready,
             models=models,
-            ready=generation_ready,
+            ready=generation_ready and embedding_ready,
             can_auto_install=True,
             install_method=f"download {DEFAULT_MODEL_REPO}",
-            message=environment_message(runtime_ready, generation_model, generation_ready, models),
+            message=("임베딩 모델 설치가 필요합니다." if runtime_ready and not embedding_ready
+                     else environment_message(runtime_ready, generation_model, generation_ready, models)),
         )
 
     def progress(self) -> EnvironmentSetupProgress:
@@ -89,41 +93,42 @@ class EnvironmentSetupManager:
             model_dir = models_path()
             model_dir.mkdir(parents=True, exist_ok=True)
 
-            if not llama_cpp_available():
+            embedding_model = request.embedding_model or DEFAULT_EMBEDDING_MODEL
+            if embedding_model not in {DEFAULT_EMBEDDING_MODEL, GEMMA_MODEL}:
+                raise ValueError("지원하지 않는 임베딩 모델입니다.")
+            if not llama_cpp_available() and (request.prepare_generation_model or embedding_model != GEMMA_MODEL):
                 raise RuntimeError("llama.cpp 런타임이 설치되어 있지 않습니다.")
 
-            generation_model = (request.generation_model or DEFAULT_GENERATION_MODEL).strip()
-            if generation_model != DEFAULT_GENERATION_MODEL:
-                self._log("models", f"사용자 지정 모델 확인: {generation_model}")
-                if resolve_model_path(generation_model, model_dir) is None:
-                    raise RuntimeError(f"'{generation_model}' 모델 파일을 찾지 못했습니다. {model_dir} 폴더에 GGUF 모델을 넣어 주세요.")
-            else:
-                self._log("download", f"기본 로컬 LLM을 준비합니다: {DEFAULT_MODEL_REPO}")
-                target = default_model_path(model_dir)
-                if target.exists():
-                    self._log("download", f"기본 모델이 이미 설치되어 있습니다: {target.name}")
+            last_bucket = -1
+
+            def report(downloaded: int, total: int | None) -> None:
+                nonlocal last_bucket
+                bucket = downloaded // (25 * 1024 * 1024)
+                if bucket != last_bucket:
+                    last_bucket = bucket
+                    message = f"{downloaded / total * 100:.1f}%" if total else f"{downloaded // (1024 * 1024)} MB"
+                    self._log("download", f"모델 다운로드 중: {message}")
+
+            if request.prepare_embedding_model:
+                self._log("download", f"전용 임베딩 모델을 준비합니다: {embedding_model}")
+                if embedding_model == GEMMA_MODEL:
+                    download_gemma(model_dir)
                 else:
+                    download_embedding_model(model_dir, progress=report)
+                self._log("download", "임베딩 모델 파일 검증 완료")
+
+            generation_model = (request.generation_model or DEFAULT_GENERATION_MODEL).strip()
+            if request.prepare_generation_model:
+                if generation_model == DEFAULT_GENERATION_MODEL:
                     last_bucket = -1
-
-                    def report(downloaded: int, total: int | None) -> None:
-                        nonlocal last_bucket
-                        bucket = downloaded // (25 * 1024 * 1024)
-                        if bucket == last_bucket:
-                            return
-                        last_bucket = bucket
-                        if total:
-                            percent = downloaded / total * 100
-                            self._log("download", f"모델 다운로드 중: {percent:.1f}%")
-                        else:
-                            size_mb = downloaded / 1024 / 1024
-                            self._log("download", f"모델 다운로드 중: {size_mb:.0f} MB")
-
+                    self._log("download", f"로컬 분석 모델을 준비합니다: {generation_model}")
                     download_default_model(model_dir, progress=report)
-                    self._log("download", f"기본 모델 설치 완료: {DEFAULT_GENERATION_MODEL}")
+                elif resolve_model_path(generation_model, model_dir) is None:
+                    raise RuntimeError(f"'{generation_model}' 모델 파일을 찾지 못했습니다.")
 
-            self._save_settings(DEFAULT_EMBEDDING_MODEL, generation_model)
-            self._log("models", f"로컬 LLM을 사용합니다: {generation_model}")
-            self._complete("로컬 LLM 환경 준비 완료")
+            self._save_settings(embedding_model, generation_model)
+            self._complete("선택한 로컬 모델 준비 완료")
+
         except Exception as error:
             self._fail(str(error))
 

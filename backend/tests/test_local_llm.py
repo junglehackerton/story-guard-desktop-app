@@ -159,6 +159,25 @@ END
     assert "열" not in item_names
 
 
+def test_local_llm_keeps_item_name_when_prefixed_by_location_particle(monkeypatch, tmp_path: Path) -> None:
+    model_path = tmp_path / "test-model.gguf"
+    model_path.write_bytes(b"placeholder")
+    fake_llm = FakeChatLlm(
+        [
+            "ENTITY|item|봉인검|계약 검|\nEND",
+            "END",
+        ]
+    )
+    monkeypatch.setattr(local_llm, "llama_cpp_available", lambda: True)
+
+    payload = FakeLoadLocalLlmExtractor(fake_llm, model_path).extract_story_facts(
+        "유나는 회백원 서고에서 봉인검을 발견했다."
+    )
+    item_names = {entity["name"] for entity in payload["entities"] if entity["type"] == "item"}
+    assert "봉인검" in item_names
+    assert "서고에서 봉인검" not in item_names
+
+
 def test_local_llm_recovers_named_organizations_for_relation_extraction(monkeypatch, tmp_path: Path) -> None:
     model_path = tmp_path / "test-model.gguf"
     model_path.write_bytes(b"placeholder")

@@ -1,0 +1,22 @@
+from pathlib import Path
+import json,html
+from backend.app.services.hybrid_search import lexical_rank,merge_rankings
+root=Path(__file__).resolve().parents[2];out=root/'output/validation/retrieval-strategies'
+r=json.loads((out/'results.json').read_text());fresh=json.loads((out/'fresh-results.json').read_text());data=json.loads((root/'output/validation/embedding-advanced/dataset.json').read_text())
+rows=[{'chunk_id':p['id'],'text':p['text']} for p in data['passages']];byid={p['chunk_id']:p for p in rows}
+# Verify the shipped algorithm exactly matches the evaluated candidate, all models/questions.
+for m in r['results']:
+ measured=json.loads((root/f"output/validation/embedding-advanced/{m['model']}.json").read_text())
+ for q,c in zip(measured['results'],m['cases']):
+  actual=merge_rankings([byid[i] for i in q['top8']],lexical_rank(rows,q['query']),4)
+  assert [p['chunk_id'] for p in actual]==c['strategies']['dense2_lex2']
+names={'dense4':'기존 벡터 4개','paragraph_bm25_4':'문단 키워드 4개','rrf4':'순위 점수 결합 4개','dense2_lex2':'벡터 2 + 키워드 2','neighbor4':'인접 청크 확장 4개'}
+tr=''.join('<tr><th>'+m['model']+'</th>'+''.join(f"<td>{m['summary'][k]['passed']}/40<br><small>개선 {m['summary'][k]['gained']} · 악화 {m['summary'][k]['lost']}</small></td>" for k in names)+'</tr>' for m in r['results'])
+changes=[]
+for c in r['results'][0]['cases']:
+ if c['success']['dense4']==c['success']['dense2_lex2']:continue
+ changes.append('<details><summary>'+html.escape(c['query'])+'</summary><p>필요한 근거</p>'+''.join('<blockquote>'+html.escape(t)+'</blockquote>' for t in c['gold_texts'])+'<p>혼합 검색 결과</p>'+''.join('<p>'+html.escape(byid[i]['text'])+'</p>' for i in c['strategies']['dense2_lex2'])+'</details>')
+page=f'''<!doctype html><html lang="ko"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Story Guard 검색 개선 비교</title><style>body{{font:16px/1.7 system-ui;color:#252A27;background:#F7F5EF;margin:0}}main{{max-width:1200px;padding:40px 24px;margin:auto}}section,details{{background:#FFFDF8;border:1px solid #DADFD8;border-radius:8px;padding:20px;margin:16px 0}}table{{border-collapse:collapse;width:100%;white-space:nowrap}}td,th{{padding:12px;border-bottom:1px solid #DADFD8;text-align:left}}a,th{{color:#24635B}}.scroll{{overflow:auto}}summary{{cursor:pointer}}blockquote{{background:#E6EFEB;padding:12px}}</style><main><a href="../embedding-advanced/index.html">← 심화 검사</a><h1>모델을 바꾸지 않고 놓친 근거를 되찾기</h1><p><a href="../model-e2e/index.html">실제 GPT 통합 검증 결과 →</a></p><p>GPT 호출 0회 · 추가 모델 다운로드 없음 · 검색 결과 최대 4개 유지</p><section><h2>동일한 40개 심화 질문으로 비교</h2><div class="scroll"><table><tr><th>모델</th>{''.join('<th>'+v+'</th>' for v in names.values())}</tr>{tr}</table></div><p>필요한 근거가 모두 포함된 문항 수다. 개선·악화는 각 모델의 기존 벡터 검색 대비 문항 변화다. 이미 살펴본 합성 데이터에서 선택한 방식이므로 탐색 결과이며 독립 정확도 지표가 아니다.</p></section><section><h2>새 사례에서 추가 확인</h2><p>새 설정 6개·질의 12개: 기존 {fresh['dense']}/12 → 혼합 {fresh['hybrid']}/12, 개선 {fresh['gained']}·악화 {fresh['lost']}. 실제 Qwen과 Chroma로 실행했다. 질의 절반은 사건을 서술한 원고 문장이다. 900자 전체 청크를 질의로 쓰는 장편 검사 및 작가가 제공한 독립 원고 검증은 남아 있다.</p></section><section><h2>앱에 적용한 범위</h2><p>GPT 분석 경로에서 벡터 검색 2개와 문단 단위 키워드 검색 2개를 결합한다. 중복은 제거하고 부족한 자리는 남은 후보로 채운다. 검색 근거는 최대 4개이며 현재 분석 중인 청크를 함께 제공하는 기존 방식은 유지한다. 추가 AI 모델이나 API 없이 로컬 코드로 동작한다.</p><p>검색 후보는 같은 작품과 지정된 회차 범위의 현재 인덱스에서만 읽는다. 기존 dense 방식도 유지한다. 문단 BM25는 한국어 단어 내부의 2·3글자 조각을 사용하며, 문단 점수 중 최대값을 청크 점수로 사용한다. 검색마다 현재 문단을 점수화하므로 더 큰 원고에서 CPU 부담·지연을 추가 측정해야 한다.</p><p>실제 GPT 호출과 최종 설정 충돌 탐지율은 이번에 측정하지 않았다. 검색 결과 개수를 유지해도 전송 토큰 수가 정확히 같다는 뜻은 아니다.</p></section><section><h2>모델 선택과 초기 임베딩 최적화</h2><p>앱에서 Qwen Q8과 EmbeddingGemma를 선택할 수 있다. Gemma는 의존성이 분리된 Python 프로세스와 자동 가속, 최대 8개 배치를 사용한다.</p><p>같은 152청크의 어댑터 실측: CPU 단건 66.0초 → 가속·배치 21.3초, Top4 29/40 유지. 최초 모델 준비 10.5초 별도. 앱은 문서별 배치를 사용하므로 실제 업로드 전체 시간은 다를 수 있다. 독립 배포본 런타임 포함과 Windows 실기 검증은 남아 있다.</p></section><h2>Qwen에서 개선된 문항</h2>{''.join(changes)}</main></html>'''
+(out/'index.html').write_text(page)
+(root/'docs/retrieval-strategy-validation.md').write_text('# 검색 개선 검증\n\nHTML: `output/validation/retrieval-strategies/index.html`\n\nQwen 30/40 → 35/40, 회귀 0. 새 합성 사례 12/12 → 12/12. 실제 작가 원고 및 GPT 최종 판단은 미검증.\n\nGPT 분석에서 strategy=hybrid를 명시하여 벡터 2개+문단 BM25 2개를 결합한다. 나머지 호출의 기본값 dense는 유지한다. API 비용 및 모델 추가 없음. 동일 개수이며 토큰 수 동일 보장은 아님.\n\n실험 알고리즘과 제품 함수의 결과가 네 모델·160질의에서 일치함을 report_strategies로 확인했다.\n')
+print('Report generated; production fusion parity verified on 160 queries.')

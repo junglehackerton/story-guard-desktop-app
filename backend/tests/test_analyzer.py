@@ -53,6 +53,29 @@ class FakeLlmExtractor:
         }
 
 
+class AmbiguousAliasLlmExtractor:
+    def enabled(self) -> bool:
+        return True
+
+    def extract_story_facts(
+        self,
+        text: str,
+        context: str = "",
+        known_entity_names: list[str] | None = None,
+    ) -> dict:
+        return {
+            "entities": [
+                {"type": "character", "name": "서윤", "summary": "북부 대장", "aliases": ["대장"]},
+                {"type": "character", "name": "도윤", "summary": "남부 대장", "aliases": ["대장"]},
+                {"type": "item", "name": "봉인검", "summary": "계약 검", "aliases": []},
+            ],
+            "relations": [
+                {"source": "대장", "target": "봉인검", "type": "사용", "confidence": 0.9},
+            ],
+            "issues": [],
+        }
+
+
 class ProgressAwareLlmExtractor(FakeLlmExtractor):
     def __init__(self, repository: StoryRepository, project_id: int) -> None:
         self.repository = repository
@@ -403,6 +426,63 @@ def test_analyzer_persists_only_llm_payload(tmp_path: Path) -> None:
     assert {entity.name for entity in graph.entities} == {"한서윤", "검은 열쇠", "흑월성"}
 
 
+def test_analyzer_does_not_fabricate_first_chunk_as_evidence(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("근거 없는 관계 보류")
+    add_story(repository, project.id, tmp_path, "한서윤은 검은 열쇠를 들고 흑월성에 갔다.")
+    documents = repository.list_documents(project.id)
+    chunks = repository.list_chunks(project.id)
+    job = repository.create_job(
+        project.id,
+        AnalysisStatus.running,
+        "근거 보존 회귀 테스트",
+        current_step="persist",
+        progress=80,
+    )
+
+    StoryAnalyzer(repository, llm=FakeLlmExtractor())._persist_llm_payload(
+        project.id,
+        documents,
+        chunks,
+        {
+            "entities": [
+                {"type": "character", "name": "한서윤", "summary": "주인공", "aliases": []},
+                {"type": "item", "name": "봉인검", "summary": "계약 검", "aliases": []},
+            ],
+            "relations": [
+                {"source": "한서윤", "target": "봉인검", "type": "사용", "confidence": 0.8}
+            ],
+            "issues": [
+                {
+                    "severity": "high",
+                    "category": "contradiction",
+                    "title": "근거 없는 충돌 후보",
+                    "description": "원문 인용이 없는 후보",
+                }
+            ],
+        },
+        job.id,
+    )
+
+    graph = repository.graph(project.id)
+    assert len(graph.relations) == 1
+    assert graph.relations[0].evidence_chunk_ids == []
+    assert len(graph.issues) == 1
+    assert graph.issues[0].evidence_chunk_ids == []
+
+
+def test_analyzer_does_not_guess_when_alias_resolves_to_multiple_entities(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("모호한 별칭 관계 보호")
+    add_story(repository, project.id, tmp_path, "서윤 대장과 도윤 대장이 봉인검을 바라보았다.")
+
+    StoryAnalyzer(repository, llm=AmbiguousAliasLlmExtractor()).analyze_project(project.id)
+    graph = repository.graph(project.id)
+
+    assert {entity.name for entity in graph.entities} >= {"서윤", "봉인검"}
+    assert all(relation.origin != "gpt" for relation in graph.relations)
+
+
 def test_analyzer_recovers_dongbaek_candidates_when_llm_misreads_body_parts(tmp_path: Path) -> None:
     repository = StoryRepository(Database(tmp_path / "test.sqlite"))
     project = repository.create_project("동백꽃 후보 기반 분석")
@@ -519,6 +599,23 @@ def test_analyzer_processes_documents_sequentially_with_previous_context(tmp_pat
     assert "이서하" in llm.calls[2]["known_entity_names"]
     assert {entity.name for entity in graph.entities} == {"이서하", "강도윤", "류하진", "회백원"}
     assert {relation.type for relation in graph.relations} == {"동행/협력"}
+
+
+def test_analyzer_passes_confirmed_and_draft_settings_as_bounded_context(tmp_path: Path) -> None:
+    repository = StoryRepository(Database(tmp_path / "test.sqlite"))
+    project = repository.create_project("설정 메모 컨텍스트")
+    add_story_document(repository, project.id, tmp_path, "유나는 봉인검을 바라보았다.", 0)
+    repository.add_story_setting(project.id, "봉인검 사용", "정식 계약자만 사용할 수 있다.", "confirmed")
+    repository.add_story_setting(project.id, "예외 아이디어", "후반부에 예외 계약을 검토한다.", "draft")
+    llm = RecordingLlmExtractor()
+
+    StoryAnalyzer(repository, llm=llm).analyze_project(project.id)
+
+    assert llm.calls
+    context = llm.calls[0]["context"]
+    assert "확정 설정" in context
+    assert "구상 메모(확정 아님)" in context
+    assert "정식 계약자만 사용할 수 있다." in context
 
 
 def test_analyzer_splits_long_document_before_local_llm_call(tmp_path: Path) -> None:

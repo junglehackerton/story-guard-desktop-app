@@ -20,7 +20,7 @@
   --desk-2: #332d28;
   --desk-3: #443b34;
   --sage: #5f9075;
-  --violet: #7163c6;
+  --primary-teal: #24635b;
   --rose: #a85b68;
   --amber: #b78343;
   --teal: #4d8b87;
@@ -59,7 +59,7 @@ button {
 button:focus-visible,
 input:focus-visible,
 select:focus-visible {
-  outline: 2px solid rgba(113, 99, 198, 0.55);
+  outline: 2px solid rgba(36, 99, 91, 0.55);
   outline-offset: 2px;
 }
 
@@ -81,22 +81,32 @@ select:focus-visible {
   display: grid;
   place-items: center;
   padding: 32px;
-  color: #f6efe7;
-  background:
-    linear-gradient(180deg, rgba(38, 34, 31, 0.96), rgba(46, 40, 35, 0.96)),
-    var(--desk);
+  color: #252a27;
+  background: #f7f5ef;
+  font-family: Pretendard, -apple-system, BlinkMacSystemFont, sans-serif;
 }
 
 .startup-loader-inner {
   display: grid;
   gap: 24px;
-  width: min(520px, 100%);
+  width: min(640px, 100%);
+  padding: 40px;
+  border: 1px solid #dadfd8;
+  border-radius: 16px;
+  background: #fffdf8;
+  box-shadow: 0 16px 48px rgba(37, 42, 39, 0.08);
 }
 
 .startup-brand {
   display: flex;
   align-items: center;
   gap: 13px;
+}
+
+.startup-brand .brand-mark {
+  border-color: #24635b;
+  color: #fffdf8;
+  background: #24635b;
 }
 
 .startup-brand h1,
@@ -107,14 +117,15 @@ select:focus-visible {
 }
 
 .startup-brand h1 {
-  font-size: 22px;
+  color: #24635b;
+  font-size: 24px;
   line-height: 1.1;
 }
 
 .startup-brand p,
 .startup-copy p,
 .startup-progress-meta {
-  color: #c8baaa;
+  color: #626b65;
 }
 
 .startup-copy {
@@ -123,7 +134,7 @@ select:focus-visible {
 }
 
 .startup-copy h2 {
-  color: #fff8ed;
+  color: #252a27;
   font-size: 32px;
   line-height: 1.18;
   letter-spacing: 0;
@@ -148,7 +159,7 @@ select:focus-visible {
 }
 
 .startup-progress-meta strong {
-  color: #fff8ed;
+  color: #24635b;
 }
 
 .startup-progress-track {
@@ -156,18 +167,19 @@ select:focus-visible {
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.13);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.08);
+  border-color: #dadfd8;
+  background: #e6efeb;
 }
 
 .startup-progress-track div {
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, var(--sage), var(--amber));
+  background: #24635b;
   transition: width 220ms ease;
 }
 
 .startup-spinner {
-  color: #e3c17a;
+  color: #24635b;
   animation: startup-spin 900ms linear infinite;
 }
 
@@ -181,18 +193,19 @@ select:focus-visible {
   padding: 0 14px;
   border: 1px solid rgba(255, 255, 255, 0.18);
   border-radius: 8px;
-  color: #fff8ed;
-  background: rgba(255, 255, 255, 0.11);
+  border-color: #24635b;
+  color: #24635b;
+  background: #e6efeb;
   cursor: pointer;
   font-weight: 850;
 }
 
 .startup-retry:hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: #d6e7e1;
 }
 
 .startup-loader.error .startup-copy h2 {
-  color: #ffd8c8;
+  color: #ad443b;
 }
 
 @keyframes startup-spin {
@@ -242,7 +255,7 @@ select:focus-visible {
   border-radius: 8px;
   color: #fff7e8;
   background:
-    linear-gradient(135deg, rgba(183, 131, 67, 0.42), rgba(113, 99, 198, 0.32)),
+    linear-gradient(135deg, rgba(183, 131, 67, 0.42), rgba(36, 99, 91, 0.32)),
     #3a332d;
   font-weight: 850;
 }
@@ -419,6 +432,44 @@ select:focus-visible {
   padding-right: 2px;
 }
 
+.document-picker {
+  display: grid;
+  gap: 8px;
+}
+
+.document-picker button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  color: var(--ink);
+  background: var(--paper-strong);
+  text-align: left;
+}
+
+.document-picker button > span {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.document-picker button small {
+  color: var(--muted);
+}
+
+.document-picker button.selected {
+  border-color: var(--teal);
+  color: #fffdf8;
+  background: var(--teal);
+}
+
+.document-picker button.selected small {
+  color: #fffdf8;
+}
+
 .project-list button,
 .document-row {
   width: 100%;
@@ -434,7 +485,7 @@ select:focus-visible {
   border-color: rgba(183, 131, 67, 0.58);
   color: #fff9ee;
   background:
-    linear-gradient(135deg, rgba(183, 131, 67, 0.36), rgba(113, 99, 198, 0.18)),
+    linear-gradient(135deg, rgba(183, 131, 67, 0.36), rgba(36, 99, 91, 0.18)),
     rgba(255, 255, 255, 0.08);
 }
 
@@ -512,6 +563,7 @@ select:focus-visible {
 }
 
 .workspace {
+  overflow-y: auto;
   display: flex;
   flex-direction: column;
   min-width: 0;
@@ -548,6 +600,10 @@ select:focus-visible {
   gap: 10px;
   min-width: 0;
   margin-top: 3px;
+}
+
+.project-title-row.context-hidden {
+  display: none;
 }
 
 .workspace-header h2 {
@@ -721,6 +777,7 @@ select:focus-visible {
   background: #f4f1ea;
 }
 
+.analysis-progress-panel.is-partial,
 .analysis-progress-panel.is-failed {
   border-bottom-color: rgba(164, 83, 83, 0.3);
   background: #fbebe6;
@@ -815,7 +872,7 @@ select:focus-visible {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #576795, #6f7ead);
+  background: #24635b;
   transition: width 220ms ease;
 }
 
@@ -834,6 +891,21 @@ select:focus-visible {
 .analysis-progress-panel p {
   margin: 0;
   line-height: 1.45;
+}
+
+.analysis-progress-cancel {
+  justify-self: start;
+  padding: 7px 12px;
+  border: 1px solid rgba(173, 68, 59, 0.35);
+  border-radius: 7px;
+  color: #ad443b;
+  background: #fffdf8;
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.analysis-progress-cancel:hover {
+  background: #fff1ed;
 }
 
 .analysis-progress-steps {
@@ -978,7 +1050,7 @@ select:focus-visible {
 }
 
 .graph-controls button.active.entity-character {
-  background: var(--violet);
+  background: var(--primary-teal);
 }
 
 .graph-controls button.active.entity-place {
@@ -994,7 +1066,7 @@ select:focus-visible {
 }
 
 .graph-controls button.active.entity-event {
-  background: #8a6aa9;
+  background: #988359;
 }
 
 .graph-controls button.active.entity-rule {
@@ -1007,9 +1079,9 @@ select:focus-visible {
 
 .graph-stage {
   position: relative;
-  flex: 1 1 auto;
+  flex: 1 0 610px;
   min-width: 0;
-  min-height: 0;
+  min-height: 610px;
   overflow: hidden;
   background:
     linear-gradient(rgba(120, 108, 94, 0.105) 1px, transparent 1px),
@@ -1193,7 +1265,7 @@ select:focus-visible {
 }
 
 .entity-character {
-  background: var(--violet);
+  background: var(--primary-teal);
 }
 
 .entity-place {
@@ -1209,7 +1281,7 @@ select:focus-visible {
 }
 
 .entity-event {
-  background: #8a6aa9;
+  background: #988359;
 }
 
 .entity-rule {
@@ -1510,3 +1582,22 @@ select:focus-visible {
     max-height: none;
   }
 }
+
+.chatgpt-panel { background: #fffdf8; border-color: #dadfd8; color: #252a27; }
+.chatgpt-panel p { line-height: 1.6; font-size: 14px; }
+.chatgpt-panel button { color: #24635b; }
+.chatgpt-code, .chatgpt-check { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin-top: 16px; }
+.chatgpt-code > strong { font-size: 28px; letter-spacing: .15em; user-select: all; }
+.chatgpt-code > span { overflow-wrap: anywhere; }
+.chatgpt-check label { display: flex; align-items: center; gap: 8px; }
+.chatgpt-check input { width: auto; }
+.chatgpt-panel [role="alert"] { color: #ad443b; }
+.chatgpt-result { padding: 16px; background: #e6efeb; margin-top: 16px; white-space: pre-wrap; }
+
+.graph-hud select { max-width: 180px; color: #252A27; background: #FFFDF8; border: 1px solid #DADFD8; border-radius: 6px; padding: 6px; }
+.relation-evidence summary { color: #24635B; cursor: pointer; }
+.relation-evidence blockquote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid #24635B; background: #FFFDF8; }
+.relation-evidence small { color: #626B65; }
+
+.workspace > :not(.graph-stage) { flex-shrink: 0; }
+@media (max-width: 900px) { .workspace { overflow-y: visible; } }

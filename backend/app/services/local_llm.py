@@ -147,6 +147,9 @@ ITEM_PREFIX_STOPWORDS = {
     "너머로",
     "길이의",
     "차생에",
+    "따르면",
+    "하지만",
+    "그러나",
 }
 CLAUSE_MARKERS = ("을 ", "를 ", "은 ", "는 ", "이 ", "가 ", "채", "했다", "한다", "왔다", "웃었다", "넘지", "않은")
 NAMED_ITEM_RE = re.compile(
@@ -814,7 +817,8 @@ END
         if len(tokens) > 2:
             tokens = tokens[-2:]
         while len(tokens) > 1 and (
-            tokens[0] in ITEM_PREFIX_STOPWORDS or (len(tokens[0]) >= 3 and re.search(r"[은는이가]$", tokens[0]))
+            tokens[0] in ITEM_PREFIX_STOPWORDS
+            or (len(tokens[0]) >= 3 and re.search(r"(?:에서|으로|에게|부터|까지|처럼|보다|에|을|를|은|는|이|가|의|와|과|도)$", tokens[0]))
         ):
             tokens = tokens[1:]
         return self._clean_entity_name(" ".join(tokens))
@@ -1155,6 +1159,12 @@ END
         llm = Llama(
             model_path=cache_key,
             n_ctx=4096,
+            # llama.cpp defaults n_batch to 512. Long Korean prompts can
+            # legitimately exceed that even after retrieval trimming, which
+            # makes the native call fail before generation. Keep context at
+            # 4096 but allow a larger prompt batch for full-episode checks.
+            n_batch=2048,
+            n_ubatch=2048,
             n_threads=threads,
             n_threads_batch=threads,
             n_gpu_layers=llama_gpu_layer_count(),

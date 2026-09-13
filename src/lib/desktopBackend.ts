@@ -20,8 +20,21 @@ export async function ensureDesktopBackend(): Promise<string> {
   const token = await invoke<string>("api_token");
   setApiToken(token);
   if (backendProcess) {
-    await waitForBackendReady();
-    return "데스크톱 backend sidecar 실행 중";
+    try {
+      await waitForBackendReady();
+      return "데스크톱 backend sidecar 실행 중";
+    } catch (error) {
+      // A sidecar can disappear without emitting the shell close event (for
+      // example when the app is terminated while an analysis is running).
+      // Do not keep a dead Child handle: clear it and recover by spawning a
+      // fresh sidecar below. Version/auth conflicts remain fatal and are
+      // surfaced by waitForBackendReady rather than silently replaced.
+      if (isBackendVersionOrAuthConflict(error)) {
+        throw error;
+      }
+      backendProcess = null;
+      startPromise = null;
+    }
   }
   if (startPromise) {
     return startPromise;
@@ -55,8 +68,12 @@ async function startSidecar(token: string): Promise<string> {
     startPromise = null;
   });
   backendProcess = await command.spawn();
-  await waitForBackendReady();
-  return `데스크톱 backend sidecar 시작: pid ${backendProcess.pid}`;
+  await waitForBackendReady(BACKEND_READY_TIMEOUT_MS, BACKEND_READY_INTERVAL_MS, () => backendProcess !== null);
+  const child = backendProcess;
+  if (!child) {
+    throw new Error("데스크톱 backend가 준비 직후 종료되었습니다. 다시 시작해 주세요.");
+  }
+  return `데스크톱 backend sidecar 시작: pid ${child.pid}`;
 }
 
 export async function stopDesktopBackend(): Promise<void> {
@@ -100,15 +117,23 @@ async function isExistingBackendReady(): Promise<boolean> {
 export async function waitForBackendReady(
   timeoutMs = BACKEND_READY_TIMEOUT_MS,
   intervalMs = BACKEND_READY_INTERVAL_MS,
+  isProcessAlive: () => boolean = () => true,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   let lastError: unknown = null;
   while (Date.now() < deadline) {
     try {
-      await api.ready();
+      // A stalled fetch must not block the outer readiness deadline. This is
+      // especially important during startup when a sidecar crashed before it
+      // opened the port: the UI should reach its retry state predictably.
+      const remainingMs = Math.max(1, deadline - Date.now());
+      await withTimeout(api.ready(), Math.min(2_000, remainingMs));
       return;
     } catch (error) {
       lastError = error;
+      if (!isProcessAlive()) {
+        throw new Error("데스크톱 backend 프로세스가 시작 직후 종료되었습니다. 포트 충돌 또는 sidecar 오류를 확인해 주세요.");
+      }
       if (
         isBackendVersionOrAuthConflict(error)
       ) {

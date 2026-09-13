@@ -4,6 +4,12 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+# Keep PyInstaller's cache inside the checkout. Some macOS installations have
+# stale files in the user cache that cannot be removed by a later build; a
+# project-local cache makes sidecar builds reproducible and avoids touching
+# unrelated user state.
+export PYINSTALLER_CONFIG_DIR="${PYINSTALLER_CONFIG_DIR:-$ROOT_DIR/.pyinstaller-config}"
+
 if [[ ! -x ".venv/bin/pyinstaller" ]]; then
   echo "PyInstaller is not installed. Run: . .venv/bin/activate && pip install -r backend/requirements.txt" >&2
   exit 1

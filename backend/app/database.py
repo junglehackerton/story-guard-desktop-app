@@ -30,6 +30,22 @@ CREATE TABLE IF NOT EXISTS documents (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS story_settings (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  certainty TEXT NOT NULL DEFAULT 'draft',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS foreshadowing_status (
+  entity_id INTEGER PRIMARY KEY REFERENCES entities(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'unreviewed',
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS chunks (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -72,6 +88,15 @@ CREATE TABLE IF NOT EXISTS issues (
   status TEXT NOT NULL DEFAULT 'open'
 );
 
+CREATE TABLE IF NOT EXISTS review_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL, description TEXT NOT NULL, status TEXT NOT NULL,
+  evidence TEXT NOT NULL, fingerprint TEXT NOT NULL,
+  outcome TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS analysis_jobs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -82,6 +107,14 @@ CREATE TABLE IF NOT EXISTS analysis_jobs (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS gpt_review_runs (
+  job_id INTEGER PRIMARY KEY REFERENCES analysis_jobs(id) ON DELETE CASCADE,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  snapshot_key TEXT NOT NULL,
+  checkpoints TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS gpt_review_snapshot ON gpt_review_runs(project_id, snapshot_key, job_id);
 
 CREATE TABLE IF NOT EXISTS document_analysis_cache (
   document_id INTEGER PRIMARY KEY REFERENCES documents(id) ON DELETE CASCADE,
@@ -133,6 +166,13 @@ CREATE TABLE IF NOT EXISTS episode_claims (
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS gpt_request_cache (
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  request_key TEXT NOT NULL,
+  response TEXT NOT NULL,
+  PRIMARY KEY(project_id, request_key)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -160,6 +200,10 @@ class Database:
     def initialize(self) -> None:
         with sqlite3.connect(self.db_path) as connection:
             connection.executescript(SCHEMA)
+            ensure_column(connection, 'analysis_jobs', 'window_details', "TEXT NOT NULL DEFAULT '[]'")
+            ensure_column(connection, 'analysis_jobs', 'review_context', "TEXT NOT NULL DEFAULT '{}'")
+            ensure_column(connection, "relations", "origin", "TEXT NOT NULL DEFAULT 'local'")
+            ensure_column(connection, "relations", "claims", "TEXT NOT NULL DEFAULT '[]'")
             ensure_column(
                 connection,
                 "analysis_jobs",

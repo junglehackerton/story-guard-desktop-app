@@ -53,6 +53,26 @@ describe("desktop backend readiness", () => {
     await expectation;
   });
 
+  it("fails immediately when the spawned sidecar has already exited", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "ready").mockRejectedValue(new Error("connection refused"));
+
+    await expect(waitForBackendReady(60_000, 250, () => false)).rejects.toThrow(
+      "backend 프로세스가 시작 직후 종료되었습니다",
+    );
+  });
+
+  it("does not wait forever when the readiness request itself hangs", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "ready").mockReturnValue(new Promise(() => undefined));
+
+    const ready = waitForBackendReady(100, 25);
+    const expectation = expect(ready).rejects.toThrow("데스크톱 backend가 시작되지 않았습니다");
+    await vi.advanceTimersByTimeAsync(125);
+
+    await expectation;
+  });
+
   it("fails fast when another backend is using a different token", async () => {
     vi.useFakeTimers();
     vi.spyOn(api, "ready").mockRejectedValue(new Error("로컬 API 인증 토큰이 필요합니다."));

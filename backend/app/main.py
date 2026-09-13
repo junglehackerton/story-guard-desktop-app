@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import logging
 import os
 import threading
 import time
+from collections import defaultdict
 from pathlib import Path
 
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
@@ -14,6 +16,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend.app.chatgpt_routes import router as chatgpt_router, connection as chatgpt_connection
 from backend.app.config import chroma_path, database_path, models_path
 from backend.app.database import Database
 from backend.app.models import (
@@ -23,6 +26,7 @@ from backend.app.models import (
     ContinuityIssue,
     DocumentDeleteResult,
     DocumentImport,
+    DocumentReplace,
     EnvironmentSetupProgress,
     EnvironmentSetupRequest,
     EnvironmentStatus,
@@ -35,8 +39,15 @@ from backend.app.models import (
     ProjectDeleteResult,
     ProjectUpdate,
     StoryDocument,
+    StorySetting,
+    StorySettingCreate,
+    StorySettingUpdate,
+    ForeshadowingStatus,
+    ForeshadowingStatusUpdate,
 )
 from backend.app.pipeline.analyzer import StoryAnalyzer
+from backend.app.pipeline.gpt_analyzer import GptStoryAnalyzer, count_review_windows
+from backend.app.chatgpt_routes import ManuscriptAnalysisRequest
 from backend.app.repository import StoryRepository
 from backend.app.services.environment_setup import EnvironmentSetupManager
 from backend.app.services.local_ai import (
@@ -67,7 +78,7 @@ def load_environment_settings() -> AppSettings:
     ):
         generation_model = DEFAULT_GENERATION_MODEL
     embedding_model = repository.get_setting("embedding_model", DEFAULT_EMBEDDING_MODEL).strip()
-    if embedding_model != DEFAULT_EMBEDDING_MODEL:
+    if embedding_model not in {DEFAULT_EMBEDDING_MODEL, "embeddinggemma-300m"}:
         embedding_model = DEFAULT_EMBEDDING_MODEL
     return AppSettings(
         generation_model=generation_model,
@@ -78,14 +89,62 @@ def load_environment_settings() -> AppSettings:
 setup_manager = EnvironmentSetupManager(save_environment_settings, load_environment_settings)
 
 app = FastAPI(title="Story Guard API", version="0.1.0")
+
+# Importing several chapters in quick succession should produce one derived
+# index build.  Starting a sync for every file reloads the local embedding
+# runtime repeatedly and makes bulk imports look hung on laptop hardware.
+_index_tasks: dict[int, asyncio.Task] = {}
+_index_generations: dict[int, int] = defaultdict(int)
+
+
+def schedule_project_index(project_id: int, embedding_model: str) -> None:
+    """Coalesce bursty document imports into one debounced index sync."""
+    _index_generations[project_id] += 1
+    task = _index_tasks.get(project_id)
+    if task is None or task.done():
+        _index_tasks[project_id] = asyncio.create_task(
+            _run_scheduled_project_index(project_id, embedding_model)
+        )
+
+
+async def _run_scheduled_project_index(project_id: int, embedding_model: str) -> None:
+    task = asyncio.current_task()
+    seen_generation = -1
+    try:
+        while True:
+            # Allow a multi-file Finder drop/API burst to settle before the
+            # expensive model is loaded.  The analysis endpoint still calls
+            # sync_project synchronously, so this remains only a warm cache.
+            await asyncio.sleep(0.35)
+            seen_generation = _index_generations[project_id]
+            request_rag = RagService(
+                chroma_path(), embedding_model=embedding_model, repository=repository
+            )
+            await asyncio.to_thread(request_rag.sync_project, project_id)
+            if seen_generation == _index_generations[project_id]:
+                return
+    except Exception:
+        logging.getLogger(__name__).exception("원고 검색 인덱스 준비 실패: project=%s", project_id)
+    finally:
+        if _index_tasks.get(project_id) is task:
+            _index_tasks.pop(project_id, None)
+app.include_router(chatgpt_router)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
         "http://127.0.0.1:5173",
+        # Keep an alternate local Vite port available for isolated UI smoke
+        # tests without weakening the API to arbitrary web origins.
+        "http://localhost:5174",
+        "http://127.0.0.1:5174",
         "http://tauri.localhost",
         "tauri://localhost",
     ],
+    # Vite may select any free localhost port during a parallel smoke test.
+    # Keep the exception limited to loopback origins rather than allowing
+    # arbitrary web sites to call the local API.
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -128,6 +187,7 @@ def shutdown(background_tasks: BackgroundTasks) -> dict[str, str]:
 
 def shutdown_process() -> None:
     time.sleep(0.2)
+    chatgpt_connection.transport.close()
     os._exit(0)
 
 
@@ -248,53 +308,100 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
         content_hash=content_hash,
         content=content,
         chapter_index=next_chapter_index,
+        preserve_analysis=True,
     )
     settings = get_settings()
-    request_rag = RagService(chroma_path(), embedding_model=settings.embedding_model)
+    request_rag = RagService(chroma_path(), embedding_model=settings.embedding_model, repository=repository)
     rag_chunks = request_rag.split_text(content, document.id, payload.project_id)
     chunks = [chunk.text for chunk in rag_chunks] or split_chunks(content)
-    chunk_ids = repository.replace_chunks(payload.project_id, document.id, chunks)
-    repository.clear_analysis(payload.project_id)
+    repository.replace_chunks(payload.project_id, document.id, chunks)
+    # Keep the last published graph visible while the new chapter is indexed
+    # and reviewed. The next successful analysis transaction replaces derived
+    # results atomically; importing a draft must not make the workspace look
+    # empty or discard the author's previous decisions.
     if chunks:
-        asyncio.create_task(
-            index_document_chunks(
-                payload.project_id,
-                document.id,
-                document.chapter_index,
-                chunk_ids,
-                chunks,
-                settings.embedding_model,
-            )
-        )
+        schedule_project_index(payload.project_id, settings.embedding_model)
     return document
 
 
-async def index_document_chunks(
-    project_id: int,
-    document_id: int,
-    chapter_index: int,
-    chunk_ids: list[int],
-    chunks: list[str],
-    embedding_model: str,
-) -> None:
+@app.put("/documents/{document_id}", response_model=StoryDocument)
+async def replace_document(document_id: int, payload: DocumentReplace) -> StoryDocument:
     try:
-        request_rag = RagService(chroma_path(), embedding_model=embedding_model)
-        await asyncio.to_thread(
-            request_rag.index_chunks,
-            project_id,
-            chunk_ids,
-            chunks,
-            document_id,
-            chapter_index,
-            list(range(len(chunks))),
-        )
-    except Exception:
-        return
+        content, file_format, content_hash = read_document(Path(payload.path))
+        if not content.strip():
+            raise HTTPException(status_code=400, detail="빈 원고로 교체할 수 없습니다.")
+        rag = RagService(chroma_path(), embedding_model=get_settings().embedding_model, repository=repository)
+        # Preserve the owning project on rebuilt chunks.  Passing a sentinel
+        # project id here makes the replaced document invisible to
+        # list_chunks(project_id) and therefore to retrieval/incremental
+        # analysis after an author edits an existing episode.
+        with repository.database.connect() as connection:
+            row = connection.execute("SELECT project_id FROM documents WHERE id=?", (document_id,)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail="원고를 찾을 수 없습니다.")
+        project_id = int(row["project_id"])
+        chunks = [chunk.text for chunk in rag.split_text(content, document_id, project_id)]
+        document = repository.replace_document(document_id, Path(payload.path), file_format, content_hash, content, chunks)
+    except (FileNotFoundError, KeyError) as error:
+        raise HTTPException(status_code=404, detail="원고 또는 파일을 찾을 수 없습니다.") from error
+    except UnsupportedDocumentFormat as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    schedule_project_index(document.project_id, get_settings().embedding_model)
+    # Retrieval synchronizes the derived index before serving any results.
+    return document
+
+
+@app.get("/projects/{project_id}/review-history")
+def review_history(project_id: int):
+    return repository.review_history(project_id)
 
 
 @app.get("/projects/{project_id}/documents", response_model=list[StoryDocument])
 def list_documents(project_id: int) -> list[StoryDocument]:
     return repository.list_documents(project_id)
+
+
+@app.get("/projects/{project_id}/settings", response_model=list[StorySetting])
+def list_story_settings(project_id: int) -> list[StorySetting]:
+    return repository.list_story_settings(project_id)
+
+
+@app.post("/projects/{project_id}/settings", response_model=StorySetting)
+def create_story_setting(project_id: int, payload: StorySettingCreate) -> StorySetting:
+    try:
+        return repository.add_story_setting(project_id, payload.title, payload.content, payload.certainty)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="작품을 찾을 수 없습니다.") from error
+
+
+@app.patch("/settings/{setting_id}", response_model=StorySetting)
+def update_story_setting(setting_id: int, payload: StorySettingUpdate) -> StorySetting:
+    try:
+        return repository.update_story_setting(setting_id, payload.title, payload.content, payload.certainty)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="설정 메모를 찾을 수 없습니다.") from error
+
+
+@app.delete("/settings/{setting_id}", response_model=dict[str, int])
+def delete_story_setting(setting_id: int) -> dict[str, int]:
+    try:
+        project_id = repository.delete_story_setting(setting_id)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="설정 메모를 찾을 수 없습니다.") from error
+    return {"project_id": project_id}
+
+
+@app.get("/projects/{project_id}/foreshadowing/status", response_model=list[ForeshadowingStatus])
+def list_foreshadowing_statuses(project_id: int) -> list[ForeshadowingStatus]:
+    return repository.list_foreshadowing_statuses(project_id)
+
+
+@app.patch("/projects/{project_id}/foreshadowing/{entity_id}", response_model=ForeshadowingStatus)
+def set_foreshadowing_status(project_id: int, entity_id: int, payload: ForeshadowingStatusUpdate) -> ForeshadowingStatus:
+    try:
+        return repository.set_foreshadowing_status(project_id, entity_id, payload.status)
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail="떡밥 후보를 찾을 수 없습니다.") from error
 
 
 @app.delete("/documents/{document_id}", response_model=DocumentDeleteResult)
@@ -311,7 +418,7 @@ def analyze_project(project_id: int) -> dict[str, int]:
     settings = get_settings()
     analyzer = StoryAnalyzer(
         repository,
-        RagService(chroma_path(), embedding_model=settings.embedding_model),
+        RagService(chroma_path(), embedding_model=settings.embedding_model, repository=repository),
         LocalLlmExtractor(model=settings.generation_model, model_dir=models_path()),
     )
     try:
@@ -323,6 +430,21 @@ def analyze_project(project_id: int) -> dict[str, int]:
         "relation_count": result.relation_count,
         "issue_count": result.issue_count,
     }
+
+
+@app.post("/projects/{project_id}/analyze/gpt")
+def analyze_project_gpt(project_id: int, payload: ManuscriptAnalysisRequest):
+    if not payload.consent:
+        raise HTTPException(status_code=400, detail="원문 전송 동의가 필요합니다.")
+    settings = get_settings()
+    analyzer = GptStoryAnalyzer(repository,
+        RagService(chroma_path(), embedding_model=settings.embedding_model, repository=repository), chatgpt_connection)
+    try:
+        return analyzer.analyze(project_id, payload.model, payload.effort, force=payload.force,
+                                batch_limit=payload.batch_limit,
+                                start_chapter=payload.start_chapter, end_chapter=payload.end_chapter)
+    except RuntimeError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
 
 
 @app.get("/projects/{project_id}/analysis/status", response_model=AnalysisJob)
@@ -342,9 +464,92 @@ def analysis_status(project_id: int) -> AnalysisJob:
     )
 
 
+@app.get("/projects/{project_id}/analysis/estimate")
+def analysis_estimate(
+    project_id: int,
+    start_chapter: int | None = None,
+    end_chapter: int | None = None,
+) -> dict[str, int | None]:
+    """Estimate bounded GPT work using the same chunks as the analyzer.
+
+    Chapter bounds are zero-based, matching the graph endpoint and GPT
+    analysis request. Invalid ranges are rejected before any work is queued.
+    """
+    if start_chapter is not None and end_chapter is not None and start_chapter > end_chapter:
+        raise HTTPException(status_code=422, detail="분석 회차 범위가 올바르지 않습니다.")
+    documents = repository.list_documents(project_id)
+    if start_chapter is not None or end_chapter is not None:
+        documents = [document for document in documents if
+                     (start_chapter is None or document.chapter_index >= start_chapter) and
+                     (end_chapter is None or document.chapter_index <= end_chapter)]
+    document_ids = {document.id for document in documents}
+    rows = [row for row in repository.list_chunks(project_id) if row["document_id"] in document_ids]
+    return {
+        "document_count": len(documents),
+        # Report the canonical manuscript size. Chunk overlap is useful for
+        # retrieval but must not inflate the amount of source text shown to
+        # the writer or used in workload estimates.
+        "manuscript_chars": sum(len(document.content) for document in documents),
+        "chunk_count": len(rows),
+        "review_window_count": count_review_windows(documents, rows),
+        "start_chapter": start_chapter,
+        "end_chapter": end_chapter,
+    }
+
+
+def recommend_analysis_plan(review_windows: int) -> tuple[str, int, str]:
+    if review_windows <= 20:
+        return "full", review_windows or 1, "전체 범위를 한 번에 검토해도 되는 규모입니다."
+    if review_windows <= 100:
+        return "segmented", 20, "회차 묶음으로 나누어 검토하면 진행 상황과 재시도를 관리하기 쉽습니다."
+    return "staged", 20, "장편 규모입니다. 20개 구간씩 단계적으로 검토하고 완료분을 먼저 확인하세요."
+
+
+def analysis_batch_count(review_windows: int, batch_size: int) -> int:
+    if review_windows <= 0:
+        return 0
+    return (review_windows + batch_size - 1) // batch_size
+
+
+@app.get("/projects/{project_id}/analysis/plan")
+def analysis_plan(
+    project_id: int,
+    start_chapter: int | None = None,
+    end_chapter: int | None = None,
+) -> dict[str, int | str | None]:
+    """Recommend a safe review mode from the measured workload."""
+    estimate = analysis_estimate(project_id, start_chapter, end_chapter)
+    windows = int(estimate["review_window_count"])
+    mode, batch_size, message = recommend_analysis_plan(windows)
+    # Measured local-throughput hints: EmbeddingGemma ~7 chunks/s and Qwen
+    # llama.cpp ~1.4 chunks/s on the validation laptop. Keep this explicitly
+    # approximate; the progress panel remains authoritative once indexing starts.
+    chunks = int(estimate["chunk_count"])
+    embedding_model = get_settings().embedding_model
+    chunks_per_second = 7.0 if embedding_model == "embeddinggemma-300m" else 1.4
+    embedding_memory_mb = 1659 if embedding_model == "embeddinggemma-300m" else 2275
+    embedding_seconds = int(round(chunks / chunks_per_second)) if chunks else 0
+    # Provider/network latency varies; this middle projection is guidance
+    # only. Live job progress remains authoritative.
+    gpt_seconds = windows * 30
+    gpt_min_seconds = windows * 15
+    gpt_max_seconds = windows * 60
+    return {**estimate, "mode": mode, "recommended_batch_size": batch_size,
+            "embedding_model": embedding_model,
+            "embedding_estimate_seconds": embedding_seconds,
+            "embedding_memory_estimate_mb": embedding_memory_mb,
+            "gpt_estimate_seconds": gpt_seconds,
+            "gpt_estimate_min_seconds": gpt_min_seconds,
+            "gpt_estimate_max_seconds": gpt_max_seconds,
+            "batch_count": analysis_batch_count(windows, batch_size), "message": message}
+
+
 @app.post("/projects/{project_id}/analysis/cancel", response_model=AnalysisJob)
 def cancel_analysis(project_id: int) -> AnalysisJob:
-    return repository.cancel_analysis(project_id)
+    job = repository.latest_analysis_job(project_id)
+    if job and job.status != AnalysisStatus.running:
+        return job
+    return repository.cancel_analysis(project_id, preserve_results=bool(job and job.current_step.startswith("gpt_")))
 
 
 @app.get("/projects/{project_id}/graph", response_model=GraphPayload)
@@ -377,6 +582,17 @@ def issue_evidence(issue_id: int) -> list[EvidenceChunk]:
 
     chunk_ids = json.loads(row["evidence_chunk_ids"] or "[]")
     return [EvidenceChunk(**chunk) for chunk in repository.get_chunks(chunk_ids)]
+
+
+@app.get("/relations/{relation_id}/evidence", response_model=list[EvidenceChunk])
+def relation_evidence(relation_id: int) -> list[EvidenceChunk]:
+    import json
+    with repository.database.connect() as connection:
+        row = connection.execute("SELECT project_id,evidence_chunk_ids FROM relations WHERE id=?", (relation_id,)).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="관계를 찾을 수 없습니다.")
+    return [EvidenceChunk(**chunk) for chunk in repository.get_chunks(json.loads(row['evidence_chunk_ids']))
+            if chunk['project_id'] == row['project_id']]
 
 
 def main() -> None:

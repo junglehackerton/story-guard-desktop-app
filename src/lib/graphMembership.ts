@@ -31,11 +31,13 @@ export function buildOrganizationMembership(
       return;
     }
     const member = entitiesById.get(memberId);
-    if (!member || member.type === "organization" || parentOrganizationByEntityId.has(memberId)) {
+    if (!member || member.type === "organization") {
       return;
     }
     membershipByOrganizationId.get(organizationId)?.add(memberId);
-    parentOrganizationByEntityId.set(memberId, organizationId);
+    // Keep every membership in the set. The parent map is only a stable
+    // layout anchor for the first (highest-confidence) organization.
+    parentOrganizationByEntityId.set(memberId, parentOrganizationByEntityId.get(memberId) ?? organizationId);
   };
 
   for (const relation of membershipRelations) {

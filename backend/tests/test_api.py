@@ -1,10 +1,12 @@
 from pathlib import Path
+import hashlib
 
 from fastapi.testclient import TestClient
 
 from backend.app import main as main_module
 from backend.app.database import Database
 from backend.app.main import app, repository
+from backend.app.main import analysis_batch_count, recommend_analysis_plan
 from backend.app.repository import StoryRepository
 
 
@@ -15,6 +17,17 @@ def test_health_endpoint() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_analysis_plan_boundaries() -> None:
+    assert recommend_analysis_plan(0)[0:2] == ("full", 1)
+    assert recommend_analysis_plan(20)[0:2] == ("full", 20)
+    assert recommend_analysis_plan(21)[0:2] == ("segmented", 20)
+    assert recommend_analysis_plan(100)[0:2] == ("segmented", 20)
+    assert recommend_analysis_plan(101)[0:2] == ("staged", 20)
+    assert analysis_batch_count(0, 20) == 0
+    assert analysis_batch_count(21, 20) == 2
+    assert analysis_batch_count(101, 20) == 6
 
 
 def test_local_dev_origin_cors_preflight() -> None:
@@ -30,6 +43,22 @@ def test_local_dev_origin_cors_preflight() -> None:
 
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5173"
+
+
+def test_loopback_smoke_ports_are_allowed_by_cors() -> None:
+    client = TestClient(app)
+
+    response = client.options(
+        "/projects",
+        headers={
+            "Origin": "http://127.0.0.1:5181",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "x-story-guard-token",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:5181"
 
 
 def test_api_token_is_required_when_configured(monkeypatch) -> None:
@@ -83,6 +112,23 @@ def test_project_title_can_be_updated() -> None:
     assert any(item["id"] == project["id"] and item["title"] == "유리 종루의 밤" for item in projects)
 
 
+def test_story_setting_api_round_trip() -> None:
+    client = TestClient(app)
+    project = client.post("/projects", json={"title": "설정 API"}).json()
+    created = client.post(f"/projects/{project['id']}/settings", json={
+        "title": "사용 조건", "content": "계약자만 사용할 수 있다.", "certainty": "confirmed"
+    })
+    assert created.status_code == 200
+    setting = created.json()
+    assert client.get(f"/projects/{project['id']}/settings").json()[0]["certainty"] == "confirmed"
+    updated = client.patch(f"/settings/{setting['id']}", json={
+        "title": "사용 조건", "content": "계약자 또는 예외 계약자만 사용할 수 있다.", "certainty": "draft"
+    })
+    assert updated.status_code == 200
+    assert updated.json()["certainty"] == "draft"
+    assert client.delete(f"/settings/{setting['id']}").json() == {"project_id": project["id"]}
+
+
 def test_empty_project_list_does_not_create_default_project(monkeypatch, tmp_path: Path) -> None:
     isolated_repository = StoryRepository(Database(tmp_path / "empty-projects.sqlite"))
     monkeypatch.setattr(main_module, "repository", isolated_repository)
@@ -93,6 +139,214 @@ def test_empty_project_list_does_not_create_default_project(monkeypatch, tmp_pat
     assert response.status_code == 200
     assert response.json() == []
     assert isolated_repository.list_projects() == []
+
+
+def test_project_list_includes_analysis_and_review_summary(tmp_path: Path) -> None:
+    isolated_repository = StoryRepository(Database(tmp_path / "project-summary.sqlite"))
+    project = isolated_repository.create_project("작품 요약")
+    story = tmp_path / "chapter-1.md"
+    content = "유나는 봉인검을 들었다."
+    story.write_text(content, encoding="utf-8")
+    document = isolated_repository.add_document(
+        project_id=project.id,
+        path=story,
+        title="1화",
+        file_format="md",
+        content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        content=content,
+        chapter_index=0,
+    )
+    isolated_repository.add_issue(
+        project.id,
+        "medium",
+        "contradiction",
+        "확인할 관계",
+        "근거를 확인해 주세요.",
+        [],
+    )
+
+    pending = isolated_repository.list_projects()[0]
+    assert pending.document_count == 1
+    assert pending.pending_document_count == 1
+    assert pending.open_issue_count == 1
+    assert pending.last_analyzed_at is None
+
+    isolated_repository.upsert_document_analysis_cache(
+        document_id=document.id,
+        project_id=project.id,
+        content_hash=document.content_hash,
+        payload={"entities": [], "relations": [], "claims": [], "issues": []},
+        model_name="test-model",
+        prompt_version="test-v1",
+    )
+
+    analyzed = isolated_repository.list_projects()[0]
+    assert analyzed.document_count == 1
+    assert analyzed.pending_document_count == 0
+    assert analyzed.open_issue_count == 1
+    assert analyzed.last_analyzed_at
+
+
+def test_importing_new_chapter_keeps_published_graph_visible(tmp_path: Path) -> None:
+    client = TestClient(app)
+    project = client.post("/projects", json={"title": "증분 보존 API"}).json()
+    first_path = tmp_path / "first.txt"
+    first_path.write_text("유나는 봉인검을 지켰다.", encoding="utf-8")
+    first = client.post("/documents/import", json={"project_id": project["id"], "path": str(first_path)}).json()
+    source = repository.upsert_entity(project["id"], "character", "유나", [], "주인공", first["id"])
+    target = repository.upsert_entity(project["id"], "item", "봉인검", [], "검", first["id"])
+    repository.add_relation(project["id"], source.id, target.id, "지킴", 0.9, [])
+
+    second_path = tmp_path / "second.txt"
+    second_path.write_text("새로운 사건이 시작된다.", encoding="utf-8")
+    response = client.post("/documents/import", json={"project_id": project["id"], "path": str(second_path)})
+
+    assert response.status_code == 200
+    graph = client.get(f"/projects/{project['id']}/graph").json()
+    assert {entity["name"] for entity in graph["entities"]} >= {"유나", "봉인검"}
+    assert any(relation["type"] == "지킴" for relation in graph["relations"])
+
+
+def test_replacing_document_keeps_chunks_in_owning_project(tmp_path: Path, monkeypatch) -> None:
+    isolated_repository = StoryRepository(Database(tmp_path / "replace.sqlite"))
+    monkeypatch.setattr(main_module, "repository", isolated_repository)
+    monkeypatch.setattr(main_module, "chroma_path", lambda: tmp_path / "chroma")
+    client = TestClient(app)
+    project = client.post("/projects", json={"title": "원고 교체 프로젝트"}).json()
+    original = tmp_path / "episode-1.txt"
+    original.write_text("유나는 항구를 떠났다.", encoding="utf-8")
+    document = client.post("/documents/import", json={"project_id": project["id"], "path": str(original)}).json()
+
+    replacement = tmp_path / "episode-1-revised.txt"
+    replacement.write_text("유나는 봉인검을 들고 항구를 떠났다. 수정된 장면이다.", encoding="utf-8")
+    response = client.put(f"/documents/{document['id']}", json={"path": str(replacement)})
+
+    assert response.status_code == 200
+    chunks = isolated_repository.list_chunks(project["id"])
+    assert chunks
+    assert all(chunk["project_id"] == project["id"] for chunk in chunks)
+    assert any("수정된 장면" in chunk["text"] for chunk in chunks)
+
+
+def test_analysis_estimate_uses_actual_chunk_grouping(tmp_path: Path) -> None:
+    client = TestClient(app)
+    project = client.post("/projects", json={"title": "분석량 추정"}).json()
+    for index in range(21):
+        path = tmp_path / f"episode-{index:02d}.txt"
+        path.write_text((f"{index + 1}화. 유나는 기록을 확인했다. " * 60), encoding="utf-8")
+        response = client.post("/documents/import", json={"project_id": project["id"], "path": str(path)})
+        assert response.status_code == 200
+
+    estimate = client.get(f"/projects/{project['id']}/analysis/estimate")
+
+    assert estimate.status_code == 200
+    payload = estimate.json()
+    assert payload["document_count"] == 21
+    assert payload["chunk_count"] > 20
+    assert payload["review_window_count"] == 21
+    assert payload["manuscript_chars"] == sum(
+        len((tmp_path / f"episode-{index:02d}.txt").read_text(encoding="utf-8"))
+        for index in range(21)
+    )
+
+    ranged = client.get(f"/projects/{project['id']}/analysis/estimate", params={"start_chapter": 5, "end_chapter": 9})
+    assert ranged.status_code == 200
+    ranged_payload = ranged.json()
+    assert ranged_payload["document_count"] == 5
+    assert ranged_payload["start_chapter"] == 5
+    assert ranged_payload["end_chapter"] == 9
+
+    empty_range = client.get(f"/projects/{project['id']}/analysis/estimate", params={"start_chapter": 99})
+    assert empty_range.status_code == 200
+    assert empty_range.json()["document_count"] == 0
+    assert empty_range.json()["review_window_count"] == 0
+
+    plan = client.get(f"/projects/{project['id']}/analysis/plan")
+    assert plan.status_code == 200
+    assert plan.json()["mode"] == "segmented"
+    assert plan.json()["recommended_batch_size"] == 20
+    assert plan.json()["batch_count"] == 2
+    assert plan.json()["embedding_estimate_seconds"] == round(plan.json()["chunk_count"] / 1.4)
+    assert plan.json()["embedding_memory_estimate_mb"] == 2275
+    assert plan.json()["gpt_estimate_seconds"] == plan.json()["review_window_count"] * 30
+    assert plan.json()["gpt_estimate_min_seconds"] == plan.json()["review_window_count"] * 15
+    assert plan.json()["gpt_estimate_max_seconds"] == plan.json()["review_window_count"] * 60
+
+
+def test_analysis_estimate_matches_small_project_request_count(tmp_path: Path, monkeypatch) -> None:
+    isolated_repository = StoryRepository(Database(tmp_path / "small-estimate.sqlite"))
+    project = isolated_repository.create_project("10회 요청 수")
+    for index in range(10):
+        content = f"{index + 1}화. 유나는 항구의 기록을 확인했다."
+        document = isolated_repository.add_document(
+            project.id, tmp_path / f"episode-{index}.txt", f"{index + 1}화", "txt",
+            hashlib.sha256(content.encode()).hexdigest(), content, index,
+        )
+        isolated_repository.replace_chunks(project.id, document.id, [content])
+    client = TestClient(app)
+    # The test repository is installed directly so the endpoint exercises the
+    # same estimator used by the desktop UI without constructing a second app.
+    monkeypatch.setattr(main_module, "repository", isolated_repository)
+    payload = client.get(f"/projects/{project.id}/analysis/estimate").json()
+    assert payload["document_count"] == 10
+    assert payload["review_window_count"] == 10
+
+
+def test_gpt_api_resumes_bounded_batches_and_reuses_checkpoints(tmp_path: Path, monkeypatch) -> None:
+    """Exercise the public route, rather than only calling the analyzer class."""
+    isolated_repository = StoryRepository(Database(tmp_path / "gpt-batch-api.sqlite"))
+    project = isolated_repository.create_project("API 배치 재개")
+    for index in range(45):
+        content = f"{index + 1}화. 유나는 항구의 기록을 확인했다."
+        document = isolated_repository.add_document(
+            project.id, tmp_path / f"episode-{index}.txt", f"{index + 1}화", "txt",
+            hashlib.sha256(content.encode()).hexdigest(), content, index,
+        )
+        isolated_repository.replace_chunks(project.id, document.id, [content])
+
+    class RagStub:
+        def sync_project(self, project_id, progress=None):
+            rows = isolated_repository.list_chunks(project_id)
+            if progress:
+                progress(len(rows), len(rows))
+            return len(rows)
+
+        def retrieve(self, project_id, query, limit=4, strategy="hybrid"):
+            return []
+
+    class ConnectionStub:
+        def __init__(self):
+            self.calls = 0
+
+        def complete(self, *args, **kwargs):
+            self.calls += 1
+            return {"text": '{"entities": [], "relations": [], "issues": []}'}
+
+    connection = ConnectionStub()
+    monkeypatch.setattr(main_module, "repository", isolated_repository)
+    monkeypatch.setattr(main_module, "RagService", lambda *args, **kwargs: RagStub())
+    monkeypatch.setattr(main_module, "chatgpt_connection", connection)
+    client = TestClient(app)
+
+    first = client.post(f"/projects/{project.id}/analyze/gpt", json={
+        "model": "test-model", "effort": "low", "consent": True, "batch_limit": 20,
+    })
+    assert first.status_code == 200
+    assert first.json()["batch_limited"] is True
+    assert first.json()["published"] is False
+    assert first.json()["request_count"] == 20
+
+    second = client.post(f"/projects/{project.id}/analyze/gpt", json={
+        "model": "test-model", "effort": "low", "consent": True, "batch_limit": 20,
+    })
+    third = client.post(f"/projects/{project.id}/analyze/gpt", json={
+        "model": "test-model", "effort": "low", "consent": True, "batch_limit": 20,
+    })
+    assert second.json()["batch_limited"] is True
+    assert third.json()["published"] is True
+    assert third.json()["batch_limited"] is False
+    assert connection.calls == 45
+    assert isolated_repository.latest_analysis_job(project.id).status.value == "completed"
 
 
 def test_project_can_be_deleted_with_owned_data(tmp_path: Path) -> None:
@@ -187,7 +441,7 @@ def test_setup_status_endpoint_reports_environment_shape() -> None:
     assert response.status_code == 200
     body = response.json()
     assert "ready" in body
-    assert body["embedding_model"] == "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    assert body["embedding_model"] == "Qwen3-Embedding-0.6B-Q8_0.gguf"
     assert isinstance(body["generation_model"], str)
     assert isinstance(body["models"], list)
     assert body["runtime_installed"] is True
@@ -346,5 +600,5 @@ def test_cancel_analysis_endpoint_stops_running_job_and_clears_graph() -> None:
     assert body["id"] == job.id
     assert body["status"] == "cancelled"
     assert body["current_step"] == "cancelled"
-    assert body["progress"] == 100
+    assert body["progress"] == 42
     assert client.get(f"/projects/{project['id']}/graph").json()["entities"] == []

@@ -1,6 +1,7 @@
 node_modules/
 dist/
 build/
+.pyinstaller-config/
 .venv/
 __pycache__/
 *.pyc
@@ -25,9 +26,21 @@ chroma/
 .chroma/
 .story-guard/
 .superpowers/
+
+# Generated visual exports; keep only the lightweight team brief source
+docs/design/
+docs/superpowers/
+docs/presentation/*.html
+!docs/presentation/story-guard-1-8-team-brief.html
 .cargo/
 .rustup/
 src-tauri/binaries/story-guard-backend*
 src-tauri/target/
 *.app/
 *.dmg
+
+# Local validation captures and generated presentation/export artifacts
+output/
+.playwright-cli/
+.omx/
+.superpowers/

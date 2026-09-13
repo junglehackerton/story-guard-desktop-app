@@ -1,10 +1,16 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { ProjectMutationScope } from "./lib/projectMutationScope";
+import { DocumentPicker } from "./components/DocumentPicker";
+import { WorkbenchNav, ProjectsPage, ManuscriptsPage, ReviewPage, GraphDetails, PAGES, type Page } from "./components/Workbench";
+import { lazy, Suspense, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { Check, Pencil, Trash2, X } from "lucide-react";
 import { api } from "./lib/api";
+import { analysisJobAfterError, analysisRetryRequest, belongsToNewAnalysis } from "./lib/analysisProgress";
 import { ensureDesktopBackend, isTauriRuntime } from "./lib/desktopBackend";
 import { clearGraphPositions } from "./lib/graphLayoutStorage";
 import { isMembershipRelation } from "./lib/graphMembership";
+import { isDanglingRelation, isRelationshipHealthIssue, temporalIssuePairs } from "./lib/relationshipHealth";
 import { ENTITY_TYPE_LABELS } from "./lib/labels";
 import type {
   EntityNode,
@@ -21,13 +27,19 @@ import type {
   Project,
   RelationEdge,
   StoryDocument,
+  StorySetting,
+  ForeshadowingStatus,
 } from "./lib/types";
-import { GraphView } from "./components/GraphView";
+const GraphView = lazy(() => import("./components/GraphView").then(({ GraphView: view }) => ({ default: view })));
 import { Inspector } from "./components/Inspector";
 import { Sidebar } from "./components/Sidebar";
+import { ChatGptPanel } from "./components/ChatGptPanel";
 import { SetupPanel } from "./components/SetupPanel";
 import { StartupLoader, type StartupStatus } from "./components/StartupLoader";
+import { friendlyStartupError } from "./lib/startupError";
 import { AnalysisProgressPanel } from "./components/AnalysisProgressPanel";
+import { sortImportPaths } from "./lib/importPaths";
+import { startupRoute } from "./lib/startupRoute";
 
 const EMPTY_GRAPH: GraphPayload = {
   entities: [],
@@ -42,11 +54,25 @@ const EMPTY_GRAPH: GraphPayload = {
     continuity_ready: true,
     message: "분석된 원고가 없습니다.",
   },
+  health: {
+    connected_entity_count: 0,
+    component_count: 0,
+    isolated_entity_count: 0,
+    unsupported_relation_count: 0,
+    generic_relation_count: 0,
+    conflicting_pair_count: 0,
+    changed_relation_count: 0,
+    explicit_break_count: 0,
+    gap_relation_count: 0,
+    dangling_relation_count: 0,
+    message: "분석된 원고가 없습니다.",
+  },
+  timeline: [],
 };
 
 const DEFAULT_SETTINGS: AppSettings = {
   generation_model: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-  embedding_model: "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+  embedding_model: "Qwen3-Embedding-0.6B-Q8_0.gguf",
 };
 
 const ENTITY_TYPES: EntityType[] = [
@@ -58,6 +84,12 @@ const ENTITY_TYPES: EntityType[] = [
   "rule",
   "foreshadowing",
 ];
+
+function formatManuscriptChars(documents: StoryDocument[]) {
+  const chars = documents.reduce((total, document) => total + document.content.length, 0);
+  if (chars >= 10000) return `${(chars / 10000).toFixed(1)}만 자`;
+  return `${chars.toLocaleString('ko-KR')}자`;
+}
 
 type RelationScope = "core" | "all";
 type ChapterRange = { startChapter: number | null; endChapter: number | null };
@@ -235,6 +267,9 @@ function buildRelationshipExplanation(
 ) {
   const sourceName = direction === "outgoing" ? entity.name : other.name;
   const targetName = direction === "outgoing" ? other.name : entity.name;
+  if (relation.origin === "gpt") {
+    return `${sourceName} → ${targetName}: ${relationName(relation)}. AI 추출 후보 · 원문 근거 ${relation.evidence_chunk_ids.length}개. 현재 상태인지는 원문 시점을 확인해 주세요.`;
+  }
   const confidence = Math.round((relation.confidence ?? 0) * 100);
   const strength = Math.round(relationScore(relation) * 100);
   const recency = relation.is_recent ? "최근 원고에서도 유지" : "이전 원고 근거 중심";
@@ -244,6 +279,14 @@ function buildRelationshipExplanation(
 }
 
 export default function App() {
+  // First launches get the guided introduction. Returning writers go straight
+  // to their shelf while the sidecar warms up, so the startup overlay never
+  // briefly shows a misleading "시작하기" screen over existing work.
+  const [page, setPage] = useState<Page>(() =>
+    startupRoute(Boolean(window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY))),
+  );
+  const [selectedRelationId, setSelectedRelationId] = useState<number | null>(null);
+  const [graphSearch, setGraphSearch] = useState("");
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [projectTitleDraft, setProjectTitleDraft] = useState("");
@@ -251,15 +294,33 @@ export default function App() {
   const [projectModalOpen, setProjectModalOpen] = useState(false);
   const [newProjectTitle, setNewProjectTitle] = useState("");
   const [documentPathModalOpen, setDocumentPathModalOpen] = useState(false);
+  const [sourceRequest, setSourceRequest] = useState<{documentId:number;quote?:string}>();
+  const [replacementDocument, setReplacementDocument] = useState<StoryDocument | null>(null);
+  const [reviewHistory, setReviewHistory] = useState<import("./lib/types").ReviewHistory[]>([]);
   const [documentPathDraft, setDocumentPathDraft] = useState("");
+  const [documentPathError, setDocumentPathError] = useState("");
   const [documents, setDocuments] = useState<StoryDocument[]>([]);
+  const [storySettings, setStorySettings] = useState<StorySetting[]>([]);
+  const [foreshadowingStatuses, setForeshadowingStatuses] = useState<ForeshadowingStatus[]>([]);
+  const [projectDataError, setProjectDataError] = useState(false);
+  const [projectDataLoading, setProjectDataLoading] = useState(false);
+  const [snapshotProjectId, setSnapshotProjectId] = useState<number | null>(null);
+  const dataOwnerRef = useRef<number | null>(null);
+  const mutationScope = useRef(new ProjectMutationScope());
+  const projectDataErrorRef = useRef(false);
   const [chapterRange, setChapterRange] = useState<ChapterRange>({
     startChapter: null,
     endChapter: null,
   });
+  const [analysisRange, setAnalysisRange] = useState<ChapterRange>({
+    startChapter: null,
+    endChapter: null,
+  });
+  const [loadedChapterRange, setLoadedChapterRange] = useState<ChapterRange>({ startChapter: null, endChapter: null });
   const [graph, setGraph] = useState<GraphPayload>(EMPTY_GRAPH);
   const [selectedEntity, setSelectedEntity] = useState<EntityNode | null>(null);
   const [relationScope, setRelationScope] = useState<RelationScope>("core");
+  const [healthOnly, setHealthOnly] = useState(false);
   const [visibleTypes, setVisibleTypes] = useState<Set<EntityType>>(
     () => new Set(ENTITY_TYPES),
   );
@@ -269,11 +330,73 @@ export default function App() {
   const [setupStatus, setSetupStatus] = useState<EnvironmentStatus | null>(null);
   const [setupProgress, setSetupProgress] = useState<EnvironmentSetupProgress | null>(null);
   const [analysisJob, setAnalysisJob] = useState<AnalysisJob | null>(null);
+  const [lastAnalysisRequest, setLastAnalysisRequest] = useState<{ model?: string; effort?: string; force?: boolean; range?: ChapterRange } | null>(null);
+  const retryRequest = analysisJob ? analysisRetryRequest(analysisJob, lastAnalysisRequest) : null;
   const [loading, setLoading] = useState(false);
+  const [activeAnalysisProject, setActiveAnalysisProject] = useState<Project | null>(null);
+  const activeAnalysisRef = useRef<{project: Project; jobId: number; awaitingResponse: boolean} | null>(null);
+  const chapterRangeRef = useRef(chapterRange);
+  chapterRangeRef.current = chapterRange;
+  const analysisRangeRef = useRef(analysisRange);
+  analysisRangeRef.current = analysisRange;
+  const analysisBusy = activeAnalysisProject !== null || analysisJob?.status === 'running';
+  const workspaceBusy = loading || analysisBusy;
   const [notice, setNotice] = useState("백엔드 연결을 확인하는 중입니다.");
   const [startupStatus, setStartupStatus] = useState<StartupStatus>(INITIAL_STARTUP_STATUS);
   const dataRequestIdRef = useRef(0);
+  const analysisRequestBaselineRef = useRef<{ projectId: number; jobId: number } | null>(null);
   const startupActiveRef = useRef(true);
+  const modalTriggerRef = useRef<HTMLElement | null>(null);
+  const modalWasOpenRef = useRef(false);
+  const workspaceRef = useRef<HTMLElement | null>(null);
+  const initialRefreshCompletedRef = useRef(false);
+  const userNavigationRef = useRef(false);
+
+  // Each section owns its own scrolling. Reset the outer workspace when the
+  // writer navigates so a review page cannot reopen halfway down a previous
+  // long manuscript or leave its header clipped at the top edge.
+  useEffect(() => {
+    workspaceRef.current?.scrollTo({ top: 0, left: 0, behavior: "auto" });
+  }, [page]);
+
+  useEffect(() => {
+    const modalOpen = projectModalOpen || documentPathModalOpen;
+    if (!modalOpen) {
+      if (modalWasOpenRef.current) {
+        modalWasOpenRef.current = false;
+        modalTriggerRef.current?.focus();
+        modalTriggerRef.current = null;
+      }
+      return;
+    }
+    modalWasOpenRef.current = true;
+    const dialog = document.querySelector<HTMLElement>('[role="dialog"]');
+    if (!dialog) return;
+    const focusable = () => Array.from(dialog.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setProjectModalOpen(false);
+        setDocumentPathModalOpen(false);
+        setReplacementDocument(null);
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const elements = focusable();
+      if (!elements.length) return;
+      const first = elements[0];
+      const last = elements[elements.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [projectModalOpen, documentPathModalOpen]);
 
   const openIssues = useMemo(
     () => graph.issues.filter((issue) => issue.status !== "ignored"),
@@ -293,13 +416,13 @@ export default function App() {
     if (documents.length === 0) {
       return "원고 없음";
     }
-    if (chapterRange.startChapter === null && chapterRange.endChapter === null) {
+    if (loadedChapterRange.startChapter === null && loadedChapterRange.endChapter === null) {
       return `전체 누적 · ${documents.length}편`;
     }
-    const startLabel = chapterRange.startChapter === null ? 1 : chapterRange.startChapter + 1;
-    const endLabel = chapterRange.endChapter === null ? documents.length : chapterRange.endChapter + 1;
+    const startLabel = loadedChapterRange.startChapter === null ? 1 : loadedChapterRange.startChapter + 1;
+    const endLabel = loadedChapterRange.endChapter === null ? documents.length : loadedChapterRange.endChapter + 1;
     return `${startLabel}화-${endLabel}화`;
-  }, [chapterRange.endChapter, chapterRange.startChapter, documents.length]);
+  }, [loadedChapterRange.endChapter, loadedChapterRange.startChapter, documents.length]);
 
   const filteredGraph = useMemo(() => {
     const entities = graph.entities.filter((entity) => visibleTypes.has(entity.type));
@@ -316,14 +439,47 @@ export default function App() {
     const organizationOnly =
       entities.length > 0 && [...visibleTypes].every((type) => type === "organization");
     const organizationRelations = organizationOnly ? aggregateOrganizationRelations(graph, relationScope) : [];
-    const relations = [...directRelations, ...organizationRelations].filter(
+    // Preserve relations whose endpoint was not extracted. They cannot be
+    // drawn safely, but diagnostic modes must expose them in the broken-link
+    // list instead of silently deleting the evidence.
+    const danglingRelations = graph.relations.filter((relation) => isDanglingRelation(relation, visibleIds));
+    const relations = [...directRelations, ...organizationRelations, ...(relationScope === "all" || healthOnly ? danglingRelations : [])].filter(
       (relation) =>
-        visibleIds.has(relation.source_entity_id) && visibleIds.has(relation.target_entity_id),
+        !isDanglingRelation(relation, visibleIds) || (relationScope === "all" || healthOnly),
     );
+    // Keep time-dependent claims between the same entities. Collapsing a pair
+    // hides the very contradiction a writer is trying to inspect.
     const scopedRelations =
-      relationScope === "core" ? strongestRelationPerPair(relations).slice(0, 46) : relations;
+      relationScope === "core"
+        ? relations
+            .filter((relation) => isCoreRelation(relation) || isMembershipRelation(relation) || relation.is_recent)
+            .sort((left, right) => relationScore(right) - relationScore(left))
+            .slice(0, 64)
+        : relations;
+    // Diagnostic mode must inspect the complete extraction result. Applying
+    // the core-confidence slice first could hide precisely the weak or
+    // changed relation the writer needs to review.
+    const healthCandidates = healthOnly ? relations : scopedRelations;
+    const temporalPairs = temporalIssuePairs(graph);
+    const healthRelations = healthOnly
+      ? healthCandidates.filter((relation) =>
+          isDanglingRelation(relation, visibleIds) ||
+          isRelationshipHealthIssue(relation, temporalPairs),
+        )
+      : scopedRelations;
     let scopedEntities = entities;
-    if (relationScope === "core" && scopedRelations.length > 0) {
+    if (healthOnly) {
+      const connectedIds = new Set<number>();
+      for (const relation of healthRelations) {
+        connectedIds.add(relation.source_entity_id);
+        connectedIds.add(relation.target_entity_id);
+      }
+      // Keep entities that are genuinely isolated in the diagnostic view. A
+      // missing edge is itself a useful signal, and hiding the node would
+      // make the health counter appear falsely clean.
+      const relationEndpoints = new Set<number>(scopedRelations.flatMap((relation) => [relation.source_entity_id, relation.target_entity_id]));
+      scopedEntities = entities.filter((entity) => connectedIds.has(entity.id) || !relationEndpoints.has(entity.id));
+    } else if (relationScope === "core" && scopedRelations.length > 0) {
       const connectedIds = new Set<number>();
       for (const relation of scopedRelations) {
         connectedIds.add(relation.source_entity_id);
@@ -334,9 +490,18 @@ export default function App() {
     return {
       ...graph,
       entities: scopedEntities,
-      relations: scopedRelations,
+      relations: healthRelations,
     };
-  }, [graph, relationScope, visibleTypes]);
+  }, [graph, healthOnly, relationScope, visibleTypes]);
+
+  const searchedGraph = useMemo(() => {
+    const query = graphSearch.trim().toLocaleLowerCase();
+    if (!query) return filteredGraph;
+    const matches = new Set(filteredGraph.entities.filter(e => [e.name, ...e.aliases].some(name => name.toLocaleLowerCase().includes(query))).map(e => e.id));
+    const relations = filteredGraph.relations.filter(r => matches.has(r.source_entity_id) || matches.has(r.target_entity_id));
+    const ids = new Set([...matches, ...relations.flatMap(r => [r.source_entity_id, r.target_entity_id])]);
+    return {...filteredGraph, entities: filteredGraph.entities.filter(e => ids.has(e.id)), relations};
+  }, [filteredGraph, graphSearch]);
 
   const selectedRelationshipDetails = useMemo<EntityRelationshipDetail[]>(() => {
     if (!selectedEntity) {
@@ -383,25 +548,141 @@ export default function App() {
     }
   }, []);
 
+  const prepareProjectData = useCallback((projectId: number | null) => {
+    if (dataOwnerRef.current === projectId) return;
+    dataOwnerRef.current = projectId;
+    mutationScope.current.activate(projectId);
+    // Invalidate late responses before switching the visible project.
+    dataRequestIdRef.current += 1;
+    setSnapshotProjectId(null);
+    setLoadedChapterRange({ startChapter: null, endChapter: null });
+    setDocuments([]);
+    setStorySettings([]);
+    setForeshadowingStatuses([]);
+    setReviewHistory([]);
+    setEvidenceByIssueId({});
+    setGraph(EMPTY_GRAPH);
+    setSourceRequest(undefined);
+    setSelectedEntity(null);
+    setSelectedRelationId(null);
+    setGraphSearch("");
+    setHealthOnly(false);
+    setAnalysisJob(null);
+    setLastAnalysisRequest(null);
+    setDocumentPathModalOpen(false);
+    setReplacementDocument(null);
+    setDocumentPathError("");
+    setNotice("");
+    projectDataErrorRef.current = false;
+    setProjectDataError(false);
+    setProjectDataLoading(projectId !== null);
+  }, []);
+
   const refreshProjectData = useCallback(async (project: Project | null, range = chapterRange) => {
+    prepareProjectData(project?.id ?? null);
     const requestId = dataRequestIdRef.current + 1;
     dataRequestIdRef.current = requestId;
     if (!project) {
       setDocuments([]);
+      setStorySettings([]);
+      setForeshadowingStatuses([]);
       setGraph(EMPTY_GRAPH);
+      setProjectDataError(false);
+      setProjectDataLoading(false);
       return;
     }
-    const nextDocuments = await api.listDocuments(project.id);
-    if (dataRequestIdRef.current !== requestId) {
-      return;
+    setProjectDataLoading(true);
+    try {
+      const [nextDocuments, nextSettings, nextForeshadowingStatuses, nextGraph, history] = await Promise.all([
+        api.listDocuments(project.id), api.listStorySettings(project.id),
+        api.listForeshadowingStatuses(project.id), api.graph(project.id, range), api.reviewHistory(project.id),
+      ]);
+      if (dataRequestIdRef.current !== requestId) return;
+      // Publish one consistent snapshot only after all reads have succeeded.
+      setDocuments(nextDocuments);
+      setStorySettings(nextSettings);
+      setForeshadowingStatuses(nextForeshadowingStatuses);
+      setGraph(nextGraph);
+      setReviewHistory(history);
+      setSnapshotProjectId(project.id);
+      setLoadedChapterRange(range);
+      if (projectDataErrorRef.current) setNotice("작품 데이터를 다시 불러왔습니다.");
+      projectDataErrorRef.current = false;
+      setProjectDataError(false);
+      return true;
+    } catch (error) {
+      if (dataRequestIdRef.current === requestId) {
+        projectDataErrorRef.current = true;
+        setProjectDataError(true);
+        setNotice(`작품 데이터를 불러오지 못했습니다. 저장된 원고와 분석 결과는 변경되지 않았습니다. ${friendlyStartupError(error)}`);
+      }
+      return false;
+    } finally {
+      if (dataRequestIdRef.current === requestId) setProjectDataLoading(false);
     }
-    setDocuments(nextDocuments);
-    const nextGraph = await api.graph(project.id, range);
-    if (dataRequestIdRef.current !== requestId) {
-      return;
-    }
-    setGraph(nextGraph);
-  }, [chapterRange]);
+  }, [chapterRange, prepareProjectData]);
+
+  async function createStorySetting(title: string, content: string, certainty: StorySetting["certainty"]): Promise<boolean> {
+    if (!selectedProject) return false;
+    const write = mutationScope.current.begin(selectedProject.id, 'setting:new');
+    if (!write) return false;
+    try {
+      const created = await api.createStorySetting(selectedProject.id, {title, content, certainty});
+      if (write.isCurrent()) {
+        setStorySettings(items => [...items.filter(item => item.id !== created.id), created]);
+        setNotice("설정 메모를 저장했습니다.");
+      }
+      return true;
+    } catch (error) {
+      if (write.isCurrent()) setNotice(error instanceof Error ? error.message : "설정 메모 저장 실패");
+      return false;
+    } finally { write.finish(); }
+  }
+  async function updateStorySetting(setting: StorySetting): Promise<boolean> {
+    if (!selectedProject) return false;
+    const write = mutationScope.current.begin(selectedProject.id, `setting:${setting.id}`);
+    if (!write) return false;
+    try {
+      const updated = await api.updateStorySetting(setting.id, {title: setting.title, content: setting.content, certainty: setting.certainty});
+      if (write.isCurrent()) {
+        setStorySettings(items => items.map(item => item.id === updated.id ? updated : item));
+        setNotice("설정 메모를 갱신했습니다.");
+      }
+      return true;
+    } catch (error) {
+      if (write.isCurrent()) setNotice(error instanceof Error ? error.message : "설정 메모 갱신 실패");
+      return false;
+    } finally { write.finish(); }
+  }
+  async function deleteStorySetting(setting: StorySetting) {
+    if (!selectedProject || !window.confirm(`'${setting.title}' 설정 메모를 삭제할까요?`)) return;
+    const write = mutationScope.current.begin(selectedProject.id, `setting:${setting.id}`);
+    if (!write) return;
+    try {
+      await api.deleteStorySetting(setting.id);
+      if (write.isCurrent()) {
+        setStorySettings(items => items.filter(item => item.id !== setting.id));
+        setNotice("설정 메모를 삭제했습니다.");
+      }
+    } catch (error) {
+      if (write.isCurrent()) setNotice(error instanceof Error ? error.message : "설정 메모 삭제 실패");
+    } finally { write.finish(); }
+  }
+
+  async function updateForeshadowingStatus(entityId: number, status: ForeshadowingStatus["status"]) {
+    if (!selectedProject) return;
+    const write = mutationScope.current.begin(selectedProject.id, `foreshadowing:${entityId}`);
+    if (!write) return;
+    try {
+      const updated = await api.updateForeshadowingStatus(selectedProject.id, entityId, status);
+      if (write.isCurrent()) {
+        setForeshadowingStatuses(items => [...items.filter(item => item.entity_id !== entityId), updated]);
+        setNotice("떡밥 상태를 저장했습니다.");
+      }
+    } catch (error) {
+      if (write.isCurrent()) setNotice(error instanceof Error ? error.message : "떡밥 상태 저장 실패");
+    } finally { write.finish(); }
+  }
 
   const refreshProjects = useCallback(async (preferredProjectId?: number | null) => {
     const nextProjects = await api.listProjects();
@@ -482,25 +763,40 @@ export default function App() {
       if (showStartup) {
         updateStartup("Local AI 확인 중", "로컬 LLM 런타임과 모델 파일을 확인하고 있습니다.", 52);
       }
-      const localAiPromise = refreshLocalAi();
-      const settingsPromise = refreshSettings();
-      const setupPromise = refreshSetup();
+      // Project data is required to open the workspace, but Local AI/setup
+      // checks are advisory. A slow or unavailable model runtime must not
+      // hold the entire app on the startup screen or hide existing projects.
+      // Attach rejection handlers immediately so every request settles.
+      const [projectsResult, localAiResult, settingsResult, setupResult] = await Promise.allSettled([
+        refreshProjects(), refreshLocalAi(), refreshSettings(), refreshSetup(),
+      ]);
+      if (projectsResult.status === "rejected") {
+        throw projectsResult.reason;
+      }
+      const nextSelectedProject = projectsResult.value;
+      const optionalFailures = [localAiResult, settingsResult, setupResult]
+        .filter((result): result is PromiseRejectedResult => result.status === "rejected");
+      if (optionalFailures.length) {
+        setNotice("작품은 열었지만 일부 준비 상태를 확인하지 못했습니다. 앱 설정에서 다시 확인할 수 있습니다.");
+      }
       if (showStartup) {
         updateStartup("작품 데이터 불러오는 중", "최근 작품, 원고, 그래프 데이터를 준비하고 있습니다.", 74);
       }
-      const nextSelectedProject = await refreshProjects();
-      await Promise.all([
-        localAiPromise,
-        settingsPromise,
-        setupPromise,
-        refreshProjectData(nextSelectedProject),
-      ]);
-      setNotice("준비 완료");
+      const projectLoaded = await refreshProjectData(nextSelectedProject);
+      // Returning writers should land on their work shelf, while a first
+      // launch with no project keeps the guided welcome screen.
+      // Do not overwrite a page the writer opened while startup data was
+      // still loading. This is especially important when opening a project
+      // card immediately after launch.
+      if (!userNavigationRef.current) {
+        setPage(nextSelectedProject ? "projects" : "welcome");
+      }
+      if (projectLoaded !== false) setNotice("준비 완료");
       if (showStartup) {
         completeStartup();
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : "백엔드 연결 실패";
+      const message = friendlyStartupError(error);
       setNotice(message);
       if (showStartup) {
         failStartup(message);
@@ -518,8 +814,41 @@ export default function App() {
   ]);
 
   useEffect(() => {
+    if (initialRefreshCompletedRef.current) {
+      return;
+    }
+    initialRefreshCompletedRef.current = true;
     void refreshAll();
   }, [refreshAll]);
+
+  // Finder에서 원고를 작업 영역으로 직접 끌어다 놓으면 여러 파일을
+  // 순서대로 가져옵니다. 분석 중이거나 작품이 없을 때는 무시합니다.
+  useEffect(() => {
+    if (!isTauriRuntime() || !selectedProject) return;
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void getCurrentWebviewWindow().onDragDropEvent(async (event) => {
+      if (disposed || event.payload.type !== "drop" || workspaceBusy) return;
+      const paths = sortImportPaths(event.payload.paths.filter((path) => /\.(txt|md|docx)$/i.test(path)));
+      if (!paths.length) return;
+      let imported = 0;
+      let failed = 0;
+      const failedNames: string[] = [];
+      for (const path of paths) {
+        if (disposed || workspaceBusy) break;
+        if (await importDocumentPath(path, null)) imported += 1;
+        else { failed += 1; failedNames.push(path.split(/[\\/]/).pop() || path); }
+      }
+      if (!disposed && imported) {
+        setNotice(failed
+          ? `원고 ${imported}편을 가져왔고 ${failed}편은 실패했습니다 (${failedNames.slice(0, 3).join(', ')}${failed > 3 ? ' 외' : ''}). 실패한 파일을 확인한 뒤 다시 시도해 주세요.`
+          : `원고 ${imported}편을 가져왔습니다. 분석 화면에서 전체 회차를 확인하세요.`);
+      } else if (!disposed && failed) {
+        setNotice(`원고 ${failed}편을 가져오지 못했습니다 (${failedNames.slice(0, 3).join(', ')}${failed > 3 ? ' 외' : ''}). 파일 형식과 경로를 확인한 뒤 다시 시도해 주세요.`);
+      }
+    }).then((dispose) => { unlisten = dispose; });
+    return () => { disposed = true; unlisten?.(); };
+  }, [selectedProject?.id, workspaceBusy]);
 
   useEffect(() => {
     if (!selectedProject) {
@@ -558,34 +887,50 @@ export default function App() {
   }, [refreshLocalAi, refreshSettings, refreshSetup, setupProgress?.running]);
 
   useEffect(() => {
-    if (
-      !selectedProject ||
-      analysisJob?.status !== "running" ||
-      analysisJob.project_id !== selectedProject.id
-    ) {
-      return;
-    }
+    if (!selectedProject && !activeAnalysisProject) return;
     let cancelled = false;
-    const projectId = selectedProject.id;
-    const loadAnalysisStatus = async () => {
-      try {
-        const nextJob = await api.analysisStatus(projectId);
-        if (!cancelled) {
-          setAnalysisJob(nextJob);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let lastLoadedJob = '';
+    const selectedId = selectedProject?.id;
+    const targets = [...new Set([selectedId, activeAnalysisProject?.id].filter((id): id is number => id !== undefined))];
+    const poll = async () => {
+      let keepPolling = false;
+      for (const projectId of targets) {
+        if (cancelled) return;
+        try {
+          const nextJob = await api.analysisStatus(projectId);
+          if (cancelled) return;
+          if (nextJob.project_id !== projectId || !belongsToNewAnalysis(nextJob, analysisRequestBaselineRef.current)) {
+            keepPolling ||= activeAnalysisRef.current?.project.id === projectId;
+            continue;
+          }
+          keepPolling ||= nextJob.status === 'running';
+          if (projectId === selectedId && dataOwnerRef.current === projectId) {
+            setAnalysisJob(nextJob);
+            const completedKey = `${projectId}:${nextJob.id}:${nextJob.status}`;
+            if (['completed', 'partial'].includes(nextJob.status) && lastLoadedJob !== completedKey && selectedProject) {
+              lastLoadedJob = completedKey;
+              await refreshProjectData(selectedProject, chapterRangeRef.current);
+              if (cancelled) return;
+            }
+          }
+          const active = activeAnalysisRef.current;
+          if (active?.project.id === projectId && !active.awaitingResponse && nextJob.status !== 'running') {
+            if (selectedId === projectId && dataOwnerRef.current === projectId && !projectDataErrorRef.current) setNotice(nextJob.message);
+            activeAnalysisRef.current = null;
+            analysisRequestBaselineRef.current = null;
+            setActiveAnalysisProject(null);
+          }
+        } catch {
+          // Continue serial checks without interpreting a missed read as job failure.
+          keepPolling = true;
         }
-      } catch {
-        // The analyze request keeps the visible failure message if polling misses once.
       }
+      if (!cancelled && (keepPolling || activeAnalysisRef.current)) timer = setTimeout(poll, 1500);
     };
-    const intervalId = window.setInterval(() => {
-      void loadAnalysisStatus();
-    }, 900);
-    void loadAnalysisStatus();
-    return () => {
-      cancelled = true;
-      window.clearInterval(intervalId);
-    };
-  }, [analysisJob?.project_id, analysisJob?.status, selectedProject]);
+    void poll();
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [selectedProject?.id, activeAnalysisProject?.id, refreshProjectData]);
 
   useEffect(() => {
     const issueIds = graph.issues.map((issue) => issue.id);
@@ -651,17 +996,19 @@ export default function App() {
   }
 
   function selectProject(project: Project) {
+    prepareProjectData(project.id);
+    setSourceRequest(undefined);
+    userNavigationRef.current = true;
     window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, String(project.id));
     setSelectedProject(project);
     setSelectedEntity(null);
-    setDocuments([]);
-    setGraph(EMPTY_GRAPH);
     setChapterRange({ startChapter: null, endChapter: null });
-    setAnalysisJob(null);
-    void refreshProjectData(project);
+    setAnalysisRange({ startChapter: null, endChapter: null });
+    // The selection effect owns this read; do not also fetch the old chapter range.
   }
 
   function createProject() {
+    modalTriggerRef.current = globalThis.document.activeElement instanceof HTMLElement ? globalThis.document.activeElement : null;
     setNewProjectTitle("");
     setProjectModalOpen(true);
   }
@@ -676,13 +1023,7 @@ export default function App() {
     try {
       const project = await api.createProject(title);
       setProjects((current) => [project, ...current]);
-      setSelectedProject(project);
-      window.localStorage.setItem(SELECTED_PROJECT_STORAGE_KEY, String(project.id));
-      setDocuments([]);
-      setGraph(EMPTY_GRAPH);
-      setChapterRange({ startChapter: null, endChapter: null });
-      setSelectedEntity(null);
-      setAnalysisJob(null);
+      selectProject(project);
       setProjectModalOpen(false);
       setNewProjectTitle("");
       setNotice(`작품 생성: ${project.title}`);
@@ -734,9 +1075,8 @@ export default function App() {
       await api.deleteProject(deletedProject.id);
       clearGraphPositions(deletedProject.id);
       window.localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
+      prepareProjectData(null);
       setSelectedProject(null);
-      setDocuments([]);
-      setGraph(EMPTY_GRAPH);
       setChapterRange({ startChapter: null, endChapter: null });
       setSelectedEntity(null);
       setAnalysisJob(null);
@@ -750,52 +1090,122 @@ export default function App() {
     }
   }
 
-  async function importDocumentPath(path: string) {
-    if (!selectedProject) {
+  async function importDocumentPath(path: string, replacement = replacementDocument, refreshAfter = true) {
+    if (!selectedProject || workspaceBusy || (replacement && replacement.project_id !== selectedProject.id)) {
       return false;
     }
     const filePath = path.trim();
     if (!filePath) {
-      setNotice("원고 파일 경로를 입력해 주세요.");
+      setDocumentPathError("원고 파일 경로를 입력해 주세요.");
       return false;
     }
+    const project = selectedProject;
+    const write = mutationScope.current.begin(project.id, 'documents');
+    if (!write) return false;
+    setDocumentPathError("");
+    setNotice(replacement ? "수정 원고를 저장하고 있습니다." : "원고를 가져오고 있습니다.");
     setLoading(true);
     try {
-      const document = await api.importDocument(selectedProject.id, filePath);
-      setDocuments((current) =>
-        current.some((item) => item.id === document.id) ? current : [...current, document],
-      );
-      setGraph(EMPTY_GRAPH);
-      setChapterRange({ startChapter: null, endChapter: null });
-      setSelectedEntity(null);
-      setAnalysisJob(null);
-      setNotice(`원고 추가: ${document.title} · 분석을 다시 실행하세요.`);
-      void refreshProjectData(selectedProject);
-      return true;
+      const document = replacement
+        ? await api.replaceDocument(replacement.id, filePath)
+        : await api.importDocument(project.id, filePath);
+      const changed = !replacement || replacement.content_hash !== document.content_hash;
+      // A return visit may have loaded the old draft while the write was still
+      // pending. Re-read it, but never give an old project ownership of a new view.
+      if (dataOwnerRef.current === project.id) {
+        if (changed) {
+          setGraph(EMPTY_GRAPH);
+          setSelectedEntity(null);
+          setAnalysisJob(null);
+        }
+        const loaded = refreshAfter ? await refreshProjectData(project, chapterRangeRef.current) : true;
+        if (loaded === true && dataOwnerRef.current === project.id) {
+          // The project shelf carries denormalized document/analyzed counts.
+          // Refresh it after every successful write so returning to "내 작품"
+          // cannot show a stale `0편` (or an old pending count) for a project
+          // whose manuscript list was just updated.
+          if (refreshAfter || replacement) await refreshProjects(project.id);
+          setNotice(changed
+            ? `원고 ${replacement ? "교체" : "추가"}: ${document.title} · 이전 검토는 이력에서 확인할 수 있습니다. 현재 원고로 다시 분석해 주세요.`
+            : "원고 내용이 같습니다. 기존 분석 결과와 작가 판단을 유지했습니다.");
+        }
+      }
+      return write.isCurrent();
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "원고 추가 실패");
+      if (write.isCurrent()) {
+        const message = error instanceof Error ? error.message : "원고 저장 응답을 확인하지 못했습니다. 원고 목록을 확인한 뒤 다시 시도해 주세요.";
+        setDocumentPathError(message);
+        setNotice(message);
+      }
       return false;
     } finally {
+      write.finish();
       setLoading(false);
     }
   }
 
   async function importDocument() {
-    if (!selectedProject) {
+    if (!selectedProject || workspaceBusy) {
       return;
     }
+    setReplacementDocument(null);
+    setDocumentPathError("");
     if (isTauriRuntime()) {
-      const selected = await open({
-        multiple: false,
-        filters: [{ name: "Manuscript", extensions: ["txt", "md", "docx"] }],
-      });
-      if (typeof selected === "string") {
-        await importDocumentPath(selected);
-      }
+      await chooseDocumentFile(null);
       return;
     }
     setDocumentPathDraft("");
+    modalTriggerRef.current = globalThis.document.activeElement instanceof HTMLElement ? globalThis.document.activeElement : null;
     setDocumentPathModalOpen(true);
+  }
+
+  async function replaceDocument(document: StoryDocument) {
+    if (!selectedProject || workspaceBusy || document.project_id !== selectedProject.id) return;
+    setDocumentPathError("");
+    if (isTauriRuntime()) {
+      await chooseDocumentFile(document);
+      return;
+    }
+    setReplacementDocument(document);
+    setDocumentPathDraft("");
+    modalTriggerRef.current = globalThis.document.activeElement instanceof HTMLElement ? globalThis.document.activeElement : null;
+    setDocumentPathModalOpen(true);
+  }
+
+  async function chooseDocumentFile(replacement: StoryDocument | null) {
+    if (!selectedProject) return;
+    const picker = mutationScope.current.begin(selectedProject.id, 'document-picker');
+    if (!picker) return;
+    try {
+      // 여러 회차를 한 번에 선택할 수 있게 해 초기 업로드 비용을 줄입니다.
+      // 수정본 교체는 대상 문서가 하나이므로 단일 선택을 유지합니다.
+      const selected = await open({multiple: replacement ? false : true, filters: [{name: "원고", extensions: ["txt", "md", "docx"]}]});
+      if (!picker.isCurrent() || selected === null) return;
+      const paths = sortImportPaths((Array.isArray(selected) ? selected : [selected]).filter((path): path is string => typeof path === "string"));
+      if (replacement) {
+        if (paths[0]) await importDocumentPath(paths[0], replacement);
+        return;
+      }
+      let imported = 0;
+      let failed = 0;
+      const failedNames: string[] = [];
+      for (const path of paths) {
+        if (!picker.isCurrent()) break;
+        if (await importDocumentPath(path, null, false)) imported += 1;
+        else { failed += 1; failedNames.push(path.split(/[\\/]/).pop() || path); }
+      }
+      if (picker.isCurrent() && imported > 0 && dataOwnerRef.current === selectedProject.id) {
+        await refreshProjectData(selectedProject, chapterRangeRef.current);
+        await refreshProjects(selectedProject.id);
+      }
+      if (picker.isCurrent() && (imported || failed)) {
+        setNotice(failed
+          ? `원고 ${imported}편을 가져왔고 ${failed}편은 실패했습니다 (${failedNames.slice(0, 3).join(', ')}${failed > 3 ? ' 외' : ''}). 실패한 파일을 확인한 뒤 다시 시도해 주세요.`
+          : `원고 ${imported}편을 가져왔습니다. 분석 화면에서 전체 회차를 확인하세요.`);
+      }
+    } catch (error) {
+      if (picker.isCurrent()) setNotice(error instanceof Error ? error.message : "파일 선택 창을 열지 못했습니다.");
+    } finally { picker.finish(); }
   }
 
   async function submitDocumentPath(event: FormEvent<HTMLFormElement>) {
@@ -804,79 +1214,127 @@ export default function App() {
     if (imported) {
       setDocumentPathModalOpen(false);
       setDocumentPathDraft("");
+      setReplacementDocument(null);
     }
   }
 
   async function deleteDocument(document: StoryDocument) {
-    if (!selectedProject) {
+    if (!selectedProject || workspaceBusy || document.project_id !== selectedProject.id) {
       return;
     }
-    const confirmed = window.confirm(`'${document.title}' 원고를 삭제할까요? 분석 그래프도 다시 비워집니다.`);
+    const confirmed = window.confirm(`'${document.title}' 원고를 삭제할까요? 이전 검토는 이력에 보관되며 재분석이 필요합니다.`);
     if (!confirmed) {
       return;
     }
+    const project = selectedProject;
+    const write = mutationScope.current.begin(project.id, 'documents');
+    if (!write) return;
+    setNotice("원고를 삭제하고 있습니다.");
     setLoading(true);
     try {
       await api.deleteDocument(document.id);
-      setDocuments((current) => current.filter((item) => item.id !== document.id));
-      setGraph(EMPTY_GRAPH);
-      setChapterRange({ startChapter: null, endChapter: null });
-      setSelectedEntity(null);
-      setAnalysisJob(null);
-      await refreshProjectData(selectedProject);
-      setNotice(`원고 삭제: ${document.title}`);
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : "원고 삭제 실패");
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function analyze() {
-    if (!selectedProject) {
-      return;
-    }
-    const project = selectedProject;
-    setLoading(true);
-    setAnalysisJob(makePendingAnalysisJob(project.id));
-    setNotice("LLM 분석을 시작합니다.");
-    try {
-      const analyzePromise = api.analyzeProject(project.id);
-      await api.analysisStatus(project.id).then(setAnalysisJob).catch(() => undefined);
-      const result = await analyzePromise;
-      const latestJob = await api.analysisStatus(project.id).catch(() => null);
-      if (latestJob) {
-        setAnalysisJob(latestJob);
+      if (dataOwnerRef.current === project.id) {
+        setGraph(EMPTY_GRAPH);
+        setSelectedEntity(null);
+        setAnalysisJob(null);
+        const loaded = await refreshProjectData(project, chapterRangeRef.current);
+        if (loaded === true && dataOwnerRef.current === project.id) setNotice(`원고 삭제: ${document.title} · 이전 검토는 이력에서 확인할 수 있습니다.`);
       }
-      await refreshProjectData(project);
-      setNotice(
-        `분석 완료: 엔티티 ${result.entity_count}개, 관계 ${result.relation_count}개, 이슈 ${result.issue_count}개`,
-      );
-      window.setTimeout(() => {
-        setAnalysisJob((current) =>
-          current?.project_id === project.id && current.status === "completed" ? null : current,
-        );
-      }, 1800);
     } catch (error) {
-      const message = error instanceof Error ? error.message : "분석 실패";
-      const latestJob = await api.analysisStatus(project.id).catch(() => null);
-      setAnalysisJob(latestJob ?? makeFailedAnalysisJob(project.id, message));
-      setNotice(message);
+      if (write.isCurrent()) setNotice(error instanceof Error ? error.message : "원고 삭제 응답을 확인하지 못했습니다.");
     } finally {
+      write.finish();
       setLoading(false);
     }
   }
 
-  async function updateIssueStatus(issueId: number, status: IssueStatus) {
+  async function analyze(model?: string, effort?: string, force = false, range: ChapterRange = analysisRangeRef.current) {
+    if (!selectedProject || workspaceBusy || activeAnalysisRef.current) return;
+    const project = selectedProject;
+    const visit = mutationScope.current.begin(project.id, 'analysis');
+    if (!visit) return;
+    const run = {project, jobId: Infinity, awaitingResponse: true};
+    activeAnalysisRef.current = run;
+    setActiveAnalysisProject(project);
+    setLastAnalysisRequest({ model, effort, force, range });
+    analysisRequestBaselineRef.current = { projectId: project.id, jobId: Infinity };
+    setAnalysisJob(makePendingAnalysisJob(project.id));
+    setNotice("작품 분석을 시작합니다.");
+    let latestJob: AnalysisJob | null = null;
+    try {
+      const previousJob = await api.analysisStatus(project.id).catch(() => null);
+      run.jobId = previousJob?.id ?? 0;
+      analysisRequestBaselineRef.current = { projectId: project.id, jobId: run.jobId };
+      let result = await (model ? api.analyzeProjectGpt(project.id, model, effort, force, 20, range) : api.analyzeProject(project.id));
+      latestJob = await api.analysisStatus(project.id).catch(() => null);
+      // Long GPT reviews are bounded to 20 windows per request. Continue a
+      // few clean batches automatically for short manuscripts, then return
+      // control to the writer so a 300-episode import cannot keep the app
+      // busy for hours without an explicit continuation.
+      let automaticBatches = 1;
+      const MAX_AUTOMATIC_BATCHES = 3;
+      while (model && automaticBatches < MAX_AUTOMATIC_BATCHES && latestJob?.status === 'partial'
+        && latestJob.message.includes('나머지를 이어갑니다')
+        && !(latestJob.window_details ?? []).some(window => ['failed', 'interrupted'].includes(window.status))) {
+        result = await api.analyzeProjectGpt(project.id, model, effort, false, 20, range);
+        latestJob = await api.analysisStatus(project.id).catch(() => null);
+        automaticBatches += 1;
+      }
+      if (visit.isCurrent()) {
+        if (latestJob?.project_id === project.id) setAnalysisJob(latestJob);
+        const loaded = await refreshProjectData(project, chapterRangeRef.current);
+        if (visit.isCurrent() && loaded !== false) setNotice(
+          latestJob?.status === "partial" ? latestJob.message : `분석 완료: 엔티티 ${result.entity_count}개, 관계 ${result.relation_count}개, 이슈 ${result.issue_count}개${model ? ` · GPT 새 요청 ${result.request_count ?? 0}회 / 재사용 ${result.cached_count ?? 0}회` : ""}`,
+        );
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "분석 요청 응답을 확인하지 못했습니다.";
+      latestJob = analysisJobAfterError(await api.analysisStatus(project.id).catch(() => null), {projectId: project.id, jobId: run.jobId});
+      if (visit.isCurrent()) {
+        setAnalysisJob(latestJob ?? makeFailedAnalysisJob(project.id, message));
+        setNotice(latestJob?.status === 'running' ? '요청 연결이 끊겼지만 분석은 진행 중입니다. 상태를 계속 확인합니다.' : message);
+      }
+    } finally {
+      visit.finish();
+      run.awaitingResponse = false;
+      // An interrupted request can leave a live server job; keep the busy state until its status ends.
+      if (activeAnalysisRef.current === run && latestJob?.status !== 'running') {
+        activeAnalysisRef.current = null;
+        analysisRequestBaselineRef.current = null;
+        setActiveAnalysisProject(null);
+      }
+    }
+  }
+
+  async function cancelAnalysis() {
+    if (!selectedProject || !analysisJob || analysisJob.status !== 'running') return;
+    try {
+      const cancelled = await api.cancelAnalysis(selectedProject.id);
+      setAnalysisJob(cancelled);
+      setNotice('분석을 중단했습니다. 완료된 구간과 기존 결과는 보존됩니다.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '분석 중단에 실패했습니다. 상태를 다시 확인해 주세요.');
+    }
+  }
+
+  async function updateIssueStatus(issueId: number, status: IssueStatus): Promise<boolean> {
+    if (!selectedProject) return false;
+    const write = mutationScope.current.begin(selectedProject.id, `issue:${issueId}`);
+    if (!write) return false;
     try {
       const updated = await api.updateIssueStatus(issueId, status);
-      setGraph((current) => ({
-        ...current,
-        issues: current.issues.map((issue) => (issue.id === issueId ? updated : issue)),
-      }));
+      if (write.isCurrent()) {
+        setGraph((current) => ({
+          ...current,
+          issues: current.issues.map((issue) => (issue.id === issueId ? updated : issue)),
+        }));
+        setNotice("작가 판단을 저장했습니다.");
+      }
+      return true;
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "이슈 상태 변경 실패");
-    }
+      if (write.isCurrent()) setNotice(error instanceof Error ? error.message : "이슈 상태 변경 실패");
+      return false;
+    } finally { write.finish(); }
   }
 
   async function updateGenerationModel(model: string) {
@@ -892,14 +1350,14 @@ export default function App() {
     }
   }
 
-  async function startEnvironmentSetup() {
+  async function startEnvironmentSetup(embeddingModel: string) {
     try {
       setNotice("로컬 AI 모델을 준비합니다.");
       const progress = await api.runSetup({
         install_runtime: false,
         prepare_embedding_model: true,
-        prepare_generation_model: true,
-        embedding_model: setupStatus?.embedding_model ?? settings.embedding_model,
+        prepare_generation_model: false,
+        embedding_model: embeddingModel,
         generation_model:
           settings.generation_model ||
           setupStatus?.generation_model ||
@@ -925,29 +1383,17 @@ export default function App() {
     void refreshAll();
   }
 
+  const projectPage = !['welcome', 'projects', 'setup', 'settings'].includes(page);
+  const projectDataBlocked = selectedProject !== null && snapshotProjectId !== selectedProject.id;
+
   return (
-    <div className="app-shell">
-      <Sidebar
-        projects={projects}
-        selectedProject={selectedProject}
-        documents={documents}
-        localAi={localAi}
-        settings={settings}
-        loading={loading}
-        onCreateProject={createProject}
-        onSelectProject={selectProject}
-        onImportDocument={importDocument}
-        onAnalyze={analyze}
-        aiReady={setupStatus?.ready ?? false}
-        onRefresh={refreshAll}
-        onGenerationModelChange={updateGenerationModel}
-        onDeleteDocument={deleteDocument}
-      />
-      <main className="workspace">
+    <div className={`app-shell workbench page-${page}`}>
+      <WorkbenchNav page={page} onPage={setPage} project={selectedProject} projects={projects} onProject={selectProject}/>
+      <main ref={workspaceRef} className="workspace">
         <header className="workspace-header">
           <div className="title-area">
-            <span className="label">작품 작업실</span>
-            {editingProjectTitle && selectedProject ? (
+            <h1 className="page-title">{PAGES[page][0]}</h1><p className="page-description">{PAGES[page][1]}</p>
+            {editingProjectTitle && selectedProject && !['welcome','projects','setup','settings'].includes(page) ? (
               <form className="project-title-editor" onSubmit={saveProjectTitle}>
                 <input
                   autoFocus
@@ -971,7 +1417,7 @@ export default function App() {
                 </button>
               </form>
             ) : (
-              <div className="project-title-row">
+              <div className={`project-title-row ${['welcome','projects','setup','settings'].includes(page) ? 'context-hidden' : ''}`}>
                 <h2>{selectedProject?.title ?? "작품 없음"}</h2>
                 {selectedProject && (
                   <>
@@ -988,7 +1434,7 @@ export default function App() {
                       type="button"
                       title="작품 삭제"
                       onClick={deleteSelectedProject}
-                      disabled={loading}
+                      disabled={workspaceBusy}
                     >
                       <Trash2 size={16} />
                     </button>
@@ -998,12 +1444,35 @@ export default function App() {
             )}
           </div>
           <div className="status-strip">
-            <span>{notice}</span>
-            <strong>{filteredGraph.entities.length} nodes</strong>
-            <strong>{filteredGraph.relations.length}/{graph.relations.length} links</strong>
+            {!['welcome','projects','setup','settings'].includes(page) && <button type="button" onClick={() => setPage(page === "graph" ? "analysis" : "graph")}>{page === "graph" ? "새 분석" : "관계 지도"}</button>}
+            {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && <span role={projectDataError ? "alert" : undefined}>{projectDataLoading ? '작품 데이터를 새로 확인하는 중입니다.' : notice}</span>}
+            {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && projectDataError && <button type="button" disabled={projectDataLoading} onClick={() => void refreshProjectData(selectedProject)}>다시 시도</button>}
+            {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && <><strong>{filteredGraph.entities.length} nodes</strong><strong>{filteredGraph.relations.length}/{graph.relations.length} links</strong></>}
           </div>
         </header>
-        {(!setupStatus?.ready || setupProgress?.running) && (
+        {activeAnalysisProject && activeAnalysisProject.id !== selectedProject?.id && <aside className="background-analysis" role="status"><span><strong>{activeAnalysisProject.title}</strong> 작품을 분석 중입니다. 다른 작품은 읽을 수 있으며 새 분석은 완료 후 시작할 수 있습니다.</span><button onClick={() => {selectProject(activeAnalysisProject); setPage('analysis');}}>진행 상황 보기</button></aside>}
+        {projectPage && projectDataBlocked && <section className="project-load-state" aria-busy={projectDataLoading}>
+          <div className="surface">
+            <h2>{projectDataLoading ? '작품을 불러오는 중입니다' : '작품을 불러오지 못했습니다'}</h2>
+            <p>{selectedProject?.title}</p>
+            <p role={projectDataLoading ? 'status' : 'alert'}>{projectDataLoading ? '원고·설정·검토 결과를 함께 준비하고 있습니다.' : notice}</p>
+            {!projectDataLoading && <button className="primary" onClick={() => void refreshProjectData(selectedProject)}>다시 시도</button>}
+            <button onClick={() => setPage('projects')}>내 작품으로 이동</button>
+          </div>
+        </section>}
+        <section hidden={page !== 'projects'}><ProjectsPage projects={projects} onCreate={createProject} onOpen={project=>{selectProject(project);setPage('manuscripts');}}/></section>
+        <section hidden={page !== 'manuscripts' || projectDataBlocked}><ManuscriptsPage key={selectedProject?.id ?? "no-project"} active={page==='manuscripts'} sourceRequest={sourceRequest} documents={documents} settings={storySettings} onCreateSetting={createStorySetting} onUpdateSetting={updateStorySetting} onDeleteSetting={deleteStorySetting} onImport={importDocument} onDelete={deleteDocument} onReplace={replaceDocument} onAnalyze={()=>setPage('analysis')} loading={workspaceBusy}/></section>
+        <section hidden={page !== 'review' || projectDataBlocked}><ReviewPage key={selectedProject?.id ?? "review-no-project"} history={reviewHistory} graph={graph} documents={documents} evidence={evidenceByIssueId} onStatus={updateIssueStatus} onOpenDocument={(documentId,quote) => {setSourceRequest({documentId,quote});setPage('manuscripts');}} onGraph={(relationId) => {const relation = relationId == null ? undefined : graph.relations.find(item => item.id === relationId); setSelectedRelationId(relationId ?? null); setSelectedEntity(relation ? graph.entities.find(entity => entity.id === relation.source_entity_id) ?? null : null); setPage('graph');}} onAnalysis={()=>setPage(documents.length ? 'analysis' : 'manuscripts')}/></section>
+        <section hidden={page !== 'welcome'} className="welcome-page surface"><span className="eyebrow">작가의 판단을 돕는 도구</span><h2>이야기에 몰입하세요.<br/>설정의 연결은 함께 살펴볼게요.</h2><p>원고를 가져오면 인물과 설정의 관계를 정리하고,<br/>다시 확인할 부분을 원문 근거와 함께 보여드립니다.</p><div className="welcome-steps"><div>01<br/><strong>원고 가져오기</strong></div><div>02<br/><strong>내 AI로 분석하기</strong></div><div>03<br/><strong>근거 읽고 판단하기</strong></div></div><button className="primary" onClick={()=>setPage('setup')}>시작하기 →</button><p className="muted">원고는 로컬에 저장됩니다. 분석 시 동의한 원문은 외부 GPT로 전송됩니다.</p></section>
+        <section hidden={page !== 'foreshadowing' || projectDataBlocked} className="page-content"><div className="surface"><h2>추출된 떡밥 후보</h2><p className="muted">AI는 등장 단서를 후보로 제시합니다. 마지막 언급 이후 공백만으로 미회수라고 단정하지 않고, 작가가 상태를 결정합니다.</p>{graph.entities.filter(e=>e.type==='foreshadowing').map(e=>{const current=foreshadowingStatuses.find(item=>item.entity_id===e.id)?.status??'unreviewed';return <div className="source-card foreshadowing-card" key={e.id}><div><h3>{e.name}</h3><span className={`setting-certainty ${current}`}>{{unreviewed:'검토 전',in_progress:'진행 중',resolved:'회수 확인',intentional:'의도적 미회수'}[current]}</span></div><p>{e.summary}</p><p className="muted">등장 회차 {e.document_ids.map(id=>documents.find(d=>d.id===id)?.chapter_index).filter((v):v is number=>v!==undefined).sort((a,b)=>a-b).map(ch=>`${ch+1}화`).join(' · ')||'확인 중'}</p><div className="foreshadowing-actions"><select aria-label={`${e.name} 상태`} value={current} onChange={event=>void updateForeshadowingStatus(e.id,event.target.value as ForeshadowingStatus['status'])}><option value="unreviewed">검토 전</option><option value="in_progress">진행 중</option><option value="resolved">회수 확인</option><option value="intentional">의도적 미회수</option></select><button onClick={()=>{setSelectedEntity(e);setPage('graph');}}>관계 지도에서 확인</button></div></div>})}{!graph.entities.some(e=>e.type==='foreshadowing')&&<div className="blank-state"><p>{graph.entities.length ? '현재 분석 결과에 떡밥 유형 후보가 없습니다. 원문에서 단서를 찾으려면 다시 분석해 보세요.' : '원고를 가져온 뒤 분석을 시작하면 떡밥 후보가 여기에 표시됩니다.'}</p><button className="primary" onClick={()=>setPage(graph.entities.length ? 'analysis' : 'manuscripts')}>{graph.entities.length ? '분석 설정으로 이동' : '원고 가져오기'}</button></div>}</div></section>
+        <section hidden={!['analysis','settings','setup'].includes(page) || (page === 'analysis' && projectDataBlocked)} className="analysis-layout">
+          <div className="surface analysis-target">
+            {page === 'analysis' ? <><h2>분석 대상</h2><div className="soft-card"><strong>{selectedProject?.title ?? '작품을 선택하세요'}</strong><p>전체 원고 · {documents.length}편 · {formatManuscriptChars(documents)}</p><p className="muted">원고 전체를 로컬에서 색인한 뒤, 선택한 회차 범위를 여러 구간으로 묶어 순서대로 검토합니다. 첫 실행은 검색 색인 시간이 필요하고, 이미 검증된 구간은 재시도 때 재사용합니다.</p></div><p className="muted analysis-list-hint">회차를 누르면 원고가 열립니다. 분석 회차 범위는 오른쪽 GPT 분석 패널에서 선택합니다.</p><DocumentPicker key={selectedProject?.id ?? 'analysis-no-project'} documents={documents} onSelect={documentId=>{setSourceRequest({documentId});setPage('manuscripts');}}/><button onClick={()=>setPage('manuscripts')}>{documents.length ? '원고·설정 관리' : '원고 가져오기'}</button><hr/><h3>이번 분석에서 확인할 내용</h3><p>설정 충돌 후보와 인물·아이템·규칙의 관계를 원문 근거와 함께 정리합니다.</p></> : page === 'setup' ? <><h2>준비 순서</h2><div className="soft-card"><strong>1. 내 GPT 연결</strong><p>작품 분석에 사용할 계정을 연결합니다.</p><strong>2. 원고 검색 모델 준비</strong><p>Qwen 또는 EmbeddingGemma 중 하나를 선택합니다.</p><strong>3. 내 작품으로 이동</strong><p>준비가 끝나면 원고를 가져오고 분석을 시작합니다.</p></div><button className="primary" onClick={()=>setPage('projects')}>내 작품으로 이동</button></> : <><h2>저장·분석 환경</h2><div className="soft-card"><strong>원고는 이 기기에 저장됩니다.</strong><p>GPT 분석을 실행할 때 동의한 원문과 검색 근거만 외부 GPT로 전송됩니다.</p></div><button onClick={()=>setPage('manuscripts')}>원고·설정 열기</button></>}
+          </div>
+          {page === 'analysis' && <div className="surface analysis-readiness"><strong>원고 검색 준비</strong><p className="muted">{setupStatus?.embedding_model ?? 'Qwen3-Embedding-0.6B-Q8_0.gguf'} · {setupStatus?.embedding_model_ready ? '검색 모델 준비 완료' : '검색 모델 준비 필요'}</p><p className="muted">원고를 수정하면 검색 자료와 분석 결과가 최신 상태가 아니게 됩니다. 다시 분석하면 현재 원문 기준으로 갱신됩니다.</p></div>}
+          <div className="analysis-options">
+        <ChatGptPanel projectId={selectedProject?.id} projectTitle={selectedProject?.title} hasDocuments={documents.length > 0} documentCount={documents.length} manuscriptChars={documents.reduce((total, document) => total + document.content.length, 0)} documentCharCounts={documents.map(document => document.content.length)} chapters={documents.map(document => ({ chapterIndex: document.chapter_index, title: document.title }))} analysisRange={analysisRange} onAnalysisRangeChange={setAnalysisRange} analyzing={workspaceBusy} onAnalyze={analyze} showAnalysis={page === 'analysis'} compact={page === 'analysis' || page === 'settings'} />
+        {(page === "setup" || page === "settings") && (
           <SetupPanel
             status={setupStatus}
             progress={setupProgress}
@@ -1011,13 +1480,23 @@ export default function App() {
             onRefresh={refreshEnvironmentSetup}
           />
         )}
-        {analysisJob && analysisJob.status !== "idle" && (
-          <AnalysisProgressPanel job={analysisJob} />
+        {page === 'analysis' && analysisJob?.project_id === selectedProject?.id && analysisJob && analysisJob.status !== "idle" && (
+          <AnalysisProgressPanel
+            job={analysisJob}
+            onRetry={!workspaceBusy && retryRequest ? () => void analyze(retryRequest.model, retryRequest.effort, false, retryRequest.range ?? analysisRangeRef.current) : undefined}
+            onCancel={workspaceBusy ? () => void cancelAnalysis() : undefined}
+          />
         )}
+          {page === 'settings' && <details className="surface" open><summary>고급 · 로컬 생성 모델</summary><p>개인 GPT 분석에는 로컬 생성 모델이 필요하지 않습니다. 로컬 모델을 사용하는 경우에만 선택하세요.</p><select aria-label="로컬 생성 모델" value={settings.generation_model} onChange={e=>updateGenerationModel(e.target.value)}>{[...new Set([settings.generation_model,...(localAi?.models??[])])].map(m=><option key={m}>{m}</option>)}</select></details>}
+          </div>
+        </section>
+        <section hidden={page !== 'graph' || projectDataBlocked} className="graph-page">
+        <div className="graph-search"><input aria-label="인물·아이템·설정 검색" placeholder="인물·아이템·설정 검색" value={graphSearch} onChange={e=>setGraphSearch(e.target.value)}/><span>○ 인물　▢ 아이템　□ 규칙　◇ 사건</span></div>
         <div className="range-controls" aria-label="회차 분석 범위">
           <div>
-            <span className="label">분석 범위</span>
+            <span className="label">표시 회차</span>
             <strong>{graphRangeLabel}</strong>
+            {(chapterRange.startChapter !== loadedChapterRange.startChapter || chapterRange.endChapter !== loadedChapterRange.endChapter) && <span role="status">{projectDataLoading ? '선택한 회차를 불러오는 중' : '조회 실패 · 이전 범위 표시 중'}</span>}
           </div>
           <button
             type="button"
@@ -1077,6 +1556,9 @@ export default function App() {
             >
               전체 관계
             </button>
+            <button type="button" className={healthOnly ? "active health-filter" : "health-filter"} onClick={() => setHealthOnly(value => !value)}>
+              점검 필요
+            </button>
           </div>
           {ENTITY_TYPES.map((type) => (
             <button
@@ -1088,33 +1570,32 @@ export default function App() {
             </button>
           ))}
         </div>
-        <GraphView
+        <div className="graph-body"><Suspense fallback={<div className="graph-loading" role="status">관계 지도를 준비하는 중…</div>}><GraphView
           projectId={selectedProject?.id ?? null}
-          graph={filteredGraph}
+          graph={searchedGraph}
+          visible={page === 'graph'}
+          selectedRelationId={selectedRelationId}
           selectedEntityId={selectedEntity?.id ?? null}
           onSelectEntity={setSelectedEntity}
-        />
+          onSelectRelation={setSelectedRelationId}
+        /></Suspense>
+        <GraphDetails onOpenDocument={(documentId,quote) => {setSourceRequest({documentId,quote});setPage("manuscripts");}} documents={documents} graph={searchedGraph} entity={selectedEntity} relationId={selectedRelationId} onRelation={setSelectedRelationId} onReview={()=>setPage('review')}/>
+        </div></section>
       </main>
-      <Inspector
-        entity={selectedEntity}
-        relationships={selectedRelationshipDetails}
-        issues={openIssues}
-        changes={graph.changes}
-        graphRange={graph.range}
-        evidenceByIssueId={evidenceByIssueId}
-        onIssueStatus={updateIssueStatus}
-      />
       <StartupLoader status={startupStatus} onRetry={retryStartup} />
       {projectModalOpen && (
         <div className="modal-backdrop" role="presentation" onMouseDown={() => setProjectModalOpen(false)}>
           <form
             className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="new-project-title-heading"
             onSubmit={submitNewProject}
             onMouseDown={(event) => event.stopPropagation()}
           >
             <div>
               <span className="label">새 작품</span>
-              <h2>작품 이름 설정</h2>
+              <h2 id="new-project-title-heading">작품 이름 설정</h2>
             </div>
             <label htmlFor="new-project-title">작품 제목</label>
             <input
@@ -1142,26 +1623,35 @@ export default function App() {
         >
           <form
             className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="document-path-heading"
             onSubmit={submitDocumentPath}
             onMouseDown={(event) => event.stopPropagation()}
           >
             <div>
-              <span className="label">원고 추가</span>
-              <h2>파일 경로 입력</h2>
+              <span className="label">{replacementDocument ? "원고 교체" : "원고 추가"}</span>
+              <h2 id="document-path-heading">{replacementDocument ? `${replacementDocument.chapter_index + 1}화 수정본 선택` : "파일 경로 입력"}</h2>
+              {replacementDocument && <p>회차와 제목을 유지합니다. 내용이 바뀌면 이전 검토와 원문 근거를 이력에 보관하며, 같은 내용이면 기존 분석을 유지합니다.</p>}
             </div>
             <label htmlFor="document-path">원고 파일 경로</label>
             <input
               id="document-path"
               autoFocus
               value={documentPathDraft}
+              disabled={workspaceBusy}
+              aria-invalid={Boolean(documentPathError)}
+              aria-describedby={documentPathError ? "document-path-error" : undefined}
               placeholder="/Users/name/Documents/story.md"
               onChange={(event) => setDocumentPathDraft(event.target.value)}
             />
+            {documentPathError && <p id="document-path-error" className="form-error" role="alert">{documentPathError}</p>}
+            {loading && <p role="status">원고를 저장하고 있습니다. 이 창을 닫아도 저장은 계속됩니다.</p>}
             <div className="modal-actions">
               <button type="button" onClick={() => setDocumentPathModalOpen(false)}>
-                취소
+                {loading ? "닫기" : "취소"}
               </button>
-              <button type="submit">추가</button>
+              <button type="submit" disabled={workspaceBusy}>{loading ? "저장 중…" : replacementDocument ? "수정본으로 교체" : "추가"}</button>
             </div>
           </form>
         </div>

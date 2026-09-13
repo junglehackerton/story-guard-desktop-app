@@ -36,7 +36,11 @@ def _read_docx(path: Path) -> str:
     return "\n".join(paragraph.text for paragraph in document.paragraphs if paragraph.text.strip())
 
 
-def split_chunks(content: str, max_chars: int = 900, overlap: int = 120) -> list[str]:
+def split_chunks(content: str, max_chars: int = 480, overlap: int = 48) -> list[str]:
+    # Korean tokenizers expand character counts considerably. Keeping the
+    # Keep chunks below the bundled Qwen embedding model's token limit while
+    # avoiding excessive indexing overhead on long manuscripts.
+    # (512-token batch limit) from rejecting ordinary prose chunks.
     paragraphs = [paragraph.strip() for paragraph in content.splitlines() if paragraph.strip()]
     if not paragraphs:
         return []

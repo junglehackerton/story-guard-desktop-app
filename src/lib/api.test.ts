@@ -17,7 +17,7 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:8765/health",
       expect.objectContaining({
-        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+        headers: expect.not.objectContaining({ "Content-Type": "application/json" }),
       }),
     );
   });
@@ -48,7 +48,6 @@ describe("api client", () => {
       "http://127.0.0.1:8765/health/ready",
       expect.objectContaining({
         headers: expect.objectContaining({
-          "Content-Type": "application/json",
           "X-Story-Guard-Token": "desktop-token",
         }),
       }),
@@ -171,7 +170,7 @@ describe("api client", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://127.0.0.1:8765/projects/7/analysis/status",
       expect.objectContaining({
-        headers: expect.objectContaining({ "Content-Type": "application/json" }),
+        headers: expect.not.objectContaining({ "Content-Type": "application/json" }),
       }),
     );
   });
@@ -207,4 +206,59 @@ describe("api client", () => {
       }),
     );
   });
+});
+
+describe("ChatGPT endpoints", () => {
+  afterEach(() => vi.unstubAllGlobals());
+  it("starts device authentication without collecting passwords", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ phase: "pending", user_code: "TEST-CODE" })));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.chatGptLogin();
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8765/chatgpt/login", expect.objectContaining({ method: "POST" }));
+  });
+  it("passes only the explicitly selected model to the sample check", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ text: "sample" })));
+    vi.stubGlobal("fetch", fetchMock);
+    await api.chatGptCheck("available-model", "high");
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8765/chatgpt/check", expect.objectContaining({ body: JSON.stringify({ model: "available-model", effort: "high" }) }));
+  });
+});
+
+it("passes the chosen model, effort and manuscript consent to GPT analysis", async () => {
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ issue_count: 1 })));
+  vi.stubGlobal("fetch", fetchMock);
+  try {
+    await api.analyzeProjectGpt(42, "chosen-model", "high");
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8765/projects/42/analyze/gpt",
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ model: "chosen-model", effort: "high", consent: true, force: false }) }));
+  } finally { vi.unstubAllGlobals(); }
+});
+
+it("passes the bounded batch limit for long manuscript analysis", async () => {
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ issue_count: 0 })));
+  vi.stubGlobal("fetch", fetchMock);
+  try {
+    await api.analyzeProjectGpt(42, "chosen-model", "medium", false, 20);
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8765/projects/42/analyze/gpt",
+      expect.objectContaining({ body: JSON.stringify({ model: "chosen-model", effort: "medium", consent: true, force: false, batch_limit: 20 }) }));
+  } finally { vi.unstubAllGlobals(); }
+});
+
+it("passes an explicitly selected chapter range to GPT analysis", async () => {
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify({ issue_count: 0 })));
+  vi.stubGlobal("fetch", fetchMock);
+  try {
+    await api.analyzeProjectGpt(42, "chosen-model", "medium", false, 20, { startChapter: 10, endChapter: 19 });
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8765/projects/42/analyze/gpt",
+      expect.objectContaining({ body: JSON.stringify({ model: "chosen-model", effort: "medium", consent: true, force: false, batch_limit: 20, start_chapter: 10, end_chapter: 19 }) }));
+  } finally { vi.unstubAllGlobals(); }
+});
+
+it("loads source text for the selected relationship", async () => {
+  const fetchMock = vi.fn(async () => new Response(JSON.stringify([])));
+  vi.stubGlobal("fetch", fetchMock);
+  try {
+    await api.relationEvidence(42);
+    expect(fetchMock).toHaveBeenCalledWith("http://127.0.0.1:8765/relations/42/evidence", expect.anything());
+  } finally { vi.unstubAllGlobals(); }
 });

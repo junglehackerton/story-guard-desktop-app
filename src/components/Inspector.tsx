@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+import { api } from "../lib/api";
 import type {
   ContinuityIssue,
   EntityNode,
@@ -6,10 +8,12 @@ import type {
   GraphRange,
   IssueStatus,
   RelationChange,
+  StoryDocument,
 } from "../lib/types";
 import { ENTITY_TYPE_LABELS, ISSUE_CATEGORY_LABELS, ISSUE_STATUS_LABELS } from "../lib/labels";
 
 interface InspectorProps {
+  hasGptRelations?: boolean;
   entity: EntityNode | null;
   relationships: EntityRelationshipDetail[];
   issues: ContinuityIssue[];
@@ -27,6 +31,7 @@ const APPEARANCE_LABELS: Record<EntityNode["appearance_state"], string> = {
 };
 
 export function Inspector({
+  hasGptRelations = false,
   entity,
   relationships,
   issues,
@@ -54,7 +59,7 @@ export function Inspector({
             {entity.aliases.length > 0 && <p>별칭: {entity.aliases.join(", ")}</p>}
             <div className="entity-relations">
               <div className="entity-relations-title">
-                <strong>활성 관계</strong>
+                <strong>연결된 관계</strong>
                 <span>{relationships.length}</span>
               </div>
               {relationships.length === 0 ? (
@@ -69,6 +74,7 @@ export function Inspector({
                       <strong>{detail.other.name}</strong>
                     </div>
                     <p>{detail.explanation}</p>
+                    {detail.relation.id > 0 && <RelationEvidence relationId={detail.relation.id} />}
                   </article>
                 ))
               )}
@@ -86,7 +92,7 @@ export function Inspector({
         </div>
         <div className="issue-list">
           {changes.length === 0 ? (
-            <p className="muted">선택 범위에서 뚜렷한 관계 변화가 없습니다.</p>
+            <p className="muted">{hasGptRelations ? "GPT가 자유 문구로 추출한 관계는 변화로 확정하지 않습니다. 선택한 관계의 회차별 원문을 확인해 주세요." : "선택 범위에서 뚜렷한 관계 변화가 없습니다."}</p>
           ) : (
             changes.map((change) => (
               <article key={change.id} className="change-card">
@@ -141,4 +147,24 @@ export function Inspector({
       </section>
     </aside>
   );
+}
+
+
+export function RelationEvidence({ relationId, expanded = false, onOpenDocument, documents = [] }: { relationId: number; expanded?: boolean; onOpenDocument?: (id: number, quote?: string) => void; documents?: StoryDocument[] }) {
+  const [chunks, setChunks] = useState<EvidenceChunk[] | null>(null);
+  const [error, setError] = useState("");
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    setChunks(null); setError("");
+    api.relationEvidence(relationId).then(value => { if (!cancelled) setChunks(value); })
+      .catch(() => { if (!cancelled) setError("원문 근거를 불러오지 못했습니다. 노드를 다시 선택해 주세요."); });
+    return () => { cancelled = true; };
+  }, [relationId, attempt]);
+  return <details className="relation-evidence" open={expanded || undefined}>
+    <summary>원문 근거 보기</summary>
+    {error ? <div role="alert"><p>{error}</p><button type="button" onClick={() => setAttempt(value => value + 1)}>다시 시도</button></div> : chunks === null ? <p>근거를 불러오는 중…</p>
+      : chunks.length === 0 ? <p>저장된 원문 근거가 없습니다.</p>
+      : chunks.map(chunk => { const document = documents.find(item => item.id === chunk.document_id); return <blockquote key={chunk.id}><small>{document ? `${document.chapter_index + 1}화 · ${document.title}` : `원문 구간 ${chunk.chunk_index + 1}`}</small><p>{chunk.text}</p>{onOpenDocument && <button onClick={() => onOpenDocument(chunk.document_id, chunk.text)}>이 회차 원고 열기</button>}</blockquote>; })}
+  </details>;
 }

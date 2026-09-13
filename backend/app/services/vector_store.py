@@ -3,6 +3,13 @@ from __future__ import annotations
 from pathlib import Path
 
 
+class _StoredVectorEmbeddingFunction:
+    """Keep Chroma from loading its optional ONNX default embedding model."""
+
+    def __call__(self, input: list[str]) -> list[list[float]]:
+        return [[0.0] for _ in input]
+
+
 class VectorIndex:
     def __init__(self, persist_dir: Path) -> None:
         self.persist_dir = persist_dir
@@ -34,7 +41,10 @@ class VectorIndex:
             path=str(self.persist_dir),
             settings=Settings(anonymized_telemetry=False),
         )
-        collection = client.get_or_create_collection(name=f"project_{project_id}")
+        collection = client.get_or_create_collection(
+            name=f"project_{project_id}",
+            embedding_function=_StoredVectorEmbeddingFunction(),
+        )
         collection.upsert(
             ids=[str(chunk_id) for chunk_id in chunk_ids],
             documents=texts,
@@ -54,7 +64,13 @@ class VectorIndex:
             path=str(self.persist_dir),
             settings=Settings(anonymized_telemetry=False),
         )
-        collection = client.get_or_create_collection(name=f"project_{project_id}")
-        result = collection.query(query_texts=[text], n_results=limit)
+        collection = client.get_or_create_collection(
+            name=f"project_{project_id}",
+            embedding_function=_StoredVectorEmbeddingFunction(),
+        )
+        # This legacy index does not retain an embedding model. Return no
+        # semantic results rather than asking Chroma to construct its ONNX
+        # default model at runtime.
+        result = collection.get(limit=limit)
         documents = result.get("documents", [[]])
         return [str(document) for document in documents[0]]

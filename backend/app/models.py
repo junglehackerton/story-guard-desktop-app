@@ -3,7 +3,8 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+import json
+from pydantic import BaseModel, Field, field_validator
 
 
 EntityType = Literal[
@@ -42,10 +43,18 @@ class Project(BaseModel):
     root_path: str | None = None
     created_at: str
     updated_at: str
+    document_count: int = 0
+    pending_document_count: int = 0
+    open_issue_count: int = 0
+    last_analyzed_at: str | None = None
 
 
 class DocumentImport(BaseModel):
     project_id: int
+    path: str
+
+
+class DocumentReplace(BaseModel):
     path: str
 
 
@@ -74,6 +83,36 @@ class StoryDocument(BaseModel):
     analysis_claim_count: int = 0
 
 
+class StorySettingCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=160)
+    content: str = Field(min_length=1, max_length=20_000)
+    certainty: Literal["confirmed", "draft"] = "draft"
+
+
+class StorySettingUpdate(StorySettingCreate):
+    pass
+
+
+class StorySetting(BaseModel):
+    id: int
+    project_id: int
+    title: str
+    content: str
+    certainty: Literal["confirmed", "draft"]
+    updated_at: str
+
+
+class ForeshadowingStatusUpdate(BaseModel):
+    status: Literal["unreviewed", "in_progress", "resolved", "intentional"]
+
+
+class ForeshadowingStatus(BaseModel):
+    entity_id: int
+    project_id: int
+    status: Literal["unreviewed", "in_progress", "resolved", "intentional"]
+    updated_at: str
+
+
 class EntityNode(BaseModel):
     id: int
     project_id: int
@@ -90,7 +129,22 @@ class EntityNode(BaseModel):
     visual_weight: float = 0.5
 
 
+class RelationQuote(BaseModel):
+    chunk_id: int
+    quote: str
+    document_id: int
+    chapter_index: int
+
+
+class RelationClaim(BaseModel):
+    explanation: str
+    basis: Literal["explicit", "inferred"]
+    quotes: list[RelationQuote]
+
+
 class RelationEdge(BaseModel):
+    claims: list[RelationClaim] = []
+    origin: Literal["local", "gpt"] = "local"
     id: int
     project_id: int
     source_entity_id: int
@@ -140,6 +194,19 @@ class RelationChange(BaseModel):
     evidence_chunk_ids: list[int] = []
 
 
+class RelationTimelineEvent(BaseModel):
+    source_entity_id: int
+    target_entity_id: int
+    source_name: str
+    target_name: str
+    relation_type: str
+    chapter_index: int
+    document_id: int
+    evidence_chunk_ids: list[int] = []
+    status: Literal["observed", "changed", "gap", "explicit_break"] = "observed"
+    gap_before: bool = False
+
+
 class GraphRange(BaseModel):
     start_chapter: int | None = None
     end_chapter: int | None = None
@@ -149,18 +216,35 @@ class GraphRange(BaseModel):
     message: str = ""
 
 
+class GraphHealth(BaseModel):
+    connected_entity_count: int = 0
+    component_count: int = 0
+    isolated_entity_count: int = 0
+    unsupported_relation_count: int = 0
+    generic_relation_count: int = 0
+    conflicting_pair_count: int = 0
+    changed_relation_count: int = 0
+    explicit_break_count: int = 0
+    gap_relation_count: int = 0
+    dangling_relation_count: int = 0
+    message: str = ""
+
+
 class GraphPayload(BaseModel):
     entities: list[EntityNode]
     relations: list[RelationEdge]
     issues: list[ContinuityIssue]
     changes: list[RelationChange] = []
     range: GraphRange = Field(default_factory=GraphRange)
+    health: GraphHealth = Field(default_factory=GraphHealth)
+    timeline: list[RelationTimelineEvent] = []
 
 
 class AnalysisStatus(str, Enum):
     idle = "idle"
     running = "running"
     completed = "completed"
+    partial = "partial"
     failed = "failed"
     cancelled = "cancelled"
 
@@ -174,6 +258,13 @@ class AnalysisJob(BaseModel):
     message: str
     created_at: str
     updated_at: str
+    window_details: list[dict] = Field(default_factory=list)
+    review_context: dict = Field(default_factory=dict)
+
+    @field_validator('window_details', 'review_context', mode='before')
+    @classmethod
+    def decode_json(cls, value):
+        return json.loads(value) if isinstance(value, str) else value
 
 
 class LocalAiHealth(BaseModel):
@@ -186,7 +277,7 @@ class LocalAiHealth(BaseModel):
 
 class AppSettings(BaseModel):
     generation_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
-    embedding_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    embedding_model: str = "Qwen3-Embedding-0.6B-Q8_0.gguf"
 
 
 class EnvironmentStatus(BaseModel):
@@ -209,7 +300,7 @@ class EnvironmentSetupRequest(BaseModel):
     install_runtime: bool = False
     prepare_embedding_model: bool = True
     prepare_generation_model: bool = True
-    embedding_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+    embedding_model: str = "Qwen3-Embedding-0.6B-Q8_0.gguf"
     generation_model: str = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
 
 

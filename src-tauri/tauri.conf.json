@@ -13,9 +13,9 @@
     "windows": [
       {
         "title": "Story Guard",
-        "width": 1320,
-        "height": 860,
-        "minWidth": 1080,
+        "width": 1440,
+        "height": 900,
+        "minWidth": 760,
         "minHeight": 720
       }
     ]

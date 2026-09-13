@@ -1,30 +1,20 @@
+import { aggregateRelationshipPairs, appendDanglingGhosts, partitionRelationships, relationshipBackboneIds, relationshipPositions } from "../lib/relationshipLayout";
+import { countConnectedComponents, countDanglingRelations, isDanglingRelation, relationshipComponents, relationPairKey, relationTypesConflict, timelinePairsByStatus } from "../lib/relationshipHealth";
 import cytoscape, { Core } from "cytoscape";
 import { Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildOrganizationMembership, isMembershipRelation } from "../lib/graphMembership";
-import {
-  clearGraphPositions,
-  readGraphPositions,
-  type GraphPosition,
-  writeGraphPositions,
-} from "../lib/graphLayoutStorage";
+import type { GraphPosition } from "../lib/graphLayoutStorage";
 import type { EntityNode, EntityType, GraphPayload, RelationEdge } from "../lib/types";
 
 const ENTITY_COLORS: Record<string, { fill: string; border: string }> = {
-  character: { fill: "#7163c6", border: "#4c3fa2" },
+  character: { fill: "#39796e", border: "#24635B" },
   place: { fill: "#5f9075", border: "#3f6f56" },
   organization: { fill: "#a85b68", border: "#813f4c" },
   item: { fill: "#b78343", border: "#8a602c" },
-  event: { fill: "#8a6aa9", border: "#684b88" },
+  event: { fill: "#988359", border: "#74643e" },
   rule: { fill: "#4d8b87", border: "#2f6865" },
   foreshadowing: { fill: "#6687bd", border: "#46679a" },
-};
-
-const GRAPH_LAYOUT: cytoscape.LayoutOptions = {
-  name: "preset",
-  animate: false,
-  fit: true,
-  padding: 96,
 };
 
 export const MEMBERSHIP_EDGE_STYLE = {
@@ -47,8 +37,13 @@ const ENTITY_TYPE_ORDER: EntityType[] = [
 interface GraphViewProps {
   projectId: number | null;
   graph: GraphPayload;
+  /** Hidden routes stay mounted in the workbench. Delay Cytoscape creation
+   * until the graph page is visible so the first fit uses real dimensions. */
+  visible?: boolean;
   selectedEntityId: number | null;
+  selectedRelationId?: number | null;
   onSelectEntity: (entity: EntityNode | null) => void;
+  onSelectRelation?: (id: number | null) => void;
 }
 
 function clamp(value: number, min: number, max: number) {
@@ -63,7 +58,8 @@ function mixHex(from: string, to: string, amount: number) {
       Number.parseInt(normalized.slice(2, 4), 16),
       Number.parseInt(normalized.slice(4, 6), 16),
     ];
-  };
+};
+
   const [r1, g1, b1] = parse(from);
   const [r2, g2, b2] = parse(to);
   const channel = (a: number, b: number) => Math.round(a + (b - a) * amount);
@@ -72,15 +68,30 @@ function mixHex(from: string, to: string, amount: number) {
     .join("")}`;
 }
 
-function shortRelationLabel(label: string) {
-  return label.length > 12 ? `${label.slice(0, 11)}...` : label;
+/** Convert a WebKit trackpad pinch wheel delta into a bounded zoom multiplier. */
+export function trackpadZoomFactor(deltaY: number): number {
+  if (!Number.isFinite(deltaY)) return 1;
+  return Math.exp(-deltaY * 0.0025);
 }
 
-function shortEntityLabel(label: string) {
-  return label.length > 14 ? `${label.slice(0, 13)}...` : label;
+export function graphPanOffset(start: { x: number; y: number }, delta: { x: number; y: number }, viewport: { width: number; height: number }, content: { width: number; height: number }, scale: number) {
+  const safeScale = clamp(Number.isFinite(scale) && scale > 0 ? scale : 1, 0.55, 2.8);
+  const next = {
+    x: start.x - delta.x * content.width / Math.max(1, viewport.width) / safeScale,
+    y: start.y - delta.y * content.height / Math.max(1, viewport.height) / safeScale,
+  };
+  // Keep at least one viewport of map content reachable in every direction.
+  // Without a bound, a long drag can move the SVG entirely off-canvas and
+  // leave the writer with a blank map and no obvious way back except reload.
+  const maxX = Math.max(0, (content.width - viewport.width / safeScale) / 2);
+  const maxY = Math.max(0, (content.height - viewport.height / safeScale) / 2);
+  return {
+    x: Math.min(maxX, Math.max(-maxX, next.x)),
+    y: Math.min(maxY, Math.max(-maxY, next.y)),
+  };
 }
 
-function entityVisual(entity: EntityNode, degree: number, clusterSize: number) {
+export function entityVisual(entity: EntityNode, degree: number, clusterSize: number) {
   const palette = ENTITY_COLORS[entity.type] ?? { fill: "#7a8494", border: "#596272" };
   const weight = clamp(
     entity.type === "organization" ? Math.max(entity.visual_weight ?? 0.5, 0.72) : (entity.visual_weight ?? 0.5),
@@ -113,6 +124,31 @@ function entityVisual(entity: EntityNode, degree: number, clusterSize: number) {
       (entity.type === "organization" ? 14 + Math.min(clusterSize * 3.8, 34) : 0),
     weight,
   };
+}
+
+export type GraphHealthLevel = "good" | "warn" | "danger";
+
+export function graphHealthLevel(health: {
+  explicit_break_count: number;
+  conflicting_pair_count: number;
+  dangling_relation_count: number;
+  isolated_entity_count: number;
+  unsupported_relation_count: number;
+  generic_relation_count: number;
+  changed_relation_count: number;
+  gap_relation_count: number;
+  component_count: number;
+}): GraphHealthLevel {
+  if (health.explicit_break_count || health.conflicting_pair_count || health.dangling_relation_count) return "danger";
+  if (health.isolated_entity_count || health.unsupported_relation_count || health.generic_relation_count || health.changed_relation_count || health.gap_relation_count || health.component_count > 1) return "warn";
+  return "good";
+}
+
+/** Keep timeline chips actionable: a count only includes pairs represented by
+ * a drawable relation in the current graph payload. */
+export function countVisibleTimelinePairs(graph: GraphPayload, status: "changed" | "gap" | "explicit_break") {
+  const visiblePairs = new Set(graph.relations.map((relation) => relationPairKey(relation.source_entity_id, relation.target_entity_id)));
+  return [...timelinePairsByStatus(graph, status)].filter((pair) => visiblePairs.has(pair)).length;
 }
 
 function relationTone(label: string) {
@@ -304,470 +340,582 @@ export function buildObsidianPositions(
   return positions;
 }
 
-function mergePositions(
-  autoPositions: Map<number, GraphPosition>,
-  savedPositions: Map<number, GraphPosition>,
-) {
-  const merged = new Map(autoPositions);
-  for (const [entityId, position] of savedPositions) {
-    if (merged.has(entityId)) {
-      merged.set(entityId, position);
-    }
-  }
-  return merged;
-}
+const TYPE_NAMES: Record<EntityType,string> = {character:'인물',place:'장소',organization:'조직',item:'아이템',event:'사건',rule:'규칙',foreshadowing:'떡밥'};
 
-function collectCurrentNodePositions(cy: Core) {
-  const positions = new Map<number, GraphPosition>();
-  cy.nodes().forEach((node) => {
-    if (node.data("isContainer") === "yes") {
-      return;
-    }
-    const rawId = String(node.id()).replace("entity-", "");
-    const entityId = Number(rawId);
-    if (!Number.isFinite(entityId)) {
-      return;
-    }
-    const position = node.position();
-    positions.set(entityId, { x: position.x, y: position.y });
-  });
-  return positions;
-}
-
-export function GraphView({ projectId, graph, selectedEntityId, onSelectEntity }: GraphViewProps) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  const cyRef = useRef<Core | null>(null);
-  const [zoomLabel, setZoomLabel] = useState("100%");
-  const [layoutResetNonce, setLayoutResetNonce] = useState(0);
-  const entitiesById = useMemo(
-    () => new Map(graph.entities.map((entity) => [entity.id, entity])),
-    [graph.entities],
+export function GraphView({ projectId, graph, visible = true, selectedEntityId, selectedRelationId, onSelectEntity, onSelectRelation }: GraphViewProps) {
+  const containerRef=useRef<HTMLDivElement>(null);
+  const cyRef=useRef<Core|null>(null);
+  const callbacks=useRef({onSelectEntity,onSelectRelation});callbacks.current={onSelectEntity,onSelectRelation};
+  const [zoom,setZoom]=useState(100);
+  const [pan,setPan]=useState({x:0,y:0});
+  const panGesture=useRef<{startX:number;startY:number;startPan:{x:number;y:number};active:boolean;dragged:boolean}|null>(null);
+  const [mapFocus,setMapFocus]=useState(false);
+  useEffect(()=>{
+    if(!mapFocus)return;
+    const onKey=(event:KeyboardEvent)=>{if(event.key==='Escape')setMapFocus(false);};
+    window.addEventListener('keydown',onKey);
+    return ()=>window.removeEventListener('keydown',onKey);
+  },[mapFocus]);
+  const [renderError,setRenderError]=useState('');
+  const [focusId,setFocusId]=useState<number|null>(null);
+  const [focusComponentAnchorId,setFocusComponentAnchorId]=useState<number|null>(null);
+  const [candidatesOpen,setCandidatesOpen]=useState(false);
+  const [danglingOpen,setDanglingOpen]=useState(false);
+  const [issuesOnly,setIssuesOnly]=useState(false);
+  const [revision,setRevision]=useState(0);
+  const {network,unlinked}=useMemo(()=>partitionRelationships(graph),[graph]);
+  const focused=focusId!==null && network.entities.some(e=>e.id===focusId);
+  const networkComponents = useMemo(() => relationshipComponents(network), [network]);
+  const focusedComponent = useMemo(
+    () => focusComponentAnchorId === null
+      ? null
+      : networkComponents.find((component) => component.anchorId === focusComponentAnchorId) ?? null,
+    [networkComponents, focusComponentAnchorId],
   );
-
-  const degreeByEntityId = useMemo(() => {
-    const degrees = new Map<number, number>();
-    for (const entity of graph.entities) {
-      degrees.set(entity.id, 0);
+  const shown=useMemo(()=>{
+    if (focusedComponent) {
+      const ids = new Set(focusedComponent.entityIds);
+      return {
+        ...network,
+        entities: network.entities.filter((entity) => ids.has(entity.id)),
+        relations: network.relations.filter((relation) => ids.has(relation.source_entity_id) && ids.has(relation.target_entity_id)),
+      };
     }
-    for (const relation of graph.relations) {
-      degrees.set(relation.source_entity_id, (degrees.get(relation.source_entity_id) ?? 0) + 1);
-      degrees.set(relation.target_entity_id, (degrees.get(relation.target_entity_id) ?? 0) + 1);
+    if(!focused) return network;
+    const relations=network.relations.filter(r=>r.source_entity_id===focusId||r.target_entity_id===focusId);
+    const ids=new Set(relations.flatMap(r=>[r.source_entity_id,r.target_entity_id]));
+    return {...network,entities:network.entities.filter(e=>ids.has(e.id)),relations};
+  },[network,focused,focusId,focusedComponent]);
+  const health = useMemo(() => {
+    // `graph` contains isolated and dangling candidates that are intentionally
+    // kept outside the drawable network. In a focused view the canvas is the
+    // source of truth, so scope every chip to that reduced view instead of
+    // carrying warnings from a different component into the current map.
+    const healthGraph = focused || focusedComponent ? shown : graph;
+    const entityIds = new Set(healthGraph.entities.map(entity => entity.id));
+    const relationEndpoints = new Set(
+      healthGraph.relations.flatMap(relation => [relation.source_entity_id, relation.target_entity_id])
+        .filter(entityId => entityIds.has(entityId)),
+    );
+    const byPair = new Map<string, Set<string>>();
+    healthGraph.relations.forEach(r => {
+      const key = [r.source_entity_id, r.target_entity_id].sort((a,b)=>a-b).join(":");
+      const types = byPair.get(key) ?? new Set<string>();
+      types.add(r.type); byPair.set(key, types);
+    });
+    return {
+      connected_entity_count: relationEndpoints.size,
+      component_count: countConnectedComponents(healthGraph),
+      isolated_entity_count: healthGraph.entities.filter(e => !relationEndpoints.has(e.id)).length,
+      unsupported_relation_count: healthGraph.relations.filter(r => !r.evidence_chunk_ids.length && !r.claims?.length).length,
+      generic_relation_count: healthGraph.relations.filter(r => ["관계", "관련", "co_occurs", "동시 등장"].includes(r.type)).length,
+      conflicting_pair_count: [...byPair.values()].filter(relationTypesConflict).length,
+      changed_relation_count: countVisibleTimelinePairs(healthGraph, "changed"),
+      explicit_break_count: countVisibleTimelinePairs(healthGraph, "explicit_break"),
+      gap_relation_count: countVisibleTimelinePairs(healthGraph, "gap"),
+      dangling_relation_count: focused || focusedComponent ? 0 : countDanglingRelations(graph),
+      message: `${healthGraph.entities.length}개 대상 · ${healthGraph.relations.length}개 관계 후보를 현재 표시 범위에서 확인합니다.${graph.health?.message ? ` ${graph.health.message}` : ""}`,
+    };
+  }, [graph, shown, focused, focusedComponent]);
+  const healthLevel = graphHealthLevel(health);
+  const components = useMemo(() => relationshipComponents(shown), [shown]);
+  const canvasGraph = useMemo(() => {
+    if (focused || focusedComponent) return shown;
+    return appendDanglingGhosts(graph, shown);
+  }, [focused, focusedComponent, graph, shown]);
+  const positions=useMemo(()=>relationshipPositions(canvasGraph),[canvasGraph,revision]);
+  const selected=graph.entities.find(e=>e.id===selectedEntityId);
+  const conflictingPairs = useMemo(() => {
+    const byPair = new Map<string, Set<string>>();
+    // Scope the visual warning to the same filtered range as the canvas. A
+    // conflict found in a later chapter must not paint an earlier-only view
+    // red when the current range contains just one side of the relationship.
+    for (const relation of shown.relations) {
+      const key = [relation.source_entity_id, relation.target_entity_id].sort((a,b)=>a-b).join(":");
+      const values = byPair.get(key) ?? new Set<string>();
+      values.add(relation.type);
+      byPair.set(key, values);
     }
-    return degrees;
+    return new Set([...byPair.entries()].filter(([, types]) => relationTypesConflict(types)).map(([key]) => key));
+  }, [shown.relations]);
+  const explicitBreakPairs = useMemo(() => {
+    const visiblePairs = new Set(shown.relations.map((relation) => relationPairKey(relation.source_entity_id, relation.target_entity_id)));
+    return new Set(
+      (graph.timeline ?? [])
+        .filter(item => item.status === "explicit_break")
+        .map(item => [item.source_entity_id, item.target_entity_id].sort((a, b) => a - b).join(":"))
+        .filter((pair) => visiblePairs.has(pair)),
+    );
+  }, [graph.timeline, shown.relations]);
+  const visibleTimelinePairs = useMemo(
+    () => new Set(shown.relations.map((relation) => relationPairKey(relation.source_entity_id, relation.target_entity_id))),
+    [shown.relations],
+  );
+  const changedPairs = useMemo(() => new Set(
+    (graph.timeline ?? [])
+      .filter(item => item.status === "changed")
+      .map(item => [item.source_entity_id, item.target_entity_id].sort((a, b) => a - b).join(":"))
+      .filter((pair) => visibleTimelinePairs.has(pair)),
+  ), [graph.timeline, visibleTimelinePairs]);
+  // Keep the canvas diagnostic state in lockstep with the health summary.
+  // `timelinePairsByStatus` also infers a reviewable middle gap when the same
+  // pair reappears in non-adjacent chapters, so the writer sees that signal on
+  // the map instead of only in the metric chip.
+  const gapPairs = useMemo(() => {
+    const inferred = timelinePairsByStatus(graph, "gap");
+    return new Set([...inferred].filter((pair) => visibleTimelinePairs.has(pair)));
+  }, [graph, visibleTimelinePairs]);
+  const danglingRelations = useMemo(() => {
+    const ids = new Set(graph.entities.map(entity => entity.id));
+    return graph.relations.filter(relation => isDanglingRelation(relation, ids));
   }, [graph.entities, graph.relations]);
+  const actionableDanglingRelations = focused || focusedComponent ? [] : danglingRelations;
+  const issueRelations = useMemo(() => {
+    const byPair = (pairs: Set<string>) => shown.relations.find((relation) => pairs.has(relationPairKey(relation.source_entity_id, relation.target_entity_id)));
+    return {
+      unsupported: shown.relations.find((relation) => !relation.evidence_chunk_ids.length && !relation.claims?.length),
+      generic: shown.relations.find((relation) => ["관계", "관련", "co_occurs", "동시 등장"].includes(relation.type)),
+      conflict: byPair(conflictingPairs),
+      changed: byPair(changedPairs),
+      gap: byPair(gapPairs),
+      explicitBreak: byPair(explicitBreakPairs),
+      dangling: actionableDanglingRelations[0],
+    };
+  }, [shown.relations, conflictingPairs, changedPairs, gapPairs, explicitBreakPairs, actionableDanglingRelations]);
+  const issueRelationIds = useMemo(() => {
+    const isIssue = (relation: RelationEdge) => {
+      const pair = relationPairKey(relation.source_entity_id, relation.target_entity_id);
+      return relation.is_weak ||
+        !relation.evidence_chunk_ids.length && !relation.claims?.length ||
+        ["관계", "관련", "co_occurs", "동시 등장"].includes(relation.type) ||
+        conflictingPairs.has(pair) || changedPairs.has(pair) || gapPairs.has(pair) || explicitBreakPairs.has(pair);
+    };
+    return new Set(network.relations.filter(isIssue).map((relation) => relation.id));
+  }, [network.relations, conflictingPairs, changedPairs, gapPairs, explicitBreakPairs]);
+  const entityName = useCallback((id: number) => graph.entities.find(entity => entity.id === id)?.name ?? `알 수 없는 대상 #${id}`, [graph.entities]);
+  const focusIssueRelation = useCallback((relation?: RelationEdge) => {
+    if (!relation) return;
+    const source = graph.entities.find((entity) => entity.id === relation.source_entity_id) ?? null;
+    callbacks.current.onSelectEntity(source);
+    callbacks.current.onSelectRelation?.(relation.id);
+  }, [graph.entities]);
+  // A scope, type, search, or chapter change produces a new graph payload.
+  // Clear the previous local focus in that case; otherwise switching back to
+  // “전체 관계” can keep rendering the component selected in the old scope.
+  useEffect(()=>{
+    setFocusId(null);
+    setFocusComponentAnchorId(null);
+    setCandidatesOpen(false);
+    setDanglingOpen(false);
+  },[projectId, graph]);
 
-  const { membershipByOrganizationId, parentOrganizationByEntityId } = useMemo(
-    () => buildOrganizationMembership(graph, entitiesById),
-    [entitiesById, graph],
-  );
-
-  const autoNodePositions = useMemo(
-    () =>
-      buildObsidianPositions(
-        graph,
-        entitiesById,
-        membershipByOrganizationId,
-        parentOrganizationByEntityId,
-        degreeByEntityId,
-      ),
-    [degreeByEntityId, entitiesById, graph, membershipByOrganizationId, parentOrganizationByEntityId],
-  );
-
-  const savedNodePositions = useMemo(
-    () => readGraphPositions(projectId, graph.entities),
-    [graph.entities, layoutResetNonce, projectId],
-  );
-
-  const nodePositions = useMemo(
-    () => mergePositions(autoNodePositions, savedNodePositions),
-    [autoNodePositions, savedNodePositions],
-  );
-
-  useEffect(() => {
-    if (!containerRef.current) {
-      return;
+  useEffect(()=>{
+    if(!visible || !containerRef.current || !canvasGraph.entities.length) return;
+    let cy:Core|null=null;
+    let observer:ResizeObserver|null=null;
+    let settleTimer: number | undefined;
+    const fit=()=>{
+      if(!cy || cy.destroyed())return;
+      // Leave a visible breathing room around the outermost cards. A tight
+      // fit makes the first/last node look clipped when the native window is
+      // resized between the initial layout pass and the ResizeObserver pass.
+      const fitPadding = Math.max(20, Math.min(56, Math.min(cy.width(), cy.height()) * .09));
+      cy.resize();cy.fit(cy.elements(), fitPadding);
+      // Cytoscape's fit can make a sparse layered map unreadably small. Keep a
+      // readable floor for normal-sized manuscripts while allowing very large
+      // graphs to zoom out further.
+      // Fit is authoritative: forcing a large floor can clip the first/last
+      // node in a short but wide graph. Keep only a conservative floor for
+      // very large maps so the complete network remains inside the viewport.
+      const readableFloor = shown.entities.length > 36 ? 0.22 : 0.30;
+      if(cy.zoom()>1.15)cy.zoom(1.15);
+      if(cy.zoom()<readableFloor)cy.zoom(readableFloor);
+      cy.center();
+    };
+    try {
+      setRenderError('');
+      const pairs=new Map<string,number[]>();
+      for(const r of canvasGraph.relations){const key=relationPairKey(r.source_entity_id,r.target_entity_id);pairs.set(key,[...(pairs.get(key)??[]),r.id]);}
+      const relationById = new Map(canvasGraph.relations.map(relation => [relation.id, relation]));
+      const relationLabelScore = (relation: RelationEdge) =>
+        (relation.evidence_chunk_ids.length ? 4 : 0) +
+        (relation.claims?.length ? 3 : 0) +
+        (relation.is_weak ? 0 : 2) +
+        (relation.type === '관계' || relation.type === '관련' ? 0 : 1) +
+        relation.confidence;
+      const labelIssueScore = (relation: RelationEdge) => {
+        const pair = relationPairKey(relation.source_entity_id, relation.target_entity_id);
+        const dangling = isDanglingRelation(relation, new Set(canvasGraph.entities.map(entity => entity.id)));
+        return (dangling ? 80 : 0) +
+          (explicitBreakPairs.has(pair) || conflictingPairs.has(pair) ? 60 : 0) +
+          (gapPairs.has(pair) || changedPairs.has(pair) ? 40 : 0) +
+          ((!relation.evidence_chunk_ids.length && !relation.claims?.length) ? 20 : 0) +
+          (relation.is_weak ? 10 : 0) +
+          (['관계', '관련', 'co_occurs', '동시 등장'].includes(relation.type) ? 10 : 0);
+      };
+      const labelRelationIds = new Set<number>();
+      for (const ids of pairs.values()) {
+        const representative = [...ids]
+          .map(id => relationById.get(id))
+          .filter((relation): relation is RelationEdge => Boolean(relation))
+          .sort((left, right) => labelIssueScore(right) - labelIssueScore(left) || relationLabelScore(right) - relationLabelScore(left) || left.id - right.id)[0];
+        if (representative) labelRelationIds.add(representative.id);
+      }
+      const labelLimit = canvasGraph.entities.length > 12 ? 14 : 24;
+      const trimmedLabelIds = new Set(
+        [...labelRelationIds]
+          .map(id => relationById.get(id)!)
+          .sort((left, right) => labelIssueScore(right) - labelIssueScore(left) || relationLabelScore(right) - relationLabelScore(left) || left.id - right.id)
+          .slice(0, labelLimit)
+          .map(relation => relation.id),
+      );
+      // Draw one semantic edge per entity pair. The extractor can produce
+      // several claims for the same pair (for example 협력 + 충돌 across
+      // chapters); drawing all of them makes the overview look like a hairball.
+      // Keep every relation in the payload and evidence rail, but aggregate
+      // the canvas edge into a representative with a count badge.
+      const representativeRelations = aggregateRelationshipPairs(canvasGraph.relations)
+        .map(({ pairKey, members }) => {
+          const representative = [...members].sort((left, right) => relationLabelScore(right) - relationLabelScore(left) || left.id - right.id)[0];
+          return representative ? { pairKey, members, representative } : null;
+        })
+        .filter((entry): entry is { pairKey: string; members: RelationEdge[]; representative: RelationEdge } => Boolean(entry));
+      const backboneIds = relationshipBackboneIds(canvasGraph.entities, canvasGraph.relations);
+      const degreeByEntityId = new Map<number, number>();
+      for (const relation of canvasGraph.relations) {
+        if (relation.source_entity_id !== relation.target_entity_id) {
+          degreeByEntityId.set(relation.source_entity_id, (degreeByEntityId.get(relation.source_entity_id) ?? 0) + 1);
+          degreeByEntityId.set(relation.target_entity_id, (degreeByEntityId.get(relation.target_entity_id) ?? 0) + 1);
+        }
+      }
+      // A saved layout may belong to a narrower filter (for example 핵심
+      // 관계) and therefore contain only part of the nodes in 전체 관계.
+      // Mixing those stale coordinates with new nodes can push the complete
+      // map outside the viewport. Reuse persisted coordinates only when they
+      // cover the whole current graph; otherwise use the deterministic layout.
+      const savedPositions = positions.size === canvasGraph.entities.length ? positions : new Map<number, GraphPosition>();
+      const fallbackPositions = new Map<number, GraphPosition>();
+      canvasGraph.entities.forEach((entity, index) => {
+        const position = savedPositions.get(entity.id);
+        fallbackPositions.set(entity.id, position && Number.isFinite(position.x) && Number.isFinite(position.y)
+          ? position
+          : { x: (index % 6) * 220, y: Math.floor(index / 6) * 170 });
+      });
+      cy=cytoscape({container:containerRef.current,minZoom:.12,maxZoom:2.5,userZoomingEnabled:true,wheelSensitivity:0.18,
+        layout:{name:'preset'},
+        elements:[...canvasGraph.entities.map(e=>{const visual=entityVisual(e, degreeByEntityId.get(e.id) ?? 0, canvasGraph.entities.length); const danglingNode=e.name.startsWith('미확인 대상 #'); return {data:{id:`n${e.id}`,entityId:e.id,dangling:danglingNode?1:0,
+          // Keep the canvas label to the entity name. Type is encoded by the
+          // shape and legend; repeating it in every node made dense graphs
+          // wrap into two lines and hid the relationship labels.
+          label:e.name,color:visual.border,fill:visual.fill,opacity:visual.opacity,width:visual.size + (e.type === 'character' ? 20 : 0),height:e.type === 'character' ? visual.size + 20 : 88,kind:e.type,degree:degreeByEntityId.get(e.id) ?? 0},position:fallbackPositions.get(e.id)};}),
+          ...representativeRelations.map(({pairKey, members, representative:r})=>{
+            const relationTypes = new Set(members.map(member => member.type));
+            const directions = new Set(members.map(member => `${member.source_entity_id}>${member.target_entity_id}`));
+            const bidirectional = directions.size > 1;
+            const weak = members.every(member => member.is_weak);
+            const conflict = conflictingPairs.has(pairKey);
+            const broken = explicitBreakPairs.has(pairKey);
+            const changed = changedPairs.has(pairKey);
+            const gap = gapPairs.has(pairKey);
+            const backbone = backboneIds.has(r.id);
+            const label = trimmedLabelIds.has(r.id)
+              ? `${r.type==='관계'?'유형 미분류':(r.display_label||r.type)}${members.length > 1 ? ` · ${members.length}개` : ''}`
+              : (members.length > 1 ? `관계 후보 ${members.length}개` : '');
+            return {data:{id:`r${r.id}`,relationId:r.id,source:`n${r.source_entity_id}`,target:`n${r.target_entity_id}`,
+              label,arrow:relationTypes.has('관계') && relationTypes.size === 1?'none':'triangle',
+              // A small deterministic bow keeps unrelated cross-links from
+              // collapsing into one straight stroke in dense networks.
+              curve:(((r.id * 37) % 5) - 2) * 26,
+              color:broken?'#AD443B':conflict?'#AD443B':changed?'#8A5A20':gap?'#B58A4D':(weak?'#A2ABA5':relationTone(r.type)),weak:weak?1:0,generic:relationTypes.size === 1 && (relationTypes.has('관계')||relationTypes.has('관련')||relationTypes.has('co_occurs')),conflict:conflict?1:0,broken:broken?1:0,changed:changed?1:0,gap:gap?1:0,bidirectional:bidirectional?1:0,
+              dangling:members.some(member => isDanglingRelation(member, new Set(canvasGraph.entities.map(entity => entity.id))))?1:0,backbone:backbone?1:0,candidateCount:members.length,relationIds:members.map(member => member.id)}};
+          })],
+        style:[
+          {selector:'node',style:{shape:'round-rectangle',width:('data(width)' as unknown) as number,height:('data(height)' as unknown) as number,'background-color':'data(fill)','background-opacity':('data(opacity)' as unknown) as number,'border-color':'data(color)','border-width':1.5,label:'data(label)',color:'#252A27','font-family':'Pretendard, sans-serif','font-size':16,'font-weight':600,'text-wrap':'wrap','text-max-width':'140px','text-valign':'center','text-halign':'center','line-height':1.5,'overlay-opacity':0}},
+          {selector:'node[kind="character"]',style:{shape:'ellipse','border-width':2}},
+          // Shape carries the entity type so a dense map can be scanned
+          // without relying on color or opening every inspector card.
+          {selector:'node[kind="item"]',style:{shape:'round-rectangle','border-width':1.8}},
+          {selector:'node[kind="rule"]',style:{shape:'rectangle','border-width':1.8}},
+          {selector:'node[kind="event"]',style:{shape:'diamond','border-width':1.8}},
+          {selector:'node[kind="foreshadowing"]',style:{shape:'hexagon','border-width':1.8}},
+          {selector:'node[dangling=1]',style:{'border-color':'#AD443B','border-style':'dashed','background-color':'#FFF0EE','color':'#AD443B','font-size':13,'font-weight':700,'text-max-width':'120px'}},
+          {selector:'edge',style:{label:'data(label)',width:1.8,'line-color':'data(color)','target-arrow-color':'data(color)','target-arrow-shape':'triangle','arrow-scale':.85,'curve-style':'unbundled-bezier','control-point-distances':'data(curve)','control-point-weights':.5,'font-family':'Pretendard, sans-serif','font-size':13,color:'#465650','text-wrap':'wrap','text-max-width':'112px','text-background-color':'#FFFDF8','text-background-opacity':.96,'text-background-padding':'5px','text-border-color':'#DADFD8','text-border-width':1,'text-border-opacity':.6,'text-margin-y':-5,'overlay-opacity':0}},
+          {selector:'edge[backbone=1]',style:{width:2.8,'line-color':'data(color)','target-arrow-color':'data(color)','font-weight':600,'z-index':4}},
+          {selector:'edge[arrow="none"]',style:{'target-arrow-shape':'none'}},
+          {selector:'edge[weak=1]',style:{'line-style':'dashed'}},
+          {selector:'edge[generic=1]',style:{'line-style':'dotted','line-color':'#B58A4D','target-arrow-color':'#B58A4D',color:'#8A5A20'}},
+          {selector:'edge[conflict=1]',style:{width:3,'line-color':'#AD443B','target-arrow-color':'#AD443B','line-style':'dashed','font-weight':700}},
+          {selector:'edge[broken=1]',style:{width:3.2,'line-color':'#AD443B','target-arrow-color':'#AD443B','line-style':'solid','font-weight':700,'z-index':21}},
+          {selector:'edge[dangling=1]',style:{width:2.8,'line-color':'#AD443B','target-arrow-color':'#AD443B','line-style':'dashed','font-weight':700,'z-index':19}},
+          {selector:'edge[changed=1]',style:{width:2.6,'line-color':'#8A5A20','target-arrow-color':'#8A5A20','line-style':'dashed','font-weight':600}},
+          {selector:'edge[gap=1]',style:{width:2.4,'line-color':'#B58A4D','target-arrow-color':'#B58A4D','line-style':'dotted','font-weight':600}},
+          {selector:'edge[candidateCount > 1]',style:{'text-background-color':'#F6EADB','text-border-color':'#D5B67F','text-border-opacity':.9}},
+          {selector:'edge[bidirectional=1]',style:{'source-arrow-shape':'triangle','source-arrow-color':'data(color)','arrow-scale':.75}},
+          {selector:'.muted',style:{opacity:.18,'text-opacity':.2}},
+          {selector:'node:selected',style:{'border-width':3,'border-color':'#24635B','underlay-color':'#24635B','underlay-opacity':.1,'underlay-padding':8}},
+          {selector:'edge:selected',style:{width:3,'line-color':'#24635B','target-arrow-color':'#24635B','font-weight':700,'z-index':20}},
+        ]});
+      cyRef.current=cy;
+      // Cytoscape is kept as a hidden interaction/indexing engine. Its fit
+      // zoom is in rendered pixels and is not the same scale as the SVG
+      // viewBox, so do not let its zoom events collapse the visible map to a
+      // 30% thumbnail.
+      cy.on('tap','node',event=>{callbacks.current.onSelectRelation?.(null);const entity=canvasGraph.entities.find(e=>e.id===event.target.data('entityId'));callbacks.current.onSelectEntity(entity?.name.startsWith('미확인 대상 #')?null:entity??null);});
+      cy.on('tap','edge',event=>{callbacks.current.onSelectEntity(null);callbacks.current.onSelectRelation?.(event.target.data('relationId'));});
+      cy.on('tap',event=>{if(event.target===cy){callbacks.current.onSelectEntity(null);callbacks.current.onSelectRelation?.(null);}});
+      // Filter changes create a new composition. Never restore the old 36% grid viewport.
+      fit();
+      requestAnimationFrame(fit);
+      settleTimer = window.setTimeout(fit, 120);
+      observer=new ResizeObserver(fit);observer.observe(containerRef.current);
+    }catch(error){setRenderError(error instanceof Error?error.message:'관계 지도를 표시하지 못했습니다.');}
+    return ()=>{observer?.disconnect();if(settleTimer!==undefined)window.clearTimeout(settleTimer);cy?.destroy();if(cyRef.current===cy)cyRef.current=null;};
+  },[canvasGraph,shown,positions,projectId,visible]);
+  useEffect(()=>{
+    const cy=cyRef.current;if(!cy)return;
+    cy.elements().removeClass('muted diagnostic-muted');cy.elements().unselect();
+    if (issuesOnly) {
+      const issueEdges = cy.edges().filter((edge) =>
+        Number(edge.data('weak')) === 1 ||
+        Number(edge.data('generic')) === 1 ||
+        Number(edge.data('conflict')) === 1 ||
+        Number(edge.data('broken')) === 1 ||
+        Number(edge.data('changed')) === 1 ||
+        Number(edge.data('gap')) === 1 ||
+        Number(edge.data('dangling')) === 1,
+      );
+      cy.edges().difference(issueEdges).addClass('diagnostic-muted');
+      cy.nodes().filter((node) => node.connectedEdges().intersection(issueEdges).empty()).addClass('diagnostic-muted');
     }
-    let cancelled = false;
-    let layout: cytoscape.Layouts | null = null;
-    let mountedCy: Core | null = null;
-    const frameId = window.requestAnimationFrame(() => {
-      if (cancelled || !containerRef.current) {
+    if(selectedRelationId!=null){
+      const edge=cy.getElementById(`r${selectedRelationId}`);
+      const representative=edge.nonempty() ? edge : cy.edges().filter((candidate) => ((candidate.data('relationIds') as number[] | undefined) ?? []).includes(selectedRelationId));
+      if(representative.nonempty()){
+        representative.select();
+        const neighbourhood = representative.union(representative.connectedNodes());
+        cy.elements().difference(neighbourhood).addClass('muted');
+        // Selecting a health metric must reveal the actual problematic edge,
+        // even when the full map was fitted to a large manuscript.
+        cy.animate({
+          center: { eles: neighbourhood },
+          zoom: Math.max(cy.zoom(), 0.72),
+        }, { duration: 220 });
         return;
       }
-      const elements = [
-        ...graph.entities.map((entity) => {
-          const clusterSize = membershipByOrganizationId.get(entity.id)?.size ?? 0;
-          const parentOrganizationId = parentOrganizationByEntityId.get(entity.id);
-          const isContainer = entity.type === "organization" && clusterSize > 0;
-          const visual = entityVisual(
-            entity,
-            degreeByEntityId.get(entity.id) ?? 0,
-            clusterSize,
-          );
-          return {
-            data: {
-              id: `entity-${entity.id}`,
-              parent: parentOrganizationId ? `entity-${parentOrganizationId}` : undefined,
-              label: shortEntityLabel(entity.name),
-              fullLabel: entity.name,
-              type: entity.type,
-              isContainer: isContainer ? "yes" : "no",
-              isMember: parentOrganizationId ? "yes" : "no",
-              state: entity.appearance_state,
-              fill: visual.fill,
-              border: visual.border,
-              opacity: visual.opacity,
-              size: visual.size,
-              weight: visual.weight,
-              clusterSize,
-            },
-            position: isContainer ? undefined : nodePositions.get(entity.id),
-          };
-        }),
-        ...graph.relations.map((relation) => {
-          const membership = isMembershipRelation(relation);
-          const displayLabel = relation.display_label || (relation.type === "co_occurs" ? "" : relation.type);
-          const isWeak = relation.is_weak || relation.type === "co_occurs";
-          const strength = clamp(relation.strength ?? relation.confidence ?? 0.55, 0.05, 1);
-          return {
-            data: {
-              id: `relation-${relation.id}`,
-              source: `entity-${relation.source_entity_id}`,
-              target: `entity-${relation.target_entity_id}`,
-              label: relation.type,
-              displayLabel: membership ? "" : displayLabel ? shortRelationLabel(displayLabel) : "",
-              confidence: clamp(relation.confidence ?? 0.55, 0.05, 1),
-              strength,
-              weak: isWeak,
-              color: relationTone(relation.type),
-              arrowShape: isWeak || membership ? "none" : "triangle",
-              lineStyle: relation.is_recent ? "solid" : "dashed",
-              aggregate: relation.id < 0 ? "yes" : "no",
-              relationKind: membership ? "membership" : "normal",
-            },
-          };
-        }),
-      ];
-
-      if (cyRef.current) {
-        cyRef.current.stop(true, true);
-        cyRef.current.elements().stop(true, true);
-        cyRef.current.destroy();
-        cyRef.current = null;
-      }
-      const cy = cytoscape({
-        container: containerRef.current,
-        elements,
-        style: [
-          {
-            selector: "node",
-            style: {
-              "background-color": "data(fill)",
-              "border-color": "data(border)",
-              "border-width": (element: cytoscape.NodeSingular) =>
-                1.4 + Number(element.data("weight") ?? 0.2) * 2.2,
-              opacity: (element: cytoscape.NodeSingular) => Number(element.data("opacity") ?? 1),
-              label: "data(label)",
-              color: "#242936",
-              "font-size": 12,
-              "font-weight": 700,
-              "text-valign": "bottom",
-              "text-margin-y": 9,
-              "text-background-color": "#f8f4ec",
-              "text-background-opacity": 0.86,
-              "text-background-padding": "3px",
-              "text-border-color": "#eadfce",
-              "text-border-opacity": 0.65,
-              "text-border-width": 1,
-              width: "data(size)",
-              height: "data(size)",
-              "z-index": 12,
-              "overlay-opacity": 0,
-            },
-          },
-          {
-            selector: "node[state = 'new']",
-            style: {
-              "border-width": 4,
-              "underlay-color": "#c78635",
-              "underlay-padding": 6,
-              "underlay-opacity": 0.16,
-            },
-          },
-          {
-            selector: "node[type = 'organization']",
-            style: {
-              shape: "round-rectangle",
-              color: "#fffdf8",
-              "font-size": 13,
-              "font-weight": 800,
-              "text-valign": "center",
-              "text-margin-y": 0,
-              "text-background-opacity": 0,
-              "text-border-opacity": 0,
-            },
-          },
-          {
-            selector: "node[isContainer = 'yes']",
-            style: {
-              shape: "round-rectangle",
-              "background-opacity": 0.14,
-              "border-width": 2.4,
-              "border-style": "solid",
-              color: "data(border)",
-              "font-size": 15,
-              "font-weight": 800,
-              "text-valign": "top",
-              "text-halign": "center",
-              "text-margin-y": -18,
-              "text-background-color": "#fffdf8",
-              "text-background-opacity": 0.9,
-              "text-background-padding": "5px",
-              "text-border-color": "#eadfce",
-              "text-border-opacity": 0.8,
-              "text-border-width": 1,
-              padding: "68px",
-              "z-index": 1,
-            },
-          },
-          {
-            selector: "node[isMember = 'yes']",
-            style: {
-              "z-index": 18,
-              "text-background-opacity": 0.94,
-            },
-          },
-          {
-            selector: "node:selected",
-            style: {
-              "border-width": 4,
-              "border-color": "#2a241f",
-              "underlay-color": "#6b5b49",
-              "underlay-padding": 9,
-              "underlay-opacity": 0.2,
-              "underlay-shape": "ellipse",
-            },
-          },
-          {
-            selector: "edge",
-            style: {
-              width: (element: cytoscape.EdgeSingular) =>
-                0.8 + Number(element.data("strength") ?? 0.55) * 3.7,
-              opacity: (element: cytoscape.EdgeSingular) =>
-                element.data("weak")
-                  ? 0.16
-                  : 0.24 + Number(element.data("strength") ?? 0.55) * 0.55,
-              label: "data(displayLabel)",
-              color: "#5f6470",
-              "font-size": 9,
-              "font-weight": 600,
-              "text-opacity": 0,
-              "text-rotation": "autorotate",
-              "text-margin-y": -8,
-              "text-background-color": "#f8f4ec",
-              "text-background-opacity": 0.72,
-              "text-background-padding": "2px",
-              "line-color": (element: cytoscape.EdgeSingular) => element.data("color"),
-              "target-arrow-color": (element: cytoscape.EdgeSingular) => element.data("color"),
-              "target-arrow-shape": (element: cytoscape.EdgeSingular): "triangle" | "none" =>
-                element.data("arrowShape") === "triangle" ? "triangle" : "none",
-              "line-style": (element: cytoscape.EdgeSingular): "solid" | "dashed" =>
-                element.data("lineStyle") === "dashed" ? "dashed" : "solid",
-              "curve-style": "bezier",
-              "control-point-step-size": 42,
-            },
-          },
-          {
-            selector: "edge[relationKind = 'membership']",
-            style: MEMBERSHIP_EDGE_STYLE,
-          },
-          {
-            selector: "edge[aggregate = 'yes']",
-            style: {
-              width: (element: cytoscape.EdgeSingular) =>
-                2.4 + Number(element.data("strength") ?? 0.55) * 4.4,
-              opacity: 0.88,
-              "text-opacity": 0.9,
-              "line-style": "solid",
-              "z-index": 8,
-            },
-          },
-          {
-            selector: ".dimmed",
-            style: {
-              opacity: 0.12,
-              "text-opacity": 0.1,
-            },
-          },
-          {
-            selector: "edge.hover, edge.spotlight",
-            style: {
-              opacity: 0.95,
-              "text-opacity": 1,
-              "z-index": 10,
-            },
-          },
-          {
-            selector: "node.spotlight",
-            style: {
-              opacity: 1,
-              "border-width": 4,
-              "z-index": 20,
-            },
-          },
-        ],
-        layout: { name: "preset" },
-        maxZoom: 2.6,
-        minZoom: 0.25,
-      });
-
-      const updateZoomLabel = () => setZoomLabel(`${Math.round(cy.zoom() * 100)}%`);
-      cy.on("zoom", updateZoomLabel);
-      cy.ready(updateZoomLabel);
-      cy.on("tap", "node", (event) => {
-        const rawId = String(event.target.id()).replace("entity-", "");
-        onSelectEntity(entitiesById.get(Number(rawId)) ?? null);
-      });
-      cy.on("tap", (event) => {
-        if (event.target === cy) {
-          onSelectEntity(null);
-        }
-      });
-      cy.on("dragfree", "node", () => {
-        writeGraphPositions(projectId, collectCurrentNodePositions(cy));
-      });
-      cy.on("mouseover", "edge", (event) => event.target.addClass("hover"));
-      cy.on("mouseout", "edge", (event) => event.target.removeClass("hover"));
-
-      cyRef.current = cy;
-      mountedCy = cy;
-      layout = cy.layout(GRAPH_LAYOUT);
-      layout.run();
-      applyFocus(cy, selectedEntityId);
-      if (selectedEntityId !== null) {
-        cy.$id(`entity-${selectedEntityId}`).select();
-      }
+    }
+    if(selectedEntityId===null)return;
+    const node=cy.getElementById(`n${selectedEntityId}`);if(node.empty())return;
+    if (focusedComponent) {
+      // A component overview is an inspection mode: keep every member at
+      // full opacity so the writer can read the whole structure at once.
+      node.select();
+      return;
+    }
+    node.select();const neighbours=node.closedNeighborhood();cy.elements().difference(neighbours).addClass('muted');
+  },[selectedEntityId,selectedRelationId,shown,focusedComponent,issuesOnly]);
+  // The native macOS WebView has a reproducible case where Cytoscape creates
+  // its canvas but does not paint it after a hidden-route mount. Keep the
+  // Cytoscape instance for its mature hit testing/selection model, while the
+  // visible map is rendered from the same data through a deterministic SVG.
+  // This also gives us a renderer that is inspectable and reliable in a
+  // packaged desktop build instead of depending on a GPU canvas repaint.
+  const svgRelations = useMemo(() => {
+    const seen = new Set<string>();
+    return aggregateRelationshipPairs(canvasGraph.relations).flatMap(({ pairKey, members }) => {
+      if (seen.has(pairKey)) return [];
+      seen.add(pairKey);
+      const representative = [...members].sort((left, right) => (right.confidence ?? 0) - (left.confidence ?? 0) || left.id - right.id)[0];
+      return representative ? [{ pairKey, members, representative }] : [];
     });
-
-    return () => {
-      cancelled = true;
-      window.cancelAnimationFrame(frameId);
-      layout?.stop();
-      if (mountedCy) {
-        mountedCy.stop(true, true);
-        mountedCy.elements().stop(true, true);
-        mountedCy.destroy();
-        if (cyRef.current === mountedCy) {
-          cyRef.current = null;
-        }
-      }
-    };
-  }, [
-    degreeByEntityId,
-    entitiesById,
-    graph,
-    membershipByOrganizationId,
-    nodePositions,
-    onSelectEntity,
-    parentOrganizationByEntityId,
-    projectId,
-  ]);
-
-  useEffect(() => {
-    const cy = cyRef.current;
-    if (!cy) {
+  }, [canvasGraph.relations]);
+  const svgMetrics = useMemo(() => {
+    const values = [...positions.values()].filter(position => Number.isFinite(position.x) && Number.isFinite(position.y));
+    if (!values.length) return { minX: -400, maxX: 400, minY: -240, maxY: 240, centerX: 0, centerY: 0, width: 800, height: 480 };
+    const minX = Math.min(...values.map(position => position.x)) - 150;
+    const maxX = Math.max(...values.map(position => position.x)) + 150;
+    const minY = Math.min(...values.map(position => position.y)) - 120;
+    const maxY = Math.max(...values.map(position => position.y)) + 120;
+    return { minX, maxX, minY, maxY, centerX: (minX + maxX) / 2, centerY: (minY + maxY) / 2, width: Math.max(800, maxX - minX), height: Math.max(480, maxY - minY) };
+  }, [positions]);
+  const svgViewBox = useMemo(() => {
+    const scale = clamp(zoom / 100, 0.55, 2.8);
+    return `${svgMetrics.centerX - svgMetrics.width / (2 * scale) + pan.x} ${svgMetrics.centerY - svgMetrics.height / (2 * scale) + pan.y} ${svgMetrics.width / scale} ${svgMetrics.height / scale}`;
+  }, [svgMetrics, zoom, pan]);
+  const fit=()=>{const cy=cyRef.current;if(cy){const fitPadding=Math.max(20,Math.min(56,Math.min(cy.width(),cy.height())*.09));cy.fit(cy.elements(),fitPadding);const readableFloor=shown.entities.length>36?.22:.24;if(cy.zoom()>1.15)cy.zoom(1.15);if(cy.zoom()<readableFloor)cy.zoom(readableFloor);cy.center();}setZoom(100);setPan({x:0,y:0});};
+  const changeZoom=(factor:number)=>{const cy=cyRef.current;if(cy)cy.zoom({level:Math.min(2.5,Math.max(.12,cy.zoom()*factor)),renderedPosition:{x:cy.width()/2,y:cy.height()/2}});setZoom(value=>Math.round(clamp(value*factor,55,280)));};
+  // macOS trackpad pinch gestures arrive in WebKit as a wheel event with a
+  // modifier key. The visible map is an SVG (Cytoscape is intentionally a
+  // hidden hit-testing engine), so the browser's native zoom would otherwise
+  // be applied to the whole page while the SVG stayed unchanged. Two-finger
+  // scrolling over the map is handled as panning so the fixed graph viewport
+  // never leaks the gesture into page scrolling.
+  const handleTrackpadZoom=(event: React.WheelEvent<HTMLDivElement>)=>{
+    if(event.ctrlKey || event.metaKey){
+      event.preventDefault();
+      const factor=trackpadZoomFactor(event.deltaY);
+      if(Number.isFinite(factor) && factor > 0) changeZoom(factor);
       return;
     }
-    cy.nodes().unselect();
-    applyFocus(cy, selectedEntityId);
-    if (selectedEntityId !== null) {
-      cy.$id(`entity-${selectedEntityId}`).select();
+    if(!Number.isFinite(event.deltaX) || !Number.isFinite(event.deltaY) || (event.deltaX===0 && event.deltaY===0))return;
+    event.preventDefault();
+    const rect=event.currentTarget.getBoundingClientRect();
+    // Wheel events can arrive faster than React commits state. Use a
+    // functional update so consecutive two-finger deltas accumulate instead
+    // of each event reading the same stale pan value.
+    setPan(currentPan => graphPanOffset(currentPan,{x:event.deltaX,y:event.deltaY},{width:rect.width,height:rect.height},svgMetrics,zoom/100));
+  };
+  const handlePointerDown=(event: React.PointerEvent<HTMLDivElement>)=>{
+    if(event.button!==0)return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    panGesture.current={startX:event.clientX,startY:event.clientY,startPan:pan,active:true,dragged:false};
+  };
+  const handlePointerMove=(event: React.PointerEvent<HTMLDivElement>)=>{
+    const gesture=panGesture.current;if(!gesture?.active)return;
+    const delta={x:event.clientX-gesture.startX,y:event.clientY-gesture.startY};
+    if(Math.hypot(delta.x,delta.y)>4)gesture.dragged=true;
+    const rect=event.currentTarget.getBoundingClientRect();
+    setPan(graphPanOffset(gesture.startPan,delta,{width:rect.width,height:rect.height},svgMetrics,zoom/100));
+  };
+  const handlePointerUp=(event: React.PointerEvent<HTMLDivElement>)=>{
+    if(!panGesture.current?.active)return;
+    panGesture.current.active=false;
+    // `lostpointercapture` may have already released this pointer. Guard the
+    // explicit release so a trailing pointerup cannot throw and interrupt
+    // the next graph gesture.
+    if(event.currentTarget.hasPointerCapture?.(event.pointerId)){
+      event.currentTarget.releasePointerCapture(event.pointerId);
     }
-  }, [selectedEntityId]);
-
-  const zoomGraph = useCallback((factor: number) => {
-    const cy = cyRef.current;
-    if (!cy) {
-      return;
-    }
-    const container = cy.container();
-    const level = clamp(cy.zoom() * factor, cy.minZoom(), cy.maxZoom());
-    cy.animate(
-      {
-        zoom: {
-          level,
-          renderedPosition: {
-            x: (container?.clientWidth ?? 0) / 2,
-            y: (container?.clientHeight ?? 0) / 2,
-          },
-        },
-      },
-      { duration: 180, easing: "ease-out-cubic" },
-    );
-  }, []);
-
-  const fitGraph = useCallback(() => {
-    const cy = cyRef.current;
-    if (!cy) {
-      return;
-    }
-    cy.animate({ fit: { eles: cy.elements(), padding: 112 } }, { duration: 180, easing: "ease-out-cubic" });
-    applyFocus(cy, selectedEntityId);
-  }, [selectedEntityId]);
-
-  const resetGraphLayout = useCallback(() => {
-    clearGraphPositions(projectId);
-    setLayoutResetNonce((current) => current + 1);
-  }, [projectId]);
-
-  if (graph.entities.length === 0) {
-    return (
-      <div className="empty-graph">
-        <h2>아직 그래프가 없습니다</h2>
-        <p>원고를 추가한 뒤 분석을 실행하면 인물, 장소, 조직, 아이템, 떡밥 관계가 표시됩니다.</p>
-      </div>
-    );
-  }
-
-  return (
-    <div className="graph-stage">
-      <div ref={containerRef} className="graph-canvas" />
-      <div className="graph-hud" aria-label="그래프 확대 축소">
-        <button type="button" onClick={() => zoomGraph(1.18)} title="확대">
-          <ZoomIn size={16} />
-        </button>
-        <span>{zoomLabel}</span>
-        <button type="button" onClick={() => zoomGraph(0.84)} title="축소">
-          <ZoomOut size={16} />
-        </button>
-        <button type="button" onClick={fitGraph} title="그래프 맞춤">
-          <Maximize2 size={16} />
-        </button>
-        <button type="button" onClick={resetGraphLayout} title="자동 배치로 초기화">
-          <RotateCcw size={16} />
-        </button>
+  };
+  const consumeMapDrag=()=>{
+    if(!panGesture.current?.dragged)return false;
+    panGesture.current.dragged=false;
+    return true;
+  };
+  return <div className={`graph-stage relationship-stage${mapFocus?" map-focus-active":""}`}>
+    <details className="graph-health-disclosure">
+      <summary>관계 점검 · {healthLevel === 'good' ? '안정' : healthLevel === 'danger' ? '주의 필요' : '확인 필요'}<span>{[
+        health.isolated_entity_count && `고립 후보 ${health.isolated_entity_count}`,
+        health.conflicting_pair_count && `충돌 ${health.conflicting_pair_count}`,
+        health.changed_relation_count && `변화 ${health.changed_relation_count}`,
+        health.gap_relation_count && `중간 공백 ${health.gap_relation_count}`,
+        health.explicit_break_count && `명시적 단절 ${health.explicit_break_count}`,
+        health.dangling_relation_count && `끊긴 끝점 ${health.dangling_relation_count}`,
+        health.unsupported_relation_count && `근거 부족 ${health.unsupported_relation_count}`,
+        health.generic_relation_count && `미분류 ${health.generic_relation_count}`,
+      ].filter(Boolean).join(' · ') || '점검 항목 보기'}</span></summary>
+    <div className="graph-health" role="status" aria-live="polite" aria-label="관계 건강도">
+      <div><strong>관계 건강도 <span className={`health-state ${healthLevel}`}>{healthLevel === "danger" ? "주의 필요" : healthLevel === "warn" ? "확인 필요" : "안정"}</span></strong><span>{health.message}</span></div>
+      <div className="graph-health-metrics">
+        <span className="health-good">연결 대상 {health.connected_entity_count}</span>
+        <span className={health.component_count > 1 ? "health-warn" : "health-good"}>분리된 망 {health.component_count}</span>
+        <span className={health.isolated_entity_count ? "health-warn" : "health-good"}>고립 후보 {health.isolated_entity_count}</span>
+        <button type="button" disabled={!issueRelations.unsupported} className={health.unsupported_relation_count ? "health-warn" : "health-good"} onClick={() => focusIssueRelation(issueRelations.unsupported)}>근거 부족 {health.unsupported_relation_count}</button>
+        <button type="button" disabled={!issueRelations.generic} className={health.generic_relation_count ? "health-warn" : "health-good"} onClick={() => focusIssueRelation(issueRelations.generic)}>미분류 관계 {health.generic_relation_count}</button>
+        <button type="button" disabled={!issueRelations.conflict} className={health.conflicting_pair_count ? "health-danger" : "health-good"} onClick={() => focusIssueRelation(issueRelations.conflict)}>충돌 {health.conflicting_pair_count}</button>
+        <button type="button" disabled={!issueRelations.changed} className={health.changed_relation_count ? "health-warn" : "health-good"} onClick={() => focusIssueRelation(issueRelations.changed)}>변화 {health.changed_relation_count}</button>
+        <button type="button" disabled={!issueRelations.gap} className={health.gap_relation_count ? "health-warn" : "health-good"} onClick={() => focusIssueRelation(issueRelations.gap)}>중간 공백 {health.gap_relation_count}</button>
+        <button type="button" disabled={!issueRelations.explicitBreak} className={health.explicit_break_count ? "health-danger" : "health-good"} onClick={() => focusIssueRelation(issueRelations.explicitBreak)}>명시적 단절 {health.explicit_break_count}</button>
+        <button type="button" disabled={!issueRelations.dangling} className={health.dangling_relation_count ? "health-danger" : "health-good"} onClick={() => focusIssueRelation(issueRelations.dangling)}>끊긴 끝점 {health.dangling_relation_count}</button>
       </div>
     </div>
-  );
-}
-
-function applyFocus(cy: Core, selectedEntityId: number | null) {
-  cy.elements().removeClass("dimmed spotlight");
-  if (selectedEntityId === null) {
-    return;
-  }
-  const selected = cy.$id(`entity-${selectedEntityId}`);
-  if (selected.empty()) {
-    return;
-  }
-  const connectedEdges = selected.connectedEdges();
-  const connectedNodes = connectedEdges.connectedNodes();
-  const parent = selected.parent();
-  const children = selected.descendants();
-  const siblings = parent.length > 0 ? parent.children() : cy.collection();
-  const focusNodes = selected.union(connectedNodes).union(parent).union(children).union(siblings);
-  const focusEdges = connectedEdges.union(focusNodes.connectedEdges());
-  cy.elements().addClass("dimmed");
-  focusNodes.removeClass("dimmed").addClass("spotlight");
-  focusEdges.removeClass("dimmed").addClass("spotlight");
+    </details>
+    {components.length > 1 && <div className="network-components" aria-label="분리된 관계망 선택">
+      <span className="network-components-label">분리된 관계망</span>
+      {components.map((component, index) => {
+        const anchor = component.anchorId;
+        const anchorEntity = graph.entities.find((entity) => entity.id === anchor);
+        const componentIssueCount = component.relationIds.filter((relationId) => issueRelationIds.has(relationId)).length;
+        const active = focusedComponent?.anchorId === anchor;
+        return <button type="button" key={`${anchor}-${index}`} className={active ? "active" : undefined} aria-pressed={active} onClick={() => {
+          setFocusId(null);
+          setFocusComponentAnchorId(anchor);
+          callbacks.current.onSelectRelation?.(null);
+          callbacks.current.onSelectEntity(anchorEntity ?? null);
+        }}>
+          <strong>망 {index + 1}</strong>
+          <span>{component.entityIds.length}개 대상 · {component.relationIds.length}개 관계{componentIssueCount > 0 ? ` · 문제 ${componentIssueCount}` : ""}</span>
+        </button>;
+      })}
+    </div>}
+    <div className="network-heading"><div><span className="network-eyebrow">STORY CONNECTIONS</span><strong>{focusedComponent?`망 ${networkComponents.findIndex((component) => component.anchorId === focusComponentAnchorId) + 1} 전체` : focused?`${network.entities.find(e=>e.id===focusId)?.name}의 주변 관계`:'이야기의 연결'}</strong><span>{shown.entities.length}개 대상 · {shown.relations.length}개 관계 후보</span></div>
+      <div className="network-heading-actions">
+        <button className="map-focus-toggle" aria-pressed={mapFocus} onClick={()=>setMapFocus(value=>!value)}>{mapFocus?'필터와 제목 다시 보기':'지도 넓게 보기'}</button>
+        <button className={issuesOnly ? 'active' : ''} aria-pressed={issuesOnly} onClick={()=>setIssuesOnly(value=>!value)}>{issuesOnly ? '전체 관계 보기' : '문제 관계만 강조'}</button>
+        {(focused || focusedComponent)?<button onClick={()=>{setFocusId(null);setFocusComponentAnchorId(null);callbacks.current.onSelectEntity(null);callbacks.current.onSelectRelation?.(null);}}>관계망 전체로</button>:<button disabled={!selected || !network.entities.some(e=>e.id===selected.id)} onClick={()=>{setFocusComponentAnchorId(null);setFocusId(selectedEntityId);}}>선택 대상 주변만</button>}
+      </div>
+    </div>
+    <details className="network-help"><summary>지도 읽는 법 · 관계선 범례</summary>
+    <div className="network-source">{shown.relations.some(r=>r.origin==='gpt')?'GPT 추출 포함':'로컬 추출'} · 원문으로 확인할 후보입니다. 선을 누르면 근거가 열립니다. 굵은 청록 선은 근거가 높은 주요 연결을 읽기 쉽게 표시한 백본입니다.{shown.relations.some(r=>r.type==='관계')&&' ‘유형 미분류’는 관계 의미가 분석되지 않은 연결입니다.'}{health.conflicting_pair_count>0&&' ‘충돌 후보’는 양립하기 어려운 술어가 함께 추출된 상태이며 시간 순서·예외는 원문에서 확인합니다.'}{shown.relations.length>14&&' 캔버스에는 대표 관계 라벨만 표시하며 전체 후보는 오른쪽 목록에서 확인합니다.'}</div>
+    <div className="network-legend" aria-label="관계선 범례">
+      <span><i className="legend-line confirmed"/>근거 확인</span>
+      <span><i className="legend-line backbone"/>주요 연결</span>
+      <span><i className="legend-line review"/>확인 필요</span>
+      <span><i className="legend-line changed"/>회차 변화</span>
+      <span><i className="legend-line gap"/>중간 공백 후보</span>
+      <span><i className="legend-line broken"/>명시적 단절</span>
+      <span><i className="legend-line conflict"/>충돌 후보</span>
+      <span><i className="legend-line dangling"/>끊긴 끝점</span>
+    </div>
+    </details>
+    <div className="network-viewport" onWheel={handleTrackpadZoom} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onLostPointerCapture={handlePointerUp} aria-label="관계 지도. 드래그로 이동하고 트랙패드 핀치 또는 확대·축소 버튼으로 크기를 조절할 수 있습니다.">
+      <svg className="network-svg" role="img" aria-label="인물과 설정의 관계망" viewBox={svgViewBox} preserveAspectRatio="xMidYMid meet">
+        <defs><marker id="story-guard-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8790a0"/></marker></defs>
+        <g className="network-svg-edges">
+          {svgRelations.map(({ pairKey, members, representative: relation }) => {
+            const source = positions.get(relation.source_entity_id); const target = positions.get(relation.target_entity_id);
+            if (!source || !target) return null;
+            const selected = members.some(member => member.id === selectedRelationId);
+            const issue = issueRelationIds.has(relation.id) || members.some(member => issueRelationIds.has(member.id));
+            const color = explicitBreakPairs.has(pairKey) || conflictingPairs.has(pairKey) ? '#AD443B' : changedPairs.has(pairKey) ? '#8A5A20' : gapPairs.has(pairKey) ? '#B58A4D' : relationTone(relation.type);
+            const marker = relation.type === '관계' || relation.type === '관련' ? undefined : 'url(#story-guard-arrow)';
+            const dx = target.x - source.x; const dy = target.y - source.y; const length = Math.max(1, Math.hypot(dx, dy));
+            const nx = -dy / length; const ny = dx / length; const curve = (((relation.id * 37) % 5) - 2) * 18;
+            const cx = (source.x + target.x) / 2 + nx * curve; const cy = (source.y + target.y) / 2 + ny * curve;
+            return <g key={`svg-edge-${pairKey}`} className={selected ? 'svg-edge selected' : issue ? 'svg-edge issue' : 'svg-edge'} onClick={() => { if(consumeMapDrag())return; onSelectEntity(null); onSelectRelation?.(relation.id); }}>
+              <path d={`M ${source.x} ${source.y} Q ${cx} ${cy} ${target.x} ${target.y}`} fill="none" stroke={selected ? '#24635B' : color} strokeWidth={selected ? 5 : issue ? 3.2 : 2.2} strokeDasharray={relation.is_weak ? '8 6' : undefined} markerEnd={marker}/>
+              {(relation.display_label || relation.type) && <text x={cx} y={cy - 8} textAnchor="middle" className="svg-edge-label">{members.length > 1 ? `${relation.display_label || relation.type} · ${members.length}` : (relation.display_label || relation.type)}</text>}
+            </g>;
+          })}
+        </g>
+        <g className="network-svg-nodes">
+          {canvasGraph.entities.map(entity => {
+            const position = positions.get(entity.id); if (!position) return null;
+            const degree = canvasGraph.relations.filter(relation => relation.source_entity_id === entity.id || relation.target_entity_id === entity.id).length;
+            const visual = entityVisual(entity, degree, canvasGraph.entities.length); const selected = entity.id === selectedEntityId; const dangling = entity.name.startsWith('미확인 대상 #');
+            const width = entity.type === 'character' ? visual.size + 20 : visual.size + 12; const height = entity.type === 'character' ? visual.size + 20 : 70;
+            const fill = dangling ? '#FFF0EE' : visual.fill; const border = dangling ? '#AD443B' : selected ? '#24635B' : visual.border;
+            const lines = entity.name.match(/.{1,10}/g) ?? [entity.name];
+            return <g key={`svg-node-${entity.id}`} className={`svg-node ${selected ? 'selected' : ''}`} transform={`translate(${position.x} ${position.y})`} onClick={() => { if(consumeMapDrag())return; onSelectRelation?.(null); onSelectEntity(dangling ? null : entity); }}>
+              {entity.type === 'character' ? <ellipse rx={width / 2} ry={height / 2} fill={fill} fillOpacity={visual.opacity} stroke={border} strokeWidth={selected ? 4 : 2.2}/> : <rect x={-width / 2} y={-height / 2} width={width} height={height} rx={entity.type === 'event' ? 4 : 10} fill={fill} fillOpacity={visual.opacity} stroke={border} strokeWidth={selected ? 4 : 2}/>}
+              <text textAnchor="middle" className="svg-node-label">{lines.slice(0, 2).map((line, index) => <tspan key={index} x="0" dy={index === 0 ? (lines.length > 1 ? -5 : 5) : 16}>{line}</tspan>)}</text>
+            </g>;
+          })}
+        </g>
+      </svg>
+      <div ref={containerRef} className="network-canvas" aria-hidden="true"/>
+      {healthLevel !== "good" && (danglingRelations.length > 0 || unlinked.length > 0) && <div className={`network-alert ${healthLevel}`} role="status">
+        <strong>{healthLevel === "danger" ? "확인이 필요한 연결이 있습니다" : "관계망을 점검해 보세요"}</strong>
+        <span>{[
+          health.conflicting_pair_count && `충돌 ${health.conflicting_pair_count}`,
+          health.explicit_break_count && `명시적 단절 ${health.explicit_break_count}`,
+          health.dangling_relation_count && `끊긴 끝점 ${health.dangling_relation_count}`,
+          health.gap_relation_count && `중간 공백 ${health.gap_relation_count}`,
+          health.isolated_entity_count && `고립 후보 ${health.isolated_entity_count}`,
+          health.unsupported_relation_count && `근거 부족 ${health.unsupported_relation_count}`,
+          health.generic_relation_count && `미분류 관계 ${health.generic_relation_count}`,
+          health.changed_relation_count && `변화 ${health.changed_relation_count}`,
+        ].filter(Boolean).join(" · ")}</span>
+        {danglingRelations.length > 0 && <button type="button" onClick={() => setDanglingOpen(true)}>끊긴 관계 보기</button>}
+        {unlinked.length > 0 && <button type="button" onClick={() => setCandidatesOpen(true)}>고립 후보 보기</button>}
+      </div>}
+      {!shown.entities.length&&<div className="network-empty"><strong>아직 연결된 관계가 없습니다</strong><p>현재 범위의 후보는 아래에서 확인할 수 있습니다.<br/>분석 결과에 관계가 있어야 연결선이 표시됩니다.</p></div>}
+      {renderError&&<div className="network-empty" role="alert"><strong>관계 지도를 불러오지 못했습니다</strong><p>{renderError}</p><button onClick={()=>setRevision(v=>v+1)}>다시 시도</button></div>}
+      <div className="network-tools"><button aria-label="축소" onClick={()=>changeZoom(.8)}><ZoomOut size={18}/></button><span>{zoom}%</span><button aria-label="확대" onClick={()=>changeZoom(1.25)}><ZoomIn size={18}/></button><button onClick={fit}><Maximize2 size={17}/> 화면에 맞춤</button><button title="자동 배치 다시 실행" aria-label="자동 배치 다시 실행" onClick={()=>setRevision(v=>v+1)}><RotateCcw size={17}/></button></div>
+    </div>
+    <div className="network-access"><label>대상 탐색<select aria-label="관계 대상 선택" value={selectedEntityId??''} onChange={e=>{callbacks.current.onSelectRelation?.(null);onSelectEntity(graph.entities.find(n=>n.id===Number(e.target.value))??null);}}><option value="">인물·설정 선택</option>{graph.entities.map(e=><option key={e.id} value={e.id}>{TYPE_NAMES[e.type]} · {e.name}</option>)}</select></label>
+    {danglingRelations.length>0&&<button className="dangling-toggle" aria-expanded={danglingOpen} onClick={()=>setDanglingOpen(v=>!v)}>끊긴 관계 {danglingRelations.length}개 {danglingOpen?'접기':'보기'}</button>}
+    {unlinked.length>0&&<button aria-expanded={candidatesOpen} onClick={()=>setCandidatesOpen(v=>!v)}>고립 후보 {unlinked.length}개 {candidatesOpen?'접기':'보기'}</button>}</div>
+    {danglingOpen&&<div className="unlinked-candidates dangling-candidates"><p>끝점이 현재 작품 엔티티에 없습니다. 그래프 선으로 숨기지 않고 원인 확인 목록에 남겼습니다.</p><div>{danglingRelations.map(relation=><button className="dangling-row" key={relation.id} onClick={()=>{callbacks.current.onSelectEntity(null);callbacks.current.onSelectRelation?.(relation.id);}}><strong>{entityName(relation.source_entity_id)} → {entityName(relation.target_entity_id)}</strong><small>{relation.display_label || relation.type} · 원문 근거 {relation.evidence_chunk_ids.length ? '있음' : '없음'}</small></button>)}</div></div>}
+    {candidatesOpen&&<div className="unlinked-candidates"><p>현재 필터에서 연결이 없는 추출 후보입니다. 이름·분류의 정확성은 원문 확인이 필요합니다.</p><div>{unlinked.map(e=><button key={e.id} className={e.id===selectedEntityId?'selected':''} onClick={()=>{callbacks.current.onSelectRelation?.(null);onSelectEntity(e);}}><small>{TYPE_NAMES[e.type]}</small>{e.name}</button>)}</div></div>}
+  </div>;
 }

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
+
 import json
 from pathlib import Path
 from typing import Any
@@ -10,13 +12,84 @@ from backend.app.models import (
     AnalysisStatus,
     ContinuityIssue,
     EntityNode,
+    GraphHealth,
     GraphRange,
     GraphPayload,
     Project,
     RelationChange,
+    RelationTimelineEvent,
     RelationEdge,
     StoryDocument,
+    StorySetting,
+    ForeshadowingStatus,
 )
+
+
+def close_unfinished_windows(raw_details: str | None, message: str) -> str:
+    """Close diagnostics only; validated responses and their checkpoints stay intact."""
+    details = decode_json(raw_details)
+    for window in details:
+        for item in [window, *window.get('parts', [])]:
+            if item.get('status') == 'running':
+                item.update(status='interrupted', error=message)
+            elif item.get('status') == 'queued':
+                item.update(status='deferred')
+    return encode_json(details)
+
+
+def relation_types_conflict(types: set[str] | list[str] | tuple[str, ...]) -> bool:
+    """Return a conservative conflict candidate for opposing predicates.
+
+    This is intentionally lexical and review-oriented: chapter order,
+    negation scope, and later exceptions remain the author's decision.
+    """
+    labels = [str(value).strip().casefold() for value in types]
+    positive = any(
+        any(term in value for term in (
+            "동행", "협력", "동맹", "친구", "보호", "신뢰", "계약 체결", "소유함", "허용", "승인",
+            "ally", "friend", "protect", "trust", "agreed", "owns", "allows",
+        ))
+        for value in labels
+    )
+    negative = any(
+        any(term in value for term in (
+            "적대", "대립", "배신", "의심", "충돌", "거절", "계약 해지", "계약 파기", "계약 거부",
+            "계약 없이", "사용 불가", "금지", "소유하지", "enemy", "hostile", "betray", "suspect",
+            "conflict", "refus", "reject", "forbidden", "without",
+        ))
+        for value in labels
+    )
+    return positive and negative
+
+
+def _unambiguous_entity_term_index(entity_rows) -> tuple[dict[str, int], set[str]]:
+    """Build a term index without guessing through colliding aliases.
+
+    Short role labels are frequently shared by multiple entities.  Returning
+    those terms in ``ambiguous`` lets timeline and change calculations skip
+    them instead of attributing an event to whichever row happened to appear
+    first.
+    """
+    index: dict[str, int] = {}
+    ambiguous: set[str] = set()
+
+    def register(raw_term: object, entity_id: int) -> None:
+        term = str(raw_term).strip()
+        if not term or term in ambiguous:
+            return
+        previous = index.get(term)
+        if previous is None:
+            index[term] = entity_id
+        elif previous != entity_id:
+            ambiguous.add(term)
+            index.pop(term, None)
+
+    for row in entity_rows:
+        entity_id = int(row["id"])
+        register(row["name"], entity_id)
+        for alias in decode_json(row["aliases"]):
+            register(alias, entity_id)
+    return index, ambiguous
 
 
 class StoryRepository:
@@ -37,7 +110,15 @@ class StoryRepository:
     def list_projects(self) -> list[Project]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM projects ORDER BY updated_at DESC, id DESC"
+                """
+                SELECT p.*,
+                       (SELECT COUNT(*) FROM documents d WHERE d.project_id = p.id) AS document_count,
+                       (SELECT COUNT(*) FROM documents d WHERE d.project_id = p.id AND NOT EXISTS (SELECT 1 FROM document_analysis_cache c WHERE c.document_id = d.id AND c.content_hash = d.content_hash)) AS pending_document_count,
+                       (SELECT COUNT(*) FROM issues i WHERE i.project_id = p.id AND i.status = 'open') AS open_issue_count,
+                       (SELECT MAX(c.analyzed_at) FROM document_analysis_cache c WHERE c.project_id = p.id) AS last_analyzed_at
+                FROM projects p
+                ORDER BY p.updated_at DESC, p.id DESC
+                """
             ).fetchall()
         return [Project(**dict(row)) for row in rows]
 
@@ -73,8 +154,14 @@ class StoryRepository:
         content_hash: str,
         content: str,
         chapter_index: int = 0,
+        preserve_analysis: bool = False,
     ) -> StoryDocument:
         with self.database.connect() as connection:
+            # A newly imported chapter is a draft addition. Callers that want
+            # incremental analysis keep the published graph and decisions
+            # visible until a replacement analysis commits atomically.
+            if not preserve_analysis:
+                self.archive_review(connection, project_id)
             cursor = connection.execute(
                 """
                 INSERT INTO documents
@@ -153,6 +240,71 @@ class StoryRepository:
             documents.append(StoryDocument(**data))
         return documents
 
+    def list_story_settings(self, project_id: int) -> list[StorySetting]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM story_settings WHERE project_id = ? ORDER BY id",
+                (project_id,),
+            ).fetchall()
+        return [StorySetting(**dict(row)) for row in rows]
+
+    def add_story_setting(self, project_id: int, title: str, content: str, certainty: str) -> StorySetting:
+        with self.database.connect() as connection:
+            if connection.execute("SELECT 1 FROM projects WHERE id = ?", (project_id,)).fetchone() is None:
+                raise KeyError(project_id)
+            cursor = connection.execute(
+                "INSERT INTO story_settings(project_id,title,content,certainty) VALUES(?,?,?,?)",
+                (project_id, title.strip(), content.strip(), certainty),
+            )
+            row = connection.execute("SELECT * FROM story_settings WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        return StorySetting(**dict(row))
+
+    def update_story_setting(self, setting_id: int, title: str, content: str, certainty: str) -> StorySetting:
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT * FROM story_settings WHERE id = ?", (setting_id,)).fetchone()
+            if row is None:
+                raise KeyError(setting_id)
+            connection.execute(
+                "UPDATE story_settings SET title = ?, content = ?, certainty = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (title.strip(), content.strip(), certainty, setting_id),
+            )
+            row = connection.execute("SELECT * FROM story_settings WHERE id = ?", (setting_id,)).fetchone()
+        return StorySetting(**dict(row))
+
+    def delete_story_setting(self, setting_id: int) -> int:
+        with self.database.connect() as connection:
+            row = connection.execute("SELECT project_id FROM story_settings WHERE id = ?", (setting_id,)).fetchone()
+            if row is None:
+                raise KeyError(setting_id)
+            connection.execute("DELETE FROM story_settings WHERE id = ?", (setting_id,))
+        return int(row["project_id"])
+
+    def list_foreshadowing_statuses(self, project_id: int) -> list[ForeshadowingStatus]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM foreshadowing_status WHERE project_id = ? ORDER BY entity_id",
+                (project_id,),
+            ).fetchall()
+        return [ForeshadowingStatus(**dict(row)) for row in rows]
+
+    def set_foreshadowing_status(self, project_id: int, entity_id: int, status: str) -> ForeshadowingStatus:
+        with self.database.connect() as connection:
+            entity = connection.execute(
+                "SELECT id FROM entities WHERE id = ? AND project_id = ? AND type = 'foreshadowing'",
+                (entity_id, project_id),
+            ).fetchone()
+            if entity is None:
+                raise KeyError(entity_id)
+            connection.execute(
+                "INSERT INTO foreshadowing_status(entity_id, project_id, status) VALUES(?,?,?) "
+                "ON CONFLICT(entity_id) DO UPDATE SET status = excluded.status, updated_at = CURRENT_TIMESTAMP",
+                (entity_id, project_id, status),
+            )
+            row = connection.execute(
+                "SELECT * FROM foreshadowing_status WHERE entity_id = ?", (entity_id,)
+            ).fetchone()
+        return ForeshadowingStatus(**dict(row))
+
     def get_document_analysis_cache(
         self,
         document_id: int,
@@ -216,6 +368,7 @@ class StoryRepository:
             if row is None:
                 raise KeyError(f"Document not found: {document_id}")
             project_id = int(row["project_id"])
+            self.archive_review(connection, project_id)
             connection.execute("DELETE FROM documents WHERE id = ?", (document_id,))
             connection.execute("DELETE FROM relations WHERE project_id = ?", (project_id,))
             connection.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
@@ -226,8 +379,51 @@ class StoryRepository:
             )
         return project_id
 
-    def replace_chunks(self, project_id: int, document_id: int, chunks: list[str]) -> list[int]:
+    @staticmethod
+    def evidence_fingerprint(rows):
+        import hashlib
+        values = sorted((row['document_id'], row['text']) for row in rows)
+        return hashlib.sha256(json.dumps(values, ensure_ascii=False).encode()).hexdigest()
+
+    def archive_review(self, connection, project_id):
+        for issue in connection.execute('SELECT * FROM issues WHERE project_id=?', (project_id,)).fetchall():
+            ids = json.loads(issue['evidence_chunk_ids'])
+            evidence = [dict(row) for row in connection.execute(
+                'SELECT c.*,d.title,d.chapter_index FROM chunks c JOIN documents d ON d.id=c.document_id WHERE c.project_id=?', (project_id,)) if row['id'] in ids]
+            connection.execute('INSERT INTO review_history(project_id,title,description,status,evidence,fingerprint) VALUES(?,?,?,?,?,?)',
+                (project_id, issue['title'], issue['description'], issue['status'], json.dumps(evidence, ensure_ascii=False), self.evidence_fingerprint(evidence)))
+        connection.execute('DELETE FROM issues WHERE project_id=?', (project_id,))
+        connection.execute('DELETE FROM relations WHERE project_id=?', (project_id,))
+        connection.execute('DELETE FROM entities WHERE project_id=?', (project_id,))
+
+    def review_history(self, project_id):
         with self.database.connect() as connection:
+            rows = connection.execute('SELECT * FROM review_history WHERE project_id=? ORDER BY id DESC', (project_id,)).fetchall()
+        return [{**dict(row), 'evidence': json.loads(row['evidence'])} for row in rows]
+
+    def replace_document(self, document_id, path, file_format, content_hash, content, chunks):
+        with self.database.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            row = connection.execute('SELECT * FROM documents WHERE id=?', (document_id,)).fetchone()
+            if row is None:
+                raise KeyError(document_id)
+            if row['content_hash'] == content_hash:
+                return StoryDocument(**dict(row))
+            project_id = row['project_id']
+            self.archive_review(connection, project_id)
+            connection.execute('UPDATE documents SET path=?,format=?,content_hash=?,content=? WHERE id=?',
+                (str(path), file_format, content_hash, content, document_id))
+            # Retain the last analyzed hash/time to distinguish a revision from
+            # a never-analyzed draft. Cache reads require the current content
+            # hash, so the previous payload cannot be reused for this revision.
+            for table in ('episode_claims', 'episode_relations', 'episode_entity_mentions'):
+                connection.execute(f'DELETE FROM {table} WHERE document_id=?', (document_id,))
+            self.replace_chunks(project_id, document_id, chunks, connection=connection)
+            connection.execute('UPDATE projects SET updated_at=CURRENT_TIMESTAMP WHERE id=?', (project_id,))
+            return StoryDocument(**dict(connection.execute('SELECT * FROM documents WHERE id=?', (document_id,)).fetchone()))
+
+    def replace_chunks(self, project_id: int, document_id: int, chunks: list[str], connection=None) -> list[int]:
+        with (nullcontext(connection) if connection is not None else self.database.connect()) as connection:
             document_row = connection.execute(
                 "SELECT content FROM documents WHERE id = ?", (document_id,)
             ).fetchone()
@@ -594,6 +790,7 @@ class StoryRepository:
             ).fetchone()
         data = dict(row)
         data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
+        data["claims"] = decode_json(data.get("claims", "[]"))
         return RelationEdge(**data)
 
     def add_issue(
@@ -659,6 +856,11 @@ class StoryRepository:
     ) -> GraphPayload:
         range_where, range_parameters = self._document_range_filter(project_id, start_chapter, end_chapter)
         with self.database.connect() as connection:
+            cited_appearances = connection.execute(
+                """SELECT m.entity_type,m.name,m.document_id FROM episode_entity_mentions m
+                JOIN document_analysis_cache c ON c.document_id=m.document_id
+                WHERE m.project_id=? AND c.prompt_version='gpt-evidence-graph-v1'""", (project_id,)
+            ).fetchall()
             entity_rows = connection.execute(
                 "SELECT * FROM entities WHERE project_id = ? ORDER BY type, name",
                 (project_id,),
@@ -696,9 +898,13 @@ class StoryRepository:
 
         entities = []
         entity_payloads: list[dict[str, Any]] = []
+        cited_docs = {}
+        for appearance in cited_appearances:
+            cited_docs.setdefault((appearance['entity_type'], appearance['name']), set()).add(appearance['document_id'])
         for row in entity_rows:
             data = dict(row)
             data["aliases"] = decode_json(data["aliases"])
+            data["_evidence_document_ids"] = cited_docs.get((data["type"], data["name"]), set())
             entity_payloads.append(data)
         entity_metrics = _entity_story_metrics(entity_payloads, [dict(row) for row in document_rows])
         for data in entity_payloads:
@@ -710,6 +916,11 @@ class StoryRepository:
         relations = []
         for row in relation_rows:
             data = dict(row)
+            data["claims"] = decode_json(data.get("claims", "[]"))
+            if has_range_filter:
+                # Do not show an explanation relying on evidence outside this range.
+                data["claims"] = [claim for claim in data["claims"]
+                    if claim.get("quotes") and all(q["chunk_id"] in selected_chunk_ids for q in claim["quotes"])]
             data["evidence_chunk_ids"] = decode_json(data["evidence_chunk_ids"])
             if has_range_filter:
                 evidence_ids = set(_coerce_int_list(data["evidence_chunk_ids"]))
@@ -717,7 +928,8 @@ class StoryRepository:
                     continue
                 if int(data["source_entity_id"]) not in visible_entity_ids or int(data["target_entity_id"]) not in visible_entity_ids:
                     continue
-            data["type"] = normalize_relation_type(str(data["type"]))
+            if data.get("origin") != "gpt":
+                data["type"] = normalize_relation_type(str(data["type"]))
             data.update(_relation_story_metrics(data, entity_metrics, len(document_rows)))
             relations.append(RelationEdge(**data))
         issues = []
@@ -730,6 +942,7 @@ class StoryRepository:
                     continue
             issues.append(ContinuityIssue(**data))
         changes = self._relation_changes(project_id, selected_document_ids, visible_entity_ids)
+        timeline = self._relation_timeline(project_id, selected_document_ids, visible_entity_ids)
         graph_range = GraphRange(
             start_chapter=start_chapter,
             end_chapter=end_chapter,
@@ -738,13 +951,161 @@ class StoryRepository:
             continuity_ready=True,
             message="선택 범위의 설정 붕괴 후보를 판단합니다.",
         )
+        entity_ids = {int(entity.id) for entity in entities}
+        relation_endpoints = {
+            endpoint
+            for relation in relations
+            for endpoint in (relation.source_entity_id, relation.target_entity_id)
+            if endpoint in entity_ids
+        }
+        # Count valid connected components so the overview can distinguish one
+        # coherent story network from several disconnected islands. Dangling
+        # endpoints are intentionally excluded from this count and reported
+        # separately below.
+        adjacency: dict[int, set[int]] = {entity_id: set() for entity_id in entity_ids}
+        for relation in relations:
+            source, target = relation.source_entity_id, relation.target_entity_id
+            if source in adjacency and target in adjacency and source != target:
+                adjacency[source].add(target)
+                adjacency[target].add(source)
+        remaining = set(relation_endpoints)
+        component_count = 0
+        while remaining:
+            component_count += 1
+            queue = [remaining.pop()]
+            for source in queue:
+                for target in adjacency[source]:
+                    if target in remaining:
+                        remaining.remove(target)
+                        queue.append(target)
+        generic_types = {"관계", "관련", "co_occurs", "동시 등장"}
+        generic_relation_count = sum(1 for relation in relations if relation.type in generic_types)
+        unsupported_relation_count = sum(
+            1 for relation in relations if not relation.evidence_chunk_ids and not relation.claims
+        )
+        pair_types: dict[tuple[int, int], set[str]] = {}
+        for relation in relations:
+            pair = tuple(sorted((relation.source_entity_id, relation.target_entity_id)))
+            pair_types.setdefault(pair, set()).add(relation.type)
+        conflicting_pair_count = sum(1 for types in pair_types.values() if relation_types_conflict(types))
+        changed_pairs = {
+            tuple(sorted((event.source_entity_id, event.target_entity_id)))
+            for event in timeline
+            if event.status == "changed"
+        }
+        explicit_break_pairs = {
+            tuple(sorted((event.source_entity_id, event.target_entity_id)))
+            for event in timeline
+            if event.status == "explicit_break"
+        }
+        gap_pairs = {
+            tuple(sorted((event.source_entity_id, event.target_entity_id)))
+            for event in timeline
+            if event.status == "gap" or event.gap_before
+        }
+        # A timeline extractor can omit the explicit gap flag. If the same
+        # pair is observed again after one or more missing chapters, retain a
+        # conservative review candidate so API health matches the graph UI.
+        chapters_by_pair: dict[tuple[int, int], set[int]] = {}
+        for event in timeline:
+            pair = tuple(sorted((event.source_entity_id, event.target_entity_id)))
+            chapters_by_pair.setdefault(pair, set()).add(event.chapter_index)
+        for pair, chapters in chapters_by_pair.items():
+            ordered = sorted(chapters)
+            if any(right - left > 1 for left, right in zip(ordered, ordered[1:])):
+                gap_pairs.add(pair)
+        health = GraphHealth(
+            connected_entity_count=len(relation_endpoints),
+            component_count=component_count,
+            isolated_entity_count=sum(1 for entity in entities if entity.id not in relation_endpoints),
+            unsupported_relation_count=unsupported_relation_count,
+            generic_relation_count=generic_relation_count,
+            conflicting_pair_count=conflicting_pair_count,
+            changed_relation_count=len(changed_pairs) if changed_pairs else len(changes),
+            explicit_break_count=len(explicit_break_pairs),
+            gap_relation_count=len(gap_pairs),
+            dangling_relation_count=sum(
+                1 for row in relation_rows
+                if int(row["source_entity_id"]) not in visible_entity_ids
+                or int(row["target_entity_id"]) not in visible_entity_ids
+            ),
+            message="근거·변화·고립 후보를 분리해 확인하세요.",
+        )
         return GraphPayload(
             entities=entities,
             relations=relations,
             issues=issues,
             changes=changes,
             range=graph_range,
+            health=health,
+            timeline=timeline,
         )
+
+    def open_issues(self, project_id: int) -> list[ContinuityIssue]:
+        """Return open candidates for range-analysis merge bookkeeping."""
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM issues WHERE project_id=? AND status='open' ORDER BY id DESC",
+                (project_id,),
+            ).fetchall()
+        values = []
+        for row in rows:
+            data = dict(row)
+            data['evidence_chunk_ids'] = decode_json(data.get('evidence_chunk_ids'))
+            values.append(ContinuityIssue(**data))
+        return values
+
+    def _relation_timeline(
+        self, project_id: int, document_ids: list[int], visible_entity_ids: set[int]
+    ) -> list[RelationTimelineEvent]:
+        if not document_ids:
+            return []
+        placeholders = ",".join("?" for _ in document_ids)
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT episode_relations.*, documents.chapter_index
+                FROM episode_relations JOIN documents ON documents.id = episode_relations.document_id
+                WHERE episode_relations.project_id = ? AND episode_relations.document_id IN ({placeholders})
+                ORDER BY documents.chapter_index, episode_relations.id
+                """, [project_id, *document_ids]
+            ).fetchall()
+            entity_rows = connection.execute(
+                "SELECT id, name, aliases FROM entities WHERE project_id = ?", (project_id,)
+            ).fetchall()
+        ids_by_term, ambiguous_terms = _unambiguous_entity_term_index(entity_rows)
+        latest: dict[tuple[int, int], str] = {}
+        last_chapter: dict[tuple[int, int], int] = {}
+        events: list[RelationTimelineEvent] = []
+        for row in rows:
+            source_term = str(row["source_name"]).strip()
+            target_term = str(row["target_name"]).strip()
+            source_id = None if source_term in ambiguous_terms else ids_by_term.get(source_term)
+            target_id = None if target_term in ambiguous_terms else ids_by_term.get(target_term)
+            if source_id is None or target_id is None or source_id not in visible_entity_ids or target_id not in visible_entity_ids:
+                continue
+            relation_type = str(row["type"])
+            pair = (source_id, target_id)
+            explicit_break = any(term in relation_type for term in ("단절", "해제", "결별", "종료", "더 이상"))
+            changed = pair in latest and latest[pair] != relation_type
+            chapter_index = int(row["chapter_index"])
+            has_gap = pair in last_chapter and chapter_index > last_chapter[pair] + 1
+            status = "explicit_break" if explicit_break else ("changed" if changed else ("gap" if has_gap else "observed"))
+            latest[pair] = relation_type
+            last_chapter[pair] = chapter_index
+            events.append(RelationTimelineEvent(
+                source_entity_id=source_id,
+                target_entity_id=target_id,
+                source_name=str(row["source_name"]),
+                target_name=str(row["target_name"]),
+                relation_type=relation_type,
+                chapter_index=chapter_index,
+                document_id=int(row["document_id"]),
+                evidence_chunk_ids=decode_json(row["evidence_chunk_ids"]),
+                status=status,
+                gap_before=has_gap,
+            ))
+        return events
 
     def _relation_changes(
         self,
@@ -764,31 +1125,36 @@ class StoryRepository:
                 f"""
                 SELECT
                   episode_relations.*,
-                  documents.chapter_index
+                  documents.chapter_index,
+                  COALESCE(document_analysis_cache.prompt_version, '') AS graph_prompt_version
                 FROM episode_relations
                 JOIN documents ON documents.id = episode_relations.document_id
+                LEFT JOIN document_analysis_cache ON document_analysis_cache.document_id = documents.id
                 WHERE episode_relations.project_id = ?
                   AND episode_relations.document_id IN ({placeholders})
                 ORDER BY documents.chapter_index, documents.id, episode_relations.id
                 """,
                 [project_id, *document_ids],
             ).fetchall()
-        entity_ids_by_term: dict[str, int] = {}
+        entity_ids_by_term, ambiguous_terms = _unambiguous_entity_term_index(entity_rows)
         names_by_id: dict[int, str] = {}
         for row in entity_rows:
             entity_id = int(row["id"])
             name = str(row["name"])
             names_by_id[entity_id] = name
-            entity_ids_by_term[name] = entity_id
-            for alias in decode_json(row["aliases"]):
-                entity_ids_by_term.setdefault(str(alias), entity_id)
 
         latest_by_pair: dict[tuple[int, int], dict[str, Any]] = {}
         changes: list[RelationChange] = []
         for row in relation_rows:
             data = dict(row)
-            source_id = entity_ids_by_term.get(str(data["source_name"]))
-            target_id = entity_ids_by_term.get(str(data["target_name"]))
+            # Free-text GPT labels do not establish a change of the same relationship state.
+            # Keep them as source-backed candidates until a typed temporal comparison exists.
+            if data.get("graph_prompt_version") == "gpt-evidence-graph-v1":
+                continue
+            source_term = str(data["source_name"]).strip()
+            target_term = str(data["target_name"]).strip()
+            source_id = None if source_term in ambiguous_terms else entity_ids_by_term.get(source_term)
+            target_id = None if target_term in ambiguous_terms else entity_ids_by_term.get(target_term)
             if source_id is None or target_id is None:
                 continue
             if source_id not in visible_entity_ids or target_id not in visible_entity_ids:
@@ -872,6 +1238,7 @@ class StoryRepository:
         message: str,
         current_step: str = "queued",
         progress: int = 0,
+        review_context: dict | None = None,
     ) -> AnalysisJob:
         progress = clamp_progress(progress)
         with self.database.connect() as connection:
@@ -890,10 +1257,10 @@ class StoryRepository:
                 raise RuntimeError("이미 분석이 진행 중입니다. 완료되거나 취소된 뒤 다시 실행해 주세요.")
             cursor = connection.execute(
                 """
-                INSERT INTO analysis_jobs (project_id, status, current_step, progress, message)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO analysis_jobs (project_id, status, current_step, progress, message, review_context)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (project_id, AnalysisStatus.running.value, current_step, progress, message),
+                (project_id, AnalysisStatus.running.value, current_step, progress, message, encode_json(review_context or {})),
             )
             row = connection.execute(
                 "SELECT * FROM analysis_jobs WHERE id = ?", (cursor.lastrowid,)
@@ -935,6 +1302,13 @@ class StoryRepository:
     ) -> AnalysisJob:
         progress_value = clamp_progress(progress) if progress is not None else None
         with self.database.connect() as connection:
+            closed_details = None
+            if status in (AnalysisStatus.failed, AnalysisStatus.cancelled):
+                connection.execute('BEGIN IMMEDIATE')
+                pending = connection.execute('SELECT window_details FROM analysis_jobs WHERE id=? AND status=?',
+                                             (job_id, AnalysisStatus.running.value)).fetchone()
+                if pending is not None:
+                    closed_details = close_unfinished_windows(pending['window_details'], message)
             connection.execute(
                 """
                 UPDATE analysis_jobs
@@ -942,6 +1316,7 @@ class StoryRepository:
                     message = ?,
                     current_step = COALESCE(?, current_step),
                     progress = COALESCE(?, progress),
+                    window_details = COALESCE(?, window_details),
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND status = ?
                 """,
@@ -950,6 +1325,7 @@ class StoryRepository:
                     message,
                     current_step,
                     progress_value,
+                    closed_details,
                     job_id,
                     AnalysisStatus.running.value,
                 ),
@@ -995,28 +1371,18 @@ class StoryRepository:
     def mark_running_jobs_interrupted(self) -> int:
         message = "이전 실행이 종료되어 분석이 중단되었습니다. 다시 분석을 실행해 주세요."
         with self.database.connect() as connection:
-            cursor = connection.execute(
-                """
-                UPDATE analysis_jobs
-                SET status = ?,
-                    current_step = ?,
-                    progress = ?,
-                    message = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE status = ?
-                """,
-                (
-                    AnalysisStatus.failed.value,
-                    "failed",
-                    100,
-                    message,
-                    AnalysisStatus.running.value,
-                ),
-            )
-        return int(cursor.rowcount or 0)
+            connection.execute('BEGIN IMMEDIATE')
+            pending = connection.execute('SELECT id,window_details FROM analysis_jobs WHERE status=?',
+                                         (AnalysisStatus.running.value,)).fetchall()
+            for row in pending:
+                connection.execute("""UPDATE analysis_jobs SET status=?,current_step='failed',message=?,
+                    window_details=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (AnalysisStatus.failed.value, message, close_unfinished_windows(row['window_details'], message), row['id']))
+        return len(pending)
 
-    def cancel_analysis(self, project_id: int) -> AnalysisJob:
+    def cancel_analysis(self, project_id: int, preserve_results: bool = False) -> AnalysisJob:
         with self.database.connect() as connection:
+            connection.execute('BEGIN IMMEDIATE')
             row = connection.execute(
                 """
                 SELECT *
@@ -1051,18 +1417,19 @@ class StoryRepository:
                             AnalysisStatus.cancelled.value,
                             "cancelled",
                             100,
-                            "분석이 취소되어 생성 중이던 내용이 삭제되었습니다.",
+                            "GPT 분석을 취소했습니다. 이전 결과는 유지됩니다." if preserve_results else "분석이 취소되어 생성 중이던 내용이 삭제되었습니다.",
                         ),
                     )
                     job_id = int(cursor.lastrowid)
             else:
                 job_id = int(row["id"])
+                pending = connection.execute('SELECT id,window_details FROM analysis_jobs WHERE project_id=? AND status=?',
+                                             (project_id, AnalysisStatus.running.value)).fetchall()
                 connection.execute(
                     """
                     UPDATE analysis_jobs
                     SET status = ?,
                         current_step = ?,
-                        progress = ?,
                         message = ?,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE project_id = ? AND status = ?
@@ -1070,15 +1437,18 @@ class StoryRepository:
                     (
                         AnalysisStatus.cancelled.value,
                         "cancelled",
-                        100,
-                        "분석이 취소되어 생성 중이던 내용이 삭제되었습니다.",
+                        "GPT 분석을 취소했습니다. 이전 결과는 유지됩니다." if preserve_results else "분석이 취소되어 생성 중이던 내용이 삭제되었습니다.",
                         project_id,
                         AnalysisStatus.running.value,
                     ),
                 )
-            connection.execute("DELETE FROM relations WHERE project_id = ?", (project_id,))
-            connection.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
-            connection.execute("DELETE FROM issues WHERE project_id = ?", (project_id,))
+                for stopped in pending:
+                    connection.execute('UPDATE analysis_jobs SET window_details=? WHERE id=?',
+                        (close_unfinished_windows(stopped['window_details'], '분석을 취소하여 이 구간의 처리가 중단되었습니다.'), stopped['id']))
+            if not preserve_results:
+                connection.execute("DELETE FROM relations WHERE project_id = ?", (project_id,))
+                connection.execute("DELETE FROM entities WHERE project_id = ?", (project_id,))
+                connection.execute("DELETE FROM issues WHERE project_id = ?", (project_id,))
             cancelled = connection.execute(
                 "SELECT * FROM analysis_jobs WHERE id = ?",
                 (job_id,),
@@ -1206,6 +1576,8 @@ def _entity_story_metrics(
         per_document_counts: list[tuple[int, int]] = []
         for document in documents:
             count = _count_mentions(str(document["content"]), terms)
+            if int(document["id"]) in entity.get("_evidence_document_ids", set()):
+                count = max(1, count)
             if count > 0:
                 per_document_counts.append((int(document["id"]), count))
         mentioned_document_ids = [document_id for document_id, _ in per_document_counts]
