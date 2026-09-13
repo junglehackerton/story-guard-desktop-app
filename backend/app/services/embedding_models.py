@@ -84,9 +84,12 @@ class _LocalGemmaEmbeddings:
                     torch.set_num_threads(4)
             requested_dtype = os.getenv('STORY_GUARD_GEMMA_DTYPE', 'float32').lower()
             low_memory = os.getenv('STORY_GUARD_LOW_MEMORY', '').lower() in {'1', 'true', 'yes'}
-            if requested_dtype == 'float16' or (requested_dtype == 'auto' and low_memory and device in {'mps', 'cuda'}):
+            # CPU float16 inference can produce invalid vectors with this
+            # model, so keep the numerically safe dtype on CPU even when a
+            # low-memory setting is requested.
+            if device in {'mps', 'cuda'} and (requested_dtype == 'float16' or (requested_dtype == 'auto' and low_memory)):
                 dtype = torch.float16
-            elif requested_dtype == 'bfloat16':
+            elif device in {'mps', 'cuda'} and requested_dtype == 'bfloat16':
                 dtype = torch.bfloat16
             else:
                 dtype = torch.float32
