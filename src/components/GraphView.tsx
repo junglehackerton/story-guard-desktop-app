@@ -4,6 +4,7 @@ import cytoscape, { Core } from "cytoscape";
 import { Maximize2, RotateCcw, ZoomIn, ZoomOut } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { buildOrganizationMembership, isMembershipRelation } from "../lib/graphMembership";
+import { writeGraphPositions } from "../lib/graphLayoutStorage";
 import type { GraphPosition } from "../lib/graphLayoutStorage";
 import type { EntityNode, EntityType, GraphPayload, RelationEdge } from "../lib/types";
 
@@ -344,6 +345,7 @@ const TYPE_NAMES: Record<EntityType,string> = {character:'인물',place:'장소'
 
 export function GraphView({ projectId, graph, visible = true, selectedEntityId, selectedRelationId, onSelectEntity, onSelectRelation }: GraphViewProps) {
   const containerRef=useRef<HTMLDivElement>(null);
+  const viewportRef=useRef<HTMLDivElement>(null);
   const cyRef=useRef<Core|null>(null);
   const callbacks=useRef({onSelectEntity,onSelectRelation});callbacks.current={onSelectEntity,onSelectRelation};
   const [zoom,setZoom]=useState(100);
@@ -363,6 +365,9 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
   const [danglingOpen,setDanglingOpen]=useState(false);
   const [issuesOnly,setIssuesOnly]=useState(false);
   const [revision,setRevision]=useState(0);
+  const [displayPositions, setDisplayPositions] = useState<Map<number, GraphPosition>>(new Map());
+  const nodeGesture = useRef<{ id: number; startX: number; startY: number; start: GraphPosition; dragged: boolean } | null>(null);
+  const suppressNextNodeClick = useRef(false);
   const {network,unlinked}=useMemo(()=>partitionRelationships(graph),[graph]);
   const focused=focusId!==null && network.entities.some(e=>e.id===focusId);
   const networkComponents = useMemo(() => relationshipComponents(network), [network]);
@@ -424,6 +429,10 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
     return appendDanglingGhosts(graph, shown);
   }, [focused, focusedComponent, graph, shown]);
   const positions=useMemo(()=>relationshipPositions(canvasGraph),[canvasGraph,revision]);
+  useEffect(() => {
+    setDisplayPositions(new Map(positions));
+  }, [positions]);
+  const renderPositions = displayPositions.size === canvasGraph.entities.length ? displayPositions : positions;
   const selected=graph.entities.find(e=>e.id===selectedEntityId);
   const conflictingPairs = useMemo(() => {
     const byPair = new Map<string, Set<string>>();
@@ -786,6 +795,53 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
       event.currentTarget.releasePointerCapture(event.pointerId);
     }
   };
+  const graphPointFromPointer = (event: { clientX: number; clientY: number }) => {
+    const rect = viewportRef.current?.getBoundingClientRect();
+    if (!rect) return { x: 0, y: 0 };
+    const scale = clamp(zoom / 100, 0.55, 2.8);
+    const width = svgMetrics.width / scale;
+    const height = svgMetrics.height / scale;
+    const originX = svgMetrics.centerX - width / 2 + pan.x;
+    const originY = svgMetrics.centerY - height / 2 + pan.y;
+    return {
+      x: originX + ((event.clientX - rect.left) / Math.max(1, rect.width)) * width,
+      y: originY + ((event.clientY - rect.top) / Math.max(1, rect.height)) * height,
+    };
+  };
+  const handleNodePointerDown = (event: React.PointerEvent<SVGGElement>, entityId: number) => {
+    if (event.button !== 0 || !viewportRef.current) return;
+    event.stopPropagation();
+    event.preventDefault();
+    const start = renderPositions.get(entityId);
+    if (!start) return;
+    const point = graphPointFromPointer(event);
+    nodeGesture.current = { id: entityId, startX: point.x, startY: point.y, start, dragged: false };
+    viewportRef.current.setPointerCapture(event.pointerId);
+  };
+  const handleNodePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    const gesture = nodeGesture.current;
+    if (!gesture) return;
+    const point = graphPointFromPointer(event);
+    const dx = point.x - gesture.startX;
+    const dy = point.y - gesture.startY;
+    if (Math.hypot(dx, dy) > 3) gesture.dragged = true;
+    if (!gesture.dragged) return;
+    const next = new Map(renderPositions);
+    next.set(gesture.id, { x: gesture.start.x + dx, y: gesture.start.y + dy });
+    setDisplayPositions(next);
+  };
+  const handleNodePointerUp = (event: React.PointerEvent<HTMLDivElement>) => {
+    const gesture = nodeGesture.current;
+    if (!gesture) return;
+    if (gesture.dragged) {
+      suppressNextNodeClick.current = true;
+      const next = new Map(displayPositions.size ? displayPositions : renderPositions);
+      writeGraphPositions(projectId, next);
+    }
+    nodeGesture.current = null;
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+  };
+
   const consumeMapDrag=()=>{
     if(!panGesture.current?.dragged)return false;
     panGesture.current.dragged=false;
@@ -857,12 +913,12 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
       <span><i className="legend-line dangling"/>끊긴 끝점</span>
     </div>
     </details>
-    <div className="network-viewport" onWheel={handleTrackpadZoom} onPointerDown={handlePointerDown} onPointerMove={handlePointerMove} onPointerUp={handlePointerUp} onPointerCancel={handlePointerUp} onLostPointerCapture={handlePointerUp} aria-label="관계 지도. 드래그로 이동하고 트랙패드 핀치 또는 확대·축소 버튼으로 크기를 조절할 수 있습니다.">
+    <div className="network-viewport" onWheel={handleTrackpadZoom} onPointerDown={handlePointerDown} ref={viewportRef} onPointerMove={(event)=>{handleNodePointerMove(event); handlePointerMove(event)}} onPointerUp={(event)=>{handleNodePointerUp(event); handlePointerUp(event)}} onPointerCancel={(event)=>{handleNodePointerUp(event); handlePointerUp(event)}} onLostPointerCapture={(event)=>{handleNodePointerUp(event); handlePointerUp(event)}} aria-label="관계 지도. 드래그로 이동하고 트랙패드 핀치 또는 확대·축소 버튼으로 크기를 조절할 수 있습니다.">
       <svg className="network-svg" role="img" aria-label="인물과 설정의 관계망" viewBox={svgViewBox} preserveAspectRatio="xMidYMid meet">
         <defs><marker id="story-guard-arrow" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="#8790a0"/></marker></defs>
         <g className="network-svg-edges">
           {svgRelations.map(({ pairKey, members, representative: relation }) => {
-            const source = positions.get(relation.source_entity_id); const target = positions.get(relation.target_entity_id);
+            const source = renderPositions.get(relation.source_entity_id); const target = renderPositions.get(relation.target_entity_id);
             if (!source || !target) return null;
             const selected = members.some(member => member.id === selectedRelationId);
             const issue = issueRelationIds.has(relation.id) || members.some(member => issueRelationIds.has(member.id));
@@ -879,13 +935,13 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
         </g>
         <g className="network-svg-nodes">
           {canvasGraph.entities.map(entity => {
-            const position = positions.get(entity.id); if (!position) return null;
+            const position = renderPositions.get(entity.id); if (!position) return null;
             const degree = canvasGraph.relations.filter(relation => relation.source_entity_id === entity.id || relation.target_entity_id === entity.id).length;
             const visual = entityVisual(entity, degree, canvasGraph.entities.length); const selected = entity.id === selectedEntityId; const dangling = entity.name.startsWith('미확인 대상 #');
             const width = entity.type === 'character' ? visual.size + 20 : visual.size + 12; const height = entity.type === 'character' ? visual.size + 20 : 70;
             const fill = dangling ? '#FFF0EE' : visual.fill; const border = dangling ? '#AD443B' : selected ? '#24635B' : visual.border;
             const lines = entity.name.match(/.{1,10}/g) ?? [entity.name];
-            return <g key={`svg-node-${entity.id}`} className={`svg-node ${selected ? 'selected' : ''}`} transform={`translate(${position.x} ${position.y})`} onClick={() => { if(consumeMapDrag())return; onSelectRelation?.(null); onSelectEntity(dangling ? null : entity); }}>
+            return <g key={`svg-node-${entity.id}`} className={`svg-node ${selected ? 'selected' : ''}`} transform={`translate(${position.x} ${position.y})`} onPointerDown={(event)=>handleNodePointerDown(event, entity.id)} onClick={() => { if(suppressNextNodeClick.current){suppressNextNodeClick.current=false;return;} if(consumeMapDrag())return; onSelectRelation?.(null); onSelectEntity(dangling ? null : entity); }}>
               {entity.type === 'character' ? <ellipse rx={width / 2} ry={height / 2} fill={fill} fillOpacity={visual.opacity} stroke={border} strokeWidth={selected ? 4 : 2.2}/> : <rect x={-width / 2} y={-height / 2} width={width} height={height} rx={entity.type === 'event' ? 4 : 10} fill={fill} fillOpacity={visual.opacity} stroke={border} strokeWidth={selected ? 4 : 2}/>}
               <text textAnchor="middle" className="svg-node-label">{lines.slice(0, 2).map((line, index) => <tspan key={index} x="0" dy={index === 0 ? (lines.length > 1 ? -5 : 5) : 16}>{line}</tspan>)}</text>
             </g>;

@@ -268,3 +268,8 @@ body{margin:0;min-width:0}button,input,select,textarea{font:inherit}button{curso
 .background-analysis button{flex-shrink:0;}
 @media(max-width:800px){.background-analysis{margin:12px 16px 0;align-items:flex-start;flex-direction:column;gap:8px;}}
 .analysis-plan{color:#24635B;font-weight:600}
+/* The map is a direct-manipulation canvas: dragging must move a node or pan the map,
+   never select the SVG's text labels as browser content. */
+.network-viewport,.network-svg,.svg-node,.svg-edge{user-select:none;-webkit-user-select:none;}
+.svg-node{cursor:grab;touch-action:none;}
+.svg-node:active{cursor:grabbing;}
