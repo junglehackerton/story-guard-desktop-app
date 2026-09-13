@@ -49,6 +49,21 @@ def test_gemma_worker_cleanup_terminates_live_processes():
  assert GemmaEmbeddings._workers == {}
 
 
+def test_gemma_release_stops_selected_worker():
+ class Process:
+  def __init__(self): self.terminated = False
+  def poll(self): return None
+  def terminate(self): self.terminated = True
+  def wait(self, timeout): return 0
+  def kill(self): self.terminated = True
+ keep = Process()
+ process = Process()
+ GemmaEmbeddings._workers = {'keep': keep, '/private/tmp/drop-model': process}
+ GemmaEmbeddings.release('/tmp/drop-model')
+ assert process.terminated is True
+ assert '/private/tmp/drop-model' not in GemmaEmbeddings._workers
+
+
 def test_gemma_batch_reduces_after_memory_error(tmp_path, monkeypatch):
  import numpy as np
  model=_LocalGemmaEmbeddings(model_dir=tmp_path)

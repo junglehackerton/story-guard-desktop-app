@@ -138,6 +138,30 @@ class GemmaEmbeddings(_LocalGemmaEmbeddings):
     _cleanup_registered = False
 
     @classmethod
+    def release(cls, model_path=None):
+        """Release one worker (or all workers) to return model memory."""
+        target = str(Path(model_path).resolve()) if model_path else None
+        keys = [key for key in cls._workers if target is None or key == target]
+        for key in keys:
+            process = cls._workers.pop(key, None)
+            if process is None or process.poll() is not None:
+                continue
+            try:
+                stdin = getattr(process, 'stdin', None)
+                if stdin is not None:
+                    stdin.write(json.dumps({'kind': 'shutdown'}) + '\n')
+                    stdin.flush()
+                    process.wait(timeout=2)
+                else:
+                    process.terminate()
+                    process.wait(timeout=2)
+            except Exception:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+
+    @classmethod
     def _cleanup_workers(cls):
         for process in list(cls._workers.values()):
             if process.poll() is not None:

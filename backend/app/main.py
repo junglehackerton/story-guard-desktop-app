@@ -58,6 +58,7 @@ from backend.app.services.local_ai import (
 from backend.app.services.local_llm import LocalLlmExtractor
 from backend.app.services.parser import UnsupportedDocumentFormat, read_document, split_chunks
 from backend.app.services.rag import RagService
+from backend.app.services.embedding_models import GemmaEmbeddings
 
 
 database = Database(database_path())
@@ -188,6 +189,7 @@ def shutdown(background_tasks: BackgroundTasks) -> dict[str, str]:
 def shutdown_process() -> None:
     time.sleep(0.2)
     chatgpt_connection.transport.close()
+    GemmaEmbeddings.release()
     os._exit(0)
 
 
