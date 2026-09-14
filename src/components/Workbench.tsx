@@ -40,13 +40,14 @@ function SettingCard({setting,onUpdate,onDelete}:{setting:StorySetting;onUpdate:
 export interface SourceNavigation { documentId: number; quote?: string; }
 export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,onAnalyze,onCreateSetting,onUpdateSetting,onDeleteSetting,loading,preferredDocumentId,sourceRequest,active=true}: {documents:StoryDocument[];settings:StorySetting[];onImport:()=>void;onDelete:(d:StoryDocument)=>void;onReplace:(d:StoryDocument)=>void;onAnalyze:()=>void;onCreateSetting:(title:string,content:string,certainty:StorySetting['certainty'])=>Promise<boolean>;onUpdateSetting:(setting:StorySetting)=>Promise<boolean>;onDeleteSetting:(setting:StorySetting)=>void;loading:boolean;preferredDocumentId?:number;sourceRequest?:SourceNavigation;active?:boolean}) {
  const [selection,setSelection]=useState<SourceNavigation>();
+ const [readerOpen,setReaderOpen]=useState(true);
  const readerRef=useRef<HTMLElement>(null);
  const listRef=useRef<HTMLElement>(null);
  const consumedRequest=useRef<SourceNavigation>();
- useEffect(()=>{if(preferredDocumentId!==undefined)setSelection({documentId:preferredDocumentId});},[preferredDocumentId]);
+ useEffect(()=>{if(preferredDocumentId!==undefined){setSelection({documentId:preferredDocumentId});setReaderOpen(true);}},[preferredDocumentId]);
  useEffect(()=>{
   if(active && sourceRequest && consumedRequest.current!==sourceRequest && documents.some(d=>d.id===sourceRequest.documentId)){
-   consumedRequest.current=sourceRequest;setSelection(sourceRequest);
+   consumedRequest.current=sourceRequest;setSelection(sourceRequest);setReaderOpen(true);
   }
  },[sourceRequest,active,documents]);
  const doc=documents.find(d=>d.id===selection?.documentId)??documents[0];
@@ -60,17 +61,17 @@ export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,
   });
   return ()=>cancelAnimationFrame(frame);
  },[selection,active,doc?.id]);
- return <div className="manuscript-layout">
+ return <div className={`manuscript-layout${readerOpen ? '' : ' list-only'}`} style={readerOpen ? undefined : {gridTemplateColumns:'minmax(0, 1fr)'}}>
   <section className="surface" ref={listRef}>
    <div className="section-heading"><h2>원고 <span className="count">{documents.length}</span></h2><div className="section-actions"><button onClick={onImport} disabled={loading}>+ 여러 원고 가져오기</button>{documents.length > 0 && <button className="primary" onClick={onAnalyze}>분석 설정으로 이동</button>}</div></div>
-   <DocumentPicker documents={documents} selectedId={doc?.id} revealKey={consumedRequest.current} onSelect={documentId=>setSelection({documentId})}/>
+   <DocumentPicker documents={documents} selectedId={doc?.id} revealKey={consumedRequest.current} onSelect={documentId=>{setSelection({documentId});setReaderOpen(true);}}/>
 
    <hr/><div className="section-heading setting-heading"><div><h3>설정 메모</h3><p className="muted">확정 설정만 충돌 판정의 기준으로 사용합니다. 구상 메모는 참고 후보로 남깁니다.</p></div></div>
    <StorySettingForm disabled={loading} onSave={({title,content,certainty})=>onCreateSetting(title,content,certainty)}/>
 
    {settings.map(setting=><SettingCard key={setting.id} setting={setting} onUpdate={onUpdateSetting} onDelete={onDeleteSetting}/>) }
   </section>
-  <section className="surface manuscript-reader" ref={readerRef}>{doc?<><div className="section-heading"><div><span className="eyebrow">가져온 원고 · 읽기 전용</span><h2 tabIndex={-1}>{doc.chapter_index+1}화 · {doc.title}</h2></div><div><button onClick={()=>{listRef.current?.querySelector<HTMLInputElement>('input[type="search"]')?.focus();}}>원고 목록으로</button> <button onClick={()=>onReplace(doc)} disabled={loading}>수정본으로 교체</button> <button onClick={()=>onDelete(doc)} disabled={loading}>원고 삭제</button></div></div><SourceText text={doc.content} quote={selection?.documentId===doc.id?selection.quote:undefined}/></>:<div className="blank-state"><FileText size={40}/><h2>원고를 가져오세요</h2><p>TXT, Markdown, DOCX 파일을 읽을 수 있습니다.</p><button onClick={onImport}>파일 가져오기</button></div>}</section>
+  <section className="surface manuscript-reader" ref={readerRef} style={readerOpen ? undefined : {display:'none'}}>{doc?<><div className="section-heading"><div><span className="eyebrow">가져온 원고 · 읽기 전용</span><h2 tabIndex={-1}>{doc.chapter_index+1}화 · {doc.title}</h2></div><div><button type="button" onClick={()=>{setReaderOpen(false); listRef.current?.scrollIntoView({behavior:'smooth',block:'start'}); window.setTimeout(()=>listRef.current?.querySelector<HTMLButtonElement>('.document-picker button.selected')?.focus(),180);}}>원고 목록으로</button> <button type="button" onClick={()=>onReplace(doc)} disabled={loading}>수정본으로 교체</button> <button type="button" onClick={()=>onDelete(doc)} disabled={loading}>원고 삭제</button></div></div><SourceText text={doc.content} quote={selection?.documentId===doc.id?selection.quote:undefined}/></>:<div className="blank-state"><FileText size={40}/><h2>원고를 가져오세요</h2><p>TXT, Markdown, DOCX 파일을 읽을 수 있습니다.</p><button type="button" onClick={onImport}>파일 가져오기</button></div>}</section>
  </div>;
 }
 function ReviewEmptyState({showReviewed,openCount,reviewedCount,documents,onSwitch,onAnalysis}:{showReviewed:boolean;openCount:number;reviewedCount:number;documents:StoryDocument[];onSwitch:()=>void;onAnalysis:()=>void}) {

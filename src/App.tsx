@@ -1275,7 +1275,11 @@ export default function App() {
       const MAX_AUTOMATIC_BATCHES = 3;
       while (model && automaticBatches < MAX_AUTOMATIC_BATCHES && latestJob?.status === 'partial'
         && latestJob.message.includes('나머지를 이어갑니다')
-        && !(latestJob.window_details ?? []).some(window => ['failed', 'interrupted'].includes(window.status))) {
+        // A malformed response in one window must not prevent unrelated
+        // deferred windows from running. Provider-wide outages are reported
+        // without the batch continuation message and therefore still stop
+        // automatic continuation safely.
+        && !(latestJob.message.includes('GPT 연결 장애'))) {
         result = await api.analyzeProjectGpt(project.id, model, effort, false, 20, range);
         latestJob = await api.analysisStatus(project.id).catch(() => null);
         automaticBatches += 1;
