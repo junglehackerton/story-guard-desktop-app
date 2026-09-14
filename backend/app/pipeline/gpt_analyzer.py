@@ -364,6 +364,10 @@ class GptStoryAnalyzer:
                     context = [{'chunk_id': value, 'document': doc_names[by_id[value]['document_id']],
                                 'text': by_id[value]['text'] if len(by_id[value]['text']) <= (2400 if value in current_ids else 2200) else by_id[value]['text'][:(2400 if value in current_ids else 2200)]}
                                for value in context_ids]
+                    context_envelope = json.dumps(
+                        [(item['chunk_id'], item['text']) for item in context],
+                        ensure_ascii=False, separators=(',', ':'))
+                    context_envelope_hash = hashlib.sha256(context_envelope.encode('utf-8')).hexdigest()
                     # The catalog is a consistency hint, not evidence. Cap it and
                     # prefer names visible in this request so the prompt does not
                     # grow linearly with the entire manuscript.
@@ -399,6 +403,7 @@ class GptStoryAnalyzer:
                     prompt_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
                     run.update(index, owned_chunk_ids=list(current_ids), retrieved_chunk_ids=list(evidence_ids),
                                prompt_hash=prompt_hash, context_chunk_ids=list(context_ids),
+                               context_envelope_sha256=context_envelope_hash,
                                cross_chapter_context=len({by_id[value]['document_id'] for value in context_ids}) > 1)
                     def attempt(number):
                         nonlocal request_count

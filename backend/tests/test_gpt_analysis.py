@@ -746,6 +746,7 @@ def test_gpt_analysis_uses_hybrid_with_diversified_evidence_window(tmp_path):
     detail = repo.latest_analysis_job(project.id).window_details[0]
     assert detail['owned_chunk_ids'] and detail['context_chunk_ids']
     assert len(detail['prompt_hash']) == 64
+    assert len(detail['context_envelope_sha256']) == 64
 
 
 def test_relation_explanation_and_exact_quotes_survive_storage(tmp_path):

@@ -59,9 +59,13 @@ def build_audit(repo: StoryRepository, project_id: int) -> dict:
             "retrieved_chunk_ids": detail.get("retrieved_chunk_ids", []),
             "context_chunk_ids": context_ids,
             "context_envelope_sha256": _sha256(envelope),
+            "recorded_context_envelope_sha256": detail.get("context_envelope_sha256"),
             "context": context,
             "missing_context_chunk_ids": missing,
-            "parity_ok": not missing,
+            "parity_ok": not missing and (
+                not detail.get("context_envelope_sha256")
+                or detail.get("context_envelope_sha256") == _sha256(envelope)
+            ),
         })
     elapsed = [window["elapsed_seconds"] for window in windows if window["elapsed_seconds"] > 0]
     requests = sum(window["attempts"] for window in windows if not window["reused"])
