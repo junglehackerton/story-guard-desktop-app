@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import statistics
 from pathlib import Path
 
 from backend.app.database import Database
@@ -49,6 +50,9 @@ def build_audit(repo: StoryRepository, project_id: int) -> dict:
             "index": detail.get("index"),
             "status": detail.get("status"),
             "stage": detail.get("stage"),
+            "elapsed_seconds": float(detail.get("elapsed_seconds", 0) or 0),
+            "attempts": int(detail.get("attempts", 0) or 0),
+            "reused": bool(detail.get("reused", False)),
             "prompt_hash": detail.get("prompt_hash"),
             "prompt_hash_recorded": bool(detail.get("prompt_hash")),
             "owned_chunk_ids": detail.get("owned_chunk_ids", []),
@@ -59,12 +63,21 @@ def build_audit(repo: StoryRepository, project_id: int) -> dict:
             "missing_context_chunk_ids": missing,
             "parity_ok": not missing,
         })
+    elapsed = [window["elapsed_seconds"] for window in windows if window["elapsed_seconds"] > 0]
+    requests = sum(window["attempts"] for window in windows if not window["reused"])
     return {
         "project_id": project_id,
         "job_id": job.id,
         "status": job.status.value,
         "review_context": job.review_context,
         "windows": windows,
+        "timing_summary": {
+            "measured_window_count": len(elapsed),
+            "total_window_seconds": round(sum(elapsed), 3),
+            "median_window_seconds": round(statistics.median(elapsed), 3) if elapsed else 0,
+            "max_window_seconds": round(max(elapsed), 3) if elapsed else 0,
+            "provider_attempts_from_checkpoints": requests,
+        },
         "issues": [issue.model_dump() for issue in repo.open_issues(project_id)],
         "parity_ok": all(window["parity_ok"] for window in windows),
     }
