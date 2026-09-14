@@ -53,6 +53,19 @@ def test_relation_quote_morphology_variant_returns_exact_source_sentence():
     assert quote.quote == '유나는 계약 없이 검을 쓴다.'
 
 
+def test_grounded_graph_prompt_context_is_compact_and_source_backed():
+    graph = GroundedGraph()
+    graph.entities[('character', '유나')] = {'summary': '주인공', 'ids': {1}}
+    graph.entities[('item', '봉인검')] = {'summary': '검', 'ids': {1}}
+    key = (('character', '유나'), ('item', '봉인검'), '사용 조건을 위반함')
+    graph.relations[key] = {1, 99}
+    graph.claims[key] = [{'explanation': '계약 없이 검을 사용함', 'basis': 'explicit', 'quotes': []}]
+    assert graph.prompt_context() == [{
+        'source': '유나', 'target': '봉인검', 'relation': '사용 조건을 위반함',
+        'evidence_chunk_ids': [1, 99], 'explanation': '계약 없이 검을 사용함',
+    }]
+
+
 def test_gpt_analysis_persists_only_grounded_candidates(tmp_path):
     repo, project, ids, rag = fixture(tmp_path)
     calls = []

@@ -41,6 +41,27 @@ class GroundedGraph:
         self.relations = {}
         self.claims = {}
 
+    def prompt_context(self, limit: int = 40) -> list[dict]:
+        """Return a compact, source-backed global relation catalog for GPT.
+
+        This is context only; it is never treated as new evidence. Keeping
+        the catalog bounded lets later chapters compare against earlier
+        rules/relationships without replaying the entire manuscript.
+        """
+        rows = []
+        for (source, target, label), evidence_ids in self.relations.items():
+            claims = self.claims.get((source, target, label), [])
+            explanation = claims[-1].get('explanation', '') if claims else ''
+            rows.append({
+                'source': source[1],
+                'target': target[1],
+                'relation': label,
+                'evidence_chunk_ids': sorted(evidence_ids)[:5],
+                'explanation': explanation[:240],
+            })
+        rows.sort(key=lambda row: (-len(row['evidence_chunk_ids']), row['source'], row['target'], row['relation']))
+        return rows[:max(0, limit)]
+
     @staticmethod
     def _evidence(quotes, context):
         ids = set()
