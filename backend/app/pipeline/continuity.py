@@ -40,6 +40,17 @@ def _object_particle(value: str) -> str:
     return '을'
 
 
+def _object_name(value: str) -> str:
+    """Normalize a regex capture that may include its object particle."""
+    noun = _compact(value)
+    return noun[:-1] if noun.endswith(('을', '를')) else noun
+
+
+def _actor_name(value: str) -> str:
+    noun = _compact(value)
+    return noun[:-1] if noun.endswith(('은', '는')) else noun
+
+
 def detect_rule_action_candidates(rows: list[dict], documents: list) -> list[dict]:
     """Find explicit rule/action pairs spanning chapters.
 
@@ -59,9 +70,9 @@ def detect_rule_action_candidates(rows: list[dict], documents: list) -> list[dic
             actions.append((chapter, row['id'], match, text))
     candidates: list[dict] = []
     for rule_chapter, rule_chunk, rule, rule_text in rules:
-        rule_object = _compact(rule.group('object'))
+        rule_object = _object_name(rule.group('object'))
         for action_chapter, action_chunk, action, action_text in actions:
-            if action_chapter <= rule_chapter or _compact(action.group('object')) != rule_object:
+            if action_chapter <= rule_chapter or _object_name(action.group('object')) != rule_object:
                 continue
             # An explicit exception in the intervening source means the pair
             # needs author review, but is not enough to call it a conflict.
@@ -76,7 +87,7 @@ def detect_rule_action_candidates(rows: list[dict], documents: list) -> list[dic
             particle = _object_particle(rule_object)
             description = (
                 f"{rule.group('condition').strip()}만 {rule_object}{particle} 사용할 수 있다는 규칙과 "
-                f"{action.group('actor')}가 {action.group('condition')} {rule_object}{particle} 사용했다는 행동을 "
+                f"{_actor_name(action.group('actor'))}가 {action.group('condition')} {rule_object}{particle} 사용했다는 행동을 "
                 + ('예외 문구와 함께 확인해야 합니다.' if has_exception else '서로 다른 회차에서 확인했습니다.')
             )
             candidates.append({
