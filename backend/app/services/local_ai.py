@@ -26,6 +26,12 @@ EMBEDDING_MODEL_URL = (
     f"{EMBEDDING_REVISION}/{DEFAULT_EMBEDDING_MODEL}"
 )
 QUERY_INSTRUCTION = "Given a story consistency question, retrieve relevant passages from the manuscript."
+# Qwen3-Embedding's packaged llama.cpp context defaults to 512 tokens. Korean
+# characters can consume more than one token, so a whole multi-chunk retrieval
+# prompt can overflow before the model returns a vector. Dense retrieval only
+# needs a compact semantic hint; canonical lexical retrieval still receives
+# the complete query in RagService.
+DEFAULT_QUERY_CHARS = 220
 DEFAULT_MODEL_URL = (
     "https://huggingface.co/"
     f"{DEFAULT_MODEL_REPO}/resolve/main/{DEFAULT_GENERATION_MODEL}"
@@ -259,7 +265,22 @@ class LocalLlmEmbeddings:
         return vectors
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed(f"Instruct: {QUERY_INSTRUCTION}\nQuery: {text}")
+        return self._embed(f"Instruct: {QUERY_INSTRUCTION}\nQuery: {self._compact_query(text)}")
+
+    @staticmethod
+    def _compact_query(text: str) -> str:
+        try:
+            limit = int(os.getenv("STORY_GUARD_EMBED_QUERY_CHARS", str(DEFAULT_QUERY_CHARS)))
+        except ValueError:
+            limit = DEFAULT_QUERY_CHARS
+        limit = max(80, min(limit, 480))
+        value = str(text or "").strip()
+        if len(value) <= limit:
+            return value
+        # Keep both the current window lead and the final question/claims;
+        # this is more useful than a hard prefix cut for cross-chapter checks.
+        head = max(1, int(limit * 0.65))
+        return value[:head].rstrip() + "\n…\n" + value[-(limit - head - 3):].lstrip()
 
     def _embed(self, text: str) -> list[float]:
         with self._lock:

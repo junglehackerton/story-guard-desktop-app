@@ -29,6 +29,17 @@ def _compact(value: str) -> str:
     return re.sub(r"\s+", "", value).strip()
 
 
+def _object_particle(value: str) -> str:
+    """Return the Korean object particle for a normalized noun."""
+    noun = _compact(value)
+    if not noun:
+        return '을'
+    code = ord(noun[-1])
+    if 0xAC00 <= code <= 0xD7A3:
+        return '을' if (code - 0xAC00) % 28 else '를'
+    return '을'
+
+
 def detect_rule_action_candidates(rows: list[dict], documents: list) -> list[dict]:
     """Find explicit rule/action pairs spanning chapters.
 
@@ -62,9 +73,10 @@ def detect_rule_action_candidates(rows: list[dict], documents: list) -> list[dic
             ]
             has_exception = any(_EXCEPTION.search(text) for text in intervening)
             title = '규칙과 행동의 전역 비교 후보'
+            particle = _object_particle(rule_object)
             description = (
-                f"{rule.group('condition').strip()}만 {rule_object}을(를) {rule.group('verb')}할 수 있다는 규칙과 "
-                f"{action.group('actor')}가 {action.group('condition')} {rule_object}을(를) {action.group('verb')}했다는 행동을 "
+                f"{rule.group('condition').strip()}만 {rule_object}{particle} 사용할 수 있다는 규칙과 "
+                f"{action.group('actor')}가 {action.group('condition')} {rule_object}{particle} 사용했다는 행동을 "
                 + ('예외 문구와 함께 확인해야 합니다.' if has_exception else '서로 다른 회차에서 확인했습니다.')
             )
             candidates.append({
