@@ -526,7 +526,10 @@ class GptStoryAnalyzer:
         for claim in [*result.entities, *result.relations]:
             for quote in claim.evidence:
                 if not GroundedGraph._evidence([quote], context):
-                    raise RuntimeError('관계 지도 근거 인용문이 전달된 원문과 일치하지 않습니다.')
+                    raise RuntimeError(
+                        '관계 지도 근거 인용문이 전달된 원문과 일치하지 않습니다. '
+                        f'(요청 chunk_id={quote.chunk_id}, 검증 대상 {len(context)}개)'
+                    )
         for issue in result.issues:
             ids = set(issue.evidence_chunk_ids)
             if len(ids) < 2 or not ids.issubset(evidence_ids):

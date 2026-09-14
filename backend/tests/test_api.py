@@ -207,6 +207,26 @@ def test_importing_new_chapter_keeps_published_graph_visible(tmp_path: Path) -> 
     assert any(relation["type"] == "지킴" for relation in graph["relations"])
 
 
+def test_import_uses_episode_number_and_deduplicates_content(tmp_path: Path) -> None:
+    client = TestClient(app)
+    project = client.post("/projects", json={"title": "회차 번호 임포트"}).json()
+    paths = []
+    for episode in (8, 2, 1):
+        path = tmp_path / f"episode-{episode:02d}.txt"
+        path.write_text(f"{episode}화 본문", encoding="utf-8")
+        paths.append(path)
+        response = client.post("/documents/import", json={"project_id": project["id"], "path": str(path)})
+        assert response.status_code == 200
+
+    duplicate = client.post("/documents/import", json={"project_id": project["id"], "path": str(paths[0])})
+    assert duplicate.status_code == 200
+    documents = client.get(f"/projects/{project['id']}/documents").json()
+    assert len(documents) == 3
+    assert [(doc["chapter_index"], doc["title"]) for doc in documents] == [
+        (0, "episode-01"), (1, "episode-02"), (7, "episode-08")
+    ]
+
+
 def test_replacing_document_keeps_chunks_in_owning_project(tmp_path: Path, monkeypatch) -> None:
     isolated_repository = StoryRepository(Database(tmp_path / "replace.sqlite"))
     monkeypatch.setattr(main_module, "repository", isolated_repository)
@@ -231,9 +251,9 @@ def test_replacing_document_keeps_chunks_in_owning_project(tmp_path: Path, monke
 def test_analysis_estimate_uses_actual_chunk_grouping(tmp_path: Path) -> None:
     client = TestClient(app)
     project = client.post("/projects", json={"title": "분석량 추정"}).json()
-    for index in range(21):
+    for index in range(1, 22):
         path = tmp_path / f"episode-{index:02d}.txt"
-        path.write_text((f"{index + 1}화. 유나는 기록을 확인했다. " * 60), encoding="utf-8")
+        path.write_text((f"{index}화. 유나는 기록을 확인했다. " * 60), encoding="utf-8")
         response = client.post("/documents/import", json={"project_id": project["id"], "path": str(path)})
         assert response.status_code == 200
 
@@ -246,7 +266,7 @@ def test_analysis_estimate_uses_actual_chunk_grouping(tmp_path: Path) -> None:
     assert payload["review_window_count"] == 21
     assert payload["manuscript_chars"] == sum(
         len((tmp_path / f"episode-{index:02d}.txt").read_text(encoding="utf-8"))
-        for index in range(21)
+        for index in range(1, 22)
     )
 
     ranged = client.get(f"/projects/{project['id']}/analysis/estimate", params={"start_chapter": 5, "end_chapter": 9})

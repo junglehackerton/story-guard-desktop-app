@@ -4,6 +4,7 @@ import pytest
 from backend.app.database import Database
 from backend.app.repository import StoryRepository
 from backend.app.pipeline.gpt_analyzer import GptStoryAnalyzer, parse_review_result
+from backend.app.pipeline.gpt_graph import GroundedGraph, EvidenceQuote
 
 
 def fixture(tmp_path):
@@ -25,6 +26,31 @@ def test_parse_review_result_normalizes_numeric_evidence_ids():
     }))
     assert result.entities[0].evidence[0].chunk_id == 42
     assert result.issues[0].evidence_chunk_ids == [42, 43]
+
+
+def test_relation_quote_can_be_grounded_in_adjacent_context_chunk():
+    quote = EvidenceQuote(chunk_id=1, quote='계약 없이 검을 사용했다.')
+    ids = GroundedGraph._evidence([quote], {
+        1: {'text': '유나는'},
+        2: {'text': '계약 없이 검을 사용했다.'},
+    })
+    assert ids == {2}
+    assert quote.chunk_id == 2
+    assert quote.quote == '계약 없이 검을 사용했다.'
+
+
+def test_relation_quote_whitespace_is_canonicalized_to_source_slice():
+    quote = EvidenceQuote(chunk_id=1, quote='유나는\n계약 없이 검을 사용했다.')
+    ids = GroundedGraph._evidence([quote], {1: {'text': '유나는 계약 없이 검을 사용했다.'}})
+    assert ids == {1}
+    assert quote.quote == '유나는 계약 없이 검을 사용했다.'
+
+
+def test_relation_quote_morphology_variant_returns_exact_source_sentence():
+    quote = EvidenceQuote(chunk_id=1, quote='유나는 계약 없이 검을 사용했다.')
+    ids = GroundedGraph._evidence([quote], {1: {'text': '유나는 계약 없이 검을 쓴다.'}})
+    assert ids == {1}
+    assert quote.quote == '유나는 계약 없이 검을 쓴다.'
 
 
 def test_gpt_analysis_persists_only_grounded_candidates(tmp_path):

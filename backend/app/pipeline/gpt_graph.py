@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import re
 import unicodedata
+import math
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from backend.app.models import EntityType
@@ -44,33 +45,87 @@ class GroundedGraph:
     def _evidence(quotes, context):
         ids = set()
         for quote in quotes:
-            source = context.get(quote.chunk_id, {}).get('text', '')
-            if not source:
+            # A window includes adjacent chunks. Models occasionally attach
+            # the preceding/following chunk id to a quote that crosses the
+            # boundary. Search the supplied context and canonicalize the id
+            # to the chunk that actually contains the quote; this keeps the
+            # evidence grounded while avoiding a needless whole-window retry.
+            if quote.chunk_id not in context:
                 continue
-            if quote.quote not in source:
-                # GPT responses often preserve the words but normalize a
-                # paragraph break to a space (or vice versa). Match only
-                # whitespace differences, then replace the response with the
-                # exact slice from the source so highlighting remains safe.
-                words = re.findall(r'\S+', unicodedata.normalize('NFC', quote.quote))
-                if not words:
+            matched = None
+            for candidate_id, row in context.items():
+                source = row.get('text', '')
+                if not source:
                     continue
-                pattern = r'\s+'.join(re.escape(word) for word in words)
-                match = re.search(pattern, unicodedata.normalize('NFC', source))
-                if match is None:
-                    # Models may also normalize Korean punctuation (for
-                    # example quote marks or a comma) while preserving every
-                    # lexical character. Permit non-word separators only;
-                    # never accept a paraphrase or reordered text.
-                    compact = ''.join(ch for ch in unicodedata.normalize('NFC', quote.quote) if ch.isalnum() or ch == '_')
-                    if compact:
-                        loose = r'\W*'.join(re.escape(ch) for ch in compact)
-                        match = re.search(loose, unicodedata.normalize('NFC', source))
-                if match is None:
-                    continue
-                quote.quote = source[match.start():match.end()]
+                span = GroundedGraph._quote_span(quote.quote, source)
+                if span is not None:
+                    matched = (candidate_id, source, span)
+                    # Prefer the model-provided id when it is valid and has a
+                    # match; otherwise use the containing chunk we found.
+                    if candidate_id == quote.chunk_id:
+                        break
+            if matched is None:
+                continue
+            candidate_id, source, (start, end) = matched
+            quote.chunk_id = int(candidate_id)
+            quote.quote = source[start:end]
             ids.add(quote.chunk_id)
         return ids
+
+    @staticmethod
+    def _quote_span(quote: str, source: str):
+        """Return an exact source span for a lightly normalized model quote."""
+        if quote in source:
+            start = source.index(quote)
+            return start, start + len(quote)
+        normalized_quote = unicodedata.normalize('NFC', quote)
+        normalized_source = unicodedata.normalize('NFC', source)
+        words = re.findall(r'\S+', normalized_quote)
+        if not words:
+            return None
+        pattern = r'\s+'.join(re.escape(word) for word in words)
+        match = re.search(pattern, normalized_source)
+        if match is None:
+            # Permit punctuation/quote-mark normalization, but retain every
+            # lexical character so a paraphrase can never become evidence.
+            compact = ''.join(ch for ch in normalized_quote if ch.isalnum() or ch == '_')
+            if compact:
+                loose = r'\W*'.join(re.escape(ch) for ch in compact)
+                match = re.search(loose, normalized_source)
+        if match is None:
+            # A model may change one inflection (for example "사용했다" to
+            # "쓴다") while preserving the cited sentence. Recover only when
+            # most lexical tokens occur in the same source sentence, then
+            # return that sentence's exact source slice. This keeps evidence
+            # source-grounded while avoiding a needless retry for harmless
+            # Korean morphology changes; unrelated summaries still fail.
+            quote_tokens = re.findall(r'[\w가-힣]+', normalized_quote)
+            if len(quote_tokens) >= 2:
+                sentence_pattern = r'[^.!?。\n]+[.!?。]?'
+                candidates = list(re.finditer(sentence_pattern, normalized_source))
+                best = None
+                for candidate in candidates:
+                    source_tokens = set(re.findall(r'[\w가-힣]+', candidate.group(0)))
+                    overlap = sum(token in source_tokens for token in quote_tokens)
+                    threshold = max(2, math.ceil(len(quote_tokens) * 0.6))
+                    if overlap >= threshold and (best is None or overlap > best[0]):
+                        best = (overlap, candidate)
+                if best is not None:
+                    match = best[1]
+        if match is None:
+            return None
+        # NFC can combine code points, so map normalized offsets back to the
+        # original string instead of slicing with potentially shifted offsets.
+        if len(normalized_source) == len(source):
+            return match.start(), match.end()
+        offsets = []
+        for index, char in enumerate(source):
+            offsets.extend([index] * len(unicodedata.normalize('NFC', char)))
+        if match.start() >= len(offsets):
+            return None
+        start = offsets[match.start()]
+        end_index = min(match.end() - 1, len(offsets) - 1)
+        return start, offsets[end_index] + 1
 
     @staticmethod
     def _label(value: str) -> str:

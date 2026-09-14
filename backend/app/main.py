@@ -4,6 +4,7 @@ import asyncio
 import hmac
 import logging
 import os
+import re
 import threading
 import time
 from collections import defaultdict
@@ -299,9 +300,31 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
         raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.") from error
 
     existing_documents = repository.list_documents(payload.project_id)
-    next_chapter_index = (
-        max((document.chapter_index for document in existing_documents), default=-1) + 1
-    )
+    # Re-importing the same file must be idempotent.  Without this guard a
+    # second file-picker attempt created a duplicate chapter and shifted every
+    # subsequent display number by one.
+    duplicate = next((document for document in existing_documents if document.content_hash == content_hash), None)
+    if duplicate is not None:
+        return duplicate
+
+    # Preserve the author's episode numbers from common filenames such as
+    # ``episode-08.txt`` or ``8화.md``.  The old implementation used import
+    # order, so selecting episode 08 first displayed it as 1화.
+    filename = path.stem
+    matches = re.findall(r"(?:^|[^0-9])(\d+)(?:[^0-9]|$)", filename)
+    parsed_episode = int(matches[-1]) if matches else None
+    if parsed_episode is not None and parsed_episode > 0:
+        next_chapter_index = parsed_episode - 1
+        occupied = next((document for document in existing_documents if document.chapter_index == next_chapter_index), None)
+        if occupied is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{parsed_episode}화 번호가 이미 사용 중입니다. 기존 회차를 교체하거나 파일명을 확인해 주세요.",
+            )
+    else:
+        next_chapter_index = (
+            max((document.chapter_index for document in existing_documents), default=-1) + 1
+        )
     document = repository.add_document(
         project_id=payload.project_id,
         path=path,
