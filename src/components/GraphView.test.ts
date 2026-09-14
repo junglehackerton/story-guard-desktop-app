@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { MEMBERSHIP_EDGE_STYLE, buildObsidianPositions, countVisibleTimelinePairs, entityVisual, graphHealthLevel, graphPanOffset, trackpadZoomFactor } from "./GraphView";
+import { MEMBERSHIP_EDGE_STYLE, buildObsidianPositions, countVisibleTimelinePairs, entityVisual, graphHealthLevel, graphPanOffset, shouldStartGraphPan, trackpadZoomFactor } from "./GraphView";
 import { partitionRelationships } from "../lib/relationshipLayout";
 import { buildOrganizationMembership, isMembershipRelation } from "../lib/graphMembership";
 import type { EntityNode, GraphPayload, RelationEdge } from "../lib/types";
@@ -139,6 +139,13 @@ describe("organization graph membership", () => {
     expect(trackpadZoomFactor(-120)).toBeGreaterThan(1);
     expect(trackpadZoomFactor(120)).toBeLessThan(1);
     expect(trackpadZoomFactor(Number.NaN)).toBe(1);
+  });
+
+  it("starts canvas panning only from an empty primary-button gesture", () => {
+    expect(shouldStartGraphPan({ button: 0, buttons: 1, isPrimary: true, target: null })).toBe(true);
+    expect(shouldStartGraphPan({ button: 0, buttons: 0, isPrimary: true, target: null })).toBe(false);
+    expect(shouldStartGraphPan({ button: 0, buttons: 1, isPrimary: true, target: { closest: () => ({}) } as unknown as Element })).toBe(false);
+    expect(shouldStartGraphPan({ button: 0, buttons: 1, isPrimary: false, target: null })).toBe(false);
   });
 
   it("pans the SVG in the same direction as a map drag", () => {

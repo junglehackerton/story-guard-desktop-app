@@ -75,6 +75,17 @@ export function trackpadZoomFactor(deltaY: number): number {
   return Math.exp(-deltaY * 0.0025);
 }
 
+/** Only a primary-button gesture on the empty canvas may pan the map. */
+export function shouldStartGraphPan(event: {
+  button: number;
+  buttons: number;
+  isPrimary?: boolean;
+  target?: Element | null;
+}) {
+  if (event.button !== 0 || event.buttons !== 1 || event.isPrimary === false) return false;
+  return !event.target?.closest('button, input, select, textarea, summary, a, .network-alert, .network-tools, .network-access, .svg-node, .svg-edge');
+}
+
 export function graphPanOffset(start: { x: number; y: number }, delta: { x: number; y: number }, viewport: { width: number; height: number }, content: { width: number; height: number }, scale: number) {
   const safeScale = clamp(Number.isFinite(scale) && scale > 0 ? scale : 1, 0.55, 2.8);
   const next = {
@@ -366,6 +377,8 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
   const [issuesOnly,setIssuesOnly]=useState(false);
   const [revision,setRevision]=useState(0);
   const [displayPositions, setDisplayPositions] = useState<Map<number, GraphPosition>>(new Map());
+  const candidatesPanelRef = useRef<HTMLDivElement>(null);
+  const danglingPanelRef = useRef<HTMLDivElement>(null);
   const nodeGesture = useRef<{ id: number; startX: number; startY: number; start: GraphPosition; dragged: boolean } | null>(null);
   const suppressNextNodeClick = useRef(false);
   const {network,unlinked}=useMemo(()=>partitionRelationships(graph),[graph]);
@@ -774,12 +787,30 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
     setPan(currentPan => graphPanOffset(currentPan,{x:event.deltaX,y:event.deltaY},{width:rect.width,height:rect.height},svgMetrics,zoom/100));
   };
   const handlePointerDown=(event: React.PointerEvent<HTMLDivElement>)=>{
-    if(event.button!==0)return;
+    // PointerMove can be emitted by WebKit after a hover or after a released
+    // trackpad gesture. Only a real primary-button press may start a pan.
+    if(!shouldStartGraphPan({ ...event, target: event.target as Element | null }))return;
+    // Do not capture controls, alerts, or graph elements. Capturing a button's
+    // pointer here prevents WebKit from dispatching its click, which made the
+    // candidate actions appear visible but inert.
     event.currentTarget.setPointerCapture(event.pointerId);
     panGesture.current={startX:event.clientX,startY:event.clientY,startPan:pan,active:true,dragged:false};
   };
+  const openCandidates = () => {
+    setCandidatesOpen(true);
+    requestAnimationFrame(() => candidatesPanelRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+  };
+  const openDangling = () => {
+    setDanglingOpen(true);
+    requestAnimationFrame(() => danglingPanelRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' }));
+  };
   const handlePointerMove=(event: React.PointerEvent<HTMLDivElement>)=>{
-    const gesture=panGesture.current;if(!gesture?.active)return;
+    const gesture=panGesture.current;
+    if(!gesture?.active)return;
+    if(event.buttons!==1){
+      panGesture.current=null;
+      return;
+    }
     const delta={x:event.clientX-gesture.startX,y:event.clientY-gesture.startY};
     if(Math.hypot(delta.x,delta.y)>4)gesture.dragged=true;
     const rect=event.currentTarget.getBoundingClientRect();
@@ -787,7 +818,7 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
   };
   const handlePointerUp=(event: React.PointerEvent<HTMLDivElement>)=>{
     if(!panGesture.current?.active)return;
-    panGesture.current.active=false;
+    panGesture.current=null;
     // `lostpointercapture` may have already released this pointer. Guard the
     // explicit release so a trailing pointerup cannot throw and interrupt
     // the next graph gesture.
@@ -821,6 +852,10 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
   const handleNodePointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
     const gesture = nodeGesture.current;
     if (!gesture) return;
+    if (event.buttons !== 1) {
+      nodeGesture.current = null;
+      return;
+    }
     const point = graphPointFromPointer(event);
     const dx = point.x - gesture.startX;
     const dy = point.y - gesture.startY;
@@ -864,7 +899,7 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
       <div className="graph-health-metrics">
         <span className="health-good">연결 대상 {health.connected_entity_count}</span>
         <span className={health.component_count > 1 ? "health-warn" : "health-good"}>분리된 망 {health.component_count}</span>
-        <span className={health.isolated_entity_count ? "health-warn" : "health-good"}>고립 후보 {health.isolated_entity_count}</span>
+        {health.isolated_entity_count ? <button type="button" className="health-warn" aria-expanded={candidatesOpen} onClick={() => candidatesOpen ? setCandidatesOpen(false) : openCandidates()}>고립 후보 {health.isolated_entity_count}</button> : <span className="health-good">고립 후보 0</span>}
         <button type="button" disabled={!issueRelations.unsupported} className={health.unsupported_relation_count ? "health-warn" : "health-good"} onClick={() => focusIssueRelation(issueRelations.unsupported)}>근거 부족 {health.unsupported_relation_count}</button>
         <button type="button" disabled={!issueRelations.generic} className={health.generic_relation_count ? "health-warn" : "health-good"} onClick={() => focusIssueRelation(issueRelations.generic)}>미분류 관계 {health.generic_relation_count}</button>
         <button type="button" disabled={!issueRelations.conflict} className={health.conflicting_pair_count ? "health-danger" : "health-good"} onClick={() => focusIssueRelation(issueRelations.conflict)}>충돌 {health.conflicting_pair_count}</button>
@@ -961,17 +996,23 @@ export function GraphView({ projectId, graph, visible = true, selectedEntityId, 
           health.generic_relation_count && `미분류 관계 ${health.generic_relation_count}`,
           health.changed_relation_count && `변화 ${health.changed_relation_count}`,
         ].filter(Boolean).join(" · ")}</span>
-        {danglingRelations.length > 0 && <button type="button" onClick={() => setDanglingOpen(true)}>끊긴 관계 보기</button>}
-        {unlinked.length > 0 && <button type="button" onClick={() => setCandidatesOpen(true)}>고립 후보 보기</button>}
+        {danglingRelations.length > 0 && <button type="button" onClick={openDangling}>끊긴 관계 보기</button>}
+        {unlinked.length > 0 && <button type="button" onClick={openCandidates}>고립 후보 보기</button>}
       </div>}
       {!shown.entities.length&&<div className="network-empty"><strong>아직 연결된 관계가 없습니다</strong><p>현재 범위의 후보는 아래에서 확인할 수 있습니다.<br/>분석 결과에 관계가 있어야 연결선이 표시됩니다.</p></div>}
       {renderError&&<div className="network-empty" role="alert"><strong>관계 지도를 불러오지 못했습니다</strong><p>{renderError}</p><button onClick={()=>setRevision(v=>v+1)}>다시 시도</button></div>}
-      <div className="network-tools"><button aria-label="축소" onClick={()=>changeZoom(.8)}><ZoomOut size={18}/></button><span>{zoom}%</span><button aria-label="확대" onClick={()=>changeZoom(1.25)}><ZoomIn size={18}/></button><button onClick={fit}><Maximize2 size={17}/> 화면에 맞춤</button><button title="자동 배치 다시 실행" aria-label="자동 배치 다시 실행" onClick={()=>setRevision(v=>v+1)}><RotateCcw size={17}/></button></div>
+      <div className="network-tools" onPointerDown={(event)=>event.stopPropagation()} onWheel={(event)=>event.stopPropagation()}>
+        <button type="button" aria-label="축소" onClick={()=>changeZoom(.8)}><ZoomOut size={18}/></button>
+        <span aria-live="polite">{zoom}%</span>
+        <button type="button" aria-label="확대" onClick={()=>changeZoom(1.25)}><ZoomIn size={18}/></button>
+        <button type="button" onClick={fit}><Maximize2 size={17}/> 화면에 맞춤</button>
+        <button type="button" title="자동 배치 다시 실행" aria-label="자동 배치 다시 실행" onClick={()=>setRevision(v=>v+1)}><RotateCcw size={17}/></button>
+      </div>
     </div>
     <div className="network-access"><label>대상 탐색<select aria-label="관계 대상 선택" value={selectedEntityId??''} onChange={e=>{callbacks.current.onSelectRelation?.(null);onSelectEntity(graph.entities.find(n=>n.id===Number(e.target.value))??null);}}><option value="">인물·설정 선택</option>{graph.entities.map(e=><option key={e.id} value={e.id}>{TYPE_NAMES[e.type]} · {e.name}</option>)}</select></label>
     {danglingRelations.length>0&&<button className="dangling-toggle" aria-expanded={danglingOpen} onClick={()=>setDanglingOpen(v=>!v)}>끊긴 관계 {danglingRelations.length}개 {danglingOpen?'접기':'보기'}</button>}
     {unlinked.length>0&&<button aria-expanded={candidatesOpen} onClick={()=>setCandidatesOpen(v=>!v)}>고립 후보 {unlinked.length}개 {candidatesOpen?'접기':'보기'}</button>}</div>
-    {danglingOpen&&<div className="unlinked-candidates dangling-candidates"><p>끝점이 현재 작품 엔티티에 없습니다. 그래프 선으로 숨기지 않고 원인 확인 목록에 남겼습니다.</p><div>{danglingRelations.map(relation=><button className="dangling-row" key={relation.id} onClick={()=>{callbacks.current.onSelectEntity(null);callbacks.current.onSelectRelation?.(relation.id);}}><strong>{entityName(relation.source_entity_id)} → {entityName(relation.target_entity_id)}</strong><small>{relation.display_label || relation.type} · 원문 근거 {relation.evidence_chunk_ids.length ? '있음' : '없음'}</small></button>)}</div></div>}
-    {candidatesOpen&&<div className="unlinked-candidates"><p>현재 필터에서 연결이 없는 추출 후보입니다. 이름·분류의 정확성은 원문 확인이 필요합니다.</p><div>{unlinked.map(e=><button key={e.id} className={e.id===selectedEntityId?'selected':''} onClick={()=>{callbacks.current.onSelectRelation?.(null);onSelectEntity(e);}}><small>{TYPE_NAMES[e.type]}</small>{e.name}</button>)}</div></div>}
+    {danglingOpen&&<div ref={danglingPanelRef} className="unlinked-candidates dangling-candidates"><p>끝점이 현재 작품 엔티티에 없습니다. 그래프 선으로 숨기지 않고 원인 확인 목록에 남겼습니다.</p><div>{danglingRelations.map(relation=><button className="dangling-row" key={relation.id} onClick={()=>{callbacks.current.onSelectEntity(null);callbacks.current.onSelectRelation?.(relation.id);}}><strong>{entityName(relation.source_entity_id)} → {entityName(relation.target_entity_id)}</strong><small>{relation.display_label || relation.type} · 원문 근거 {relation.evidence_chunk_ids.length ? '있음' : '없음'}</small></button>)}</div></div>}
+    {candidatesOpen&&<div ref={candidatesPanelRef} className="unlinked-candidates"><p>현재 필터에서 연결이 없는 추출 후보입니다. 이름·분류의 정확성은 원문 확인이 필요합니다.</p><div>{unlinked.map(e=><button key={e.id} className={e.id===selectedEntityId?'selected':''} onClick={()=>{callbacks.current.onSelectRelation?.(null);onSelectEntity(e);}}><small>{TYPE_NAMES[e.type]}</small>{e.name}</button>)}</div></div>}
   </div>;
 }
