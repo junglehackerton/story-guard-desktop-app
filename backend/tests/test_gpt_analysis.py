@@ -650,17 +650,23 @@ def test_new_chapter_reuses_unchanged_review_windows(tmp_path):
     assert len(calls) == 3
     assert result['cached_count'] == 2 and result['request_count'] == 1
 
-def test_gpt_analysis_uses_hybrid_without_increasing_evidence_limit(tmp_path):
+def test_gpt_analysis_uses_hybrid_with_diversified_evidence_window(tmp_path):
     repo, project, ids, rag = fixture(tmp_path)
     original = rag.retrieve
     requested = []
+    queries = []
     def retrieve(*args, **kwargs):
         requested.append(kwargs)
+        queries.append(args[1] if len(args) > 1 else '')
         return original(*args, **kwargs)
     rag.retrieve = retrieve
     connection = SimpleNamespace(complete=lambda *a, **k: {'text': '{"entities": [], "relations": [], "issues": []}'})
     GptStoryAnalyzer(repo, rag, connection).analyze(project.id, 'model', 'low')
-    assert requested and all(k.get('strategy') == 'hybrid' and k['limit'] == 4 for k in requested)
+    assert requested and all(k.get('strategy') == 'hybrid' and k['limit'] == 12 for k in requested)
+    assert queries and all(query.strip() for query in queries)
+    detail = repo.latest_analysis_job(project.id).window_details[0]
+    assert detail['owned_chunk_ids'] and detail['context_chunk_ids']
+    assert len(detail['prompt_hash']) == 64
 
 
 def test_relation_explanation_and_exact_quotes_survive_storage(tmp_path):

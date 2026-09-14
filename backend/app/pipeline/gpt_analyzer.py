@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import time
+import hashlib
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from backend.app.models import AnalysisStatus
@@ -297,14 +298,19 @@ class GptStoryAnalyzer:
                         # Avoid reopening/checking Chroma for every GPT window;
                         # the source snapshot check below still aborts on edits.
                         try:
-                            hits = self.rag.retrieve(project_id, by_id[current_ids[0]]['text'], limit=4,
+                            # Search the complete owned window. Using only the
+                            # first chunk made a late rule/action pair invisible
+                            # when a review window contained several chunks.
+                            query = '\n'.join(by_id[value]['text'] for value in current_ids if value in by_id)
+                            hits = self.rag.retrieve(project_id, query, limit=12,
                                                      strategy='hybrid', ensure_index=False)
                         except TypeError as error:
                             # Preserve compatibility with integrations that
                             # still expose the pre-optimization signature.
                             if 'ensure_index' not in str(error):
                                 raise
-                            hits = self.rag.retrieve(project_id, by_id[current_ids[0]]['text'], limit=4,
+                            query = '\n'.join(by_id[value]['text'] for value in current_ids if value in by_id)
+                            hits = self.rag.retrieve(project_id, query, limit=12,
                                                      strategy='hybrid')
                         evidence_ids = list(dict.fromkeys(current_ids + list(neighbors) + [hit['chunk_id'] for hit in hits]))
                     # A derived vector cache can briefly return an ID from an
@@ -315,6 +321,24 @@ class GptStoryAnalyzer:
                     if any(value not in by_id for value in current_ids):
                         raise RuntimeError('분석 중 원고가 변경되었습니다. 다시 실행해 주세요.')
                     evidence_ids = [value for value in evidence_ids if value in by_id]
+                    # Keep direct evidence first, then diversify retrieved
+                    # evidence across chapters. Without this cap, dense search
+                    # can fill the prompt with near-duplicate chunks from the
+                    # current episode and evict the earlier rule being tested.
+                    document_by_chunk = {chunk_id: by_id[chunk_id]['document_id'] for chunk_id in evidence_ids}
+                    selected_evidence: list[int] = []
+                    per_document: dict[int, int] = {}
+                    for value in [*current_ids, *neighbors, *evidence_ids]:
+                        if value not in by_id or value in selected_evidence:
+                            continue
+                        document_id = document_by_chunk.get(value, by_id[value]['document_id'])
+                        if value not in current_ids and value not in neighbors and per_document.get(document_id, 0) >= 3:
+                            continue
+                        selected_evidence.append(value)
+                        per_document[document_id] = per_document.get(document_id, 0) + 1
+                        if len(selected_evidence) >= 16:
+                            break
+                    evidence_ids = selected_evidence
                     # Keep the evidence sent to the provider bounded. The full IDs remain
                     # attached to the checkpoint and are still used for quote validation;
                     # only the prompt payload is budgeted so a large retrieved hit cannot
@@ -323,14 +347,14 @@ class GptStoryAnalyzer:
                     context_chars = 0
                     for value in evidence_ids:
                         text = by_id[value]['text']
-                        budget = 2400 if value in current_ids else 1600
+                        budget = 2400 if value in current_ids else 2200
                         excerpt = text if len(text) <= budget else text[:budget]
-                        if context_ids and context_chars + len(excerpt) > 12000:
+                        if context_ids and context_chars + len(excerpt) > 16000:
                             continue
                         context_ids.append(value)
                         context_chars += len(excerpt)
                     context = [{'chunk_id': value, 'document': doc_names[by_id[value]['document_id']],
-                                'text': by_id[value]['text'] if len(by_id[value]['text']) <= (2400 if value in current_ids else 1600) else by_id[value]['text'][:(2400 if value in current_ids else 1600)]}
+                                'text': by_id[value]['text'] if len(by_id[value]['text']) <= (2400 if value in current_ids else 2200) else by_id[value]['text'][:(2400 if value in current_ids else 2200)]}
                                for value in context_ids]
                     # The catalog is a consistency hint, not evidence. Cap it and
                     # prefer names visible in this request so the prompt does not
@@ -357,7 +381,15 @@ class GptStoryAnalyzer:
                         '설명은 인용문이 뒷받침하는 범위로 제한하고 서술 순서를 사건의 시간 순서로 단정하지 마세요. '
                         '같이 등장했다는 이유만으로 관계를 만들지 마세요. 이름은 원문 표현을 유지하고 동일 인물은 일관된 이름을 사용하세요. '
                         '관계 type에 계약 거절, 계약 체결, 사용 불가처럼 방향·부정·조건을 유지하세요. 근거가 없으면 entities/relations를 빈 배열로 반환하세요. '
-                        'JSON만 반환하세요.\n' + settings_context + '\n현재 구간 ID 목록: ' + json.dumps(current_ids) + '\n원문 근거:\n' + json.dumps(context, ensure_ascii=False) + '\n이미 추출한 이름 목록:\n' + json.dumps(catalog, ensure_ascii=False))
+                        '현재 구간과 과거 회차의 원문 근거가 함께 제공되면 반드시 회차 간 규칙·행동·관계 상태를 비교하세요. '
+                        '과거 근거가 검색되지 않았으면 충돌 없음으로 단정하지 말고 issues에 포함하지 않은 채 비교 근거 부족으로 설명할 수 있도록 하세요. '
+                        'JSON만 반환하세요.\n' + settings_context + '\n현재 구간 ID 목록: ' + json.dumps(current_ids) + '\n'
+                        '검색 근거에는 현재 회차뿐 아니라 관련 과거 회차가 포함될 수 있습니다. 각 항목의 document를 회차 확인에 사용하세요.\n원문 근거:\n'
+                        + json.dumps(context, ensure_ascii=False) + '\n이미 추출한 이름 목록:\n' + json.dumps(catalog, ensure_ascii=False))
+                    prompt_hash = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+                    run.update(index, owned_chunk_ids=list(current_ids), retrieved_chunk_ids=list(evidence_ids),
+                               prompt_hash=prompt_hash, context_chunk_ids=list(context_ids),
+                               cross_chapter_context=len({by_id[value]['document_id'] for value in context_ids}) > 1)
                     def attempt(number):
                         nonlocal request_count
                         request_count += 1
