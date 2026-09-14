@@ -66,6 +66,40 @@ def test_grounded_graph_prompt_context_is_compact_and_source_backed():
     }]
 
 
+def test_later_review_window_receives_prior_verified_relation_context(tmp_path):
+    repo = StoryRepository(Database(tmp_path / 'cross-chapter.sqlite'))
+    project = repo.create_project('회차 간 관계 비교')
+    first = repo.add_document(project.id, tmp_path / 'one.txt', '1화', 'txt', 'one', '정식 계약자만 봉인검을 사용할 수 있다.', 0)
+    second = repo.add_document(project.id, tmp_path / 'seven.txt', '7화', 'txt', 'seven', '유나는 계약 없이 봉인검을 사용했다.', 6)
+    first_ids = repo.replace_chunks(project.id, first.id, [first.content])
+    second_ids = repo.replace_chunks(project.id, second.id, [second.content])
+    rag = SimpleNamespace(sync_project=lambda _: 2, retrieve=lambda *args, **kwargs: [])
+    prompts = []
+    def complete(model, prompt, **kwargs):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return {'text': json.dumps({'entities': [
+                {'id': 's', 'type': 'rule', 'name': '봉인검 사용 규칙', 'summary': '정식 계약자만 사용 가능',
+                 'evidence': [{'chunk_id': first_ids[0], 'quote': first.content}]},
+                {'id': 'i', 'type': 'item', 'name': '봉인검', 'summary': '검',
+                 'evidence': [{'chunk_id': first_ids[0], 'quote': first.content}]},
+            ], 'relations': [{
+                'source': 's', 'target': 'i', 'type': '사용 조건 제한',
+                'explanation': '정식 계약자만 봉인검을 사용할 수 있다.', 'basis': 'explicit',
+                'evidence': [{'chunk_id': first_ids[0], 'quote': first.content}],
+            }], 'issues': []})}
+        assert '사용 조건 제한' in prompt
+        assert '앞선 구간에서 검증된 관계·규칙 후보' in prompt
+        return {'text': '{"entities": [], "relations": [], "issues": []}'}
+    result = GptStoryAnalyzer(repo, rag, SimpleNamespace(complete=complete)).analyze(project.id, 'model', 'low')
+    assert result['published'] is True
+    assert len(prompts) == 2
+    detail = repo.latest_analysis_job(project.id).window_details[1]
+    assert detail['cross_chapter_context'] is True
+    assert first_ids[0] in detail['context_chunk_ids']
+    assert second_ids[0] in detail['owned_chunk_ids']
+
+
 def test_gpt_analysis_persists_only_grounded_candidates(tmp_path):
     repo, project, ids, rag = fixture(tmp_path)
     calls = []
