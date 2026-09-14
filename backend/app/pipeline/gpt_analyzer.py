@@ -11,6 +11,7 @@ from backend.app.services.gpt_errors import GptRequestError
 from backend.app.pipeline.gpt_review_run import GptReviewRun
 from backend.app.pipeline.gpt_review_window import review_window, response_timed_out
 from backend.app.pipeline.gpt_graph import GraphEntity, GraphRelation, GroundedGraph
+from backend.app.pipeline.continuity import detect_rule_action_candidates
 
 
 class ReviewIssue(BaseModel):
@@ -516,6 +517,21 @@ class GptStoryAnalyzer:
                     run.update(index, status='completed', stage='validated', error='',
                                reused=all(item[3] for item in results))
                     break
+            # GPT windows are intentionally bounded for latency, so a rule in
+            # an earlier chapter can be absent from the local prompt when a
+            # later action is reviewed. Add conservative, source-grounded
+            # cross-chapter candidates after a complete run as a safety net.
+            # Never publish these candidates for partial or failed runs.
+            if not failed_windows and not reached_batch_limit:
+                for issue in detect_rule_action_candidates(rows, documents):
+                    evidence_ids = sorted(set(issue['evidence_chunk_ids']))
+                    persisted = {
+                        'title': issue['title'],
+                        'description': issue['description'],
+                        'severity': issue['severity'],
+                        'evidence_chunk_ids': evidence_ids,
+                    }
+                    candidates.setdefault(tuple(evidence_ids), persisted)
             if reached_batch_limit:
                 leaves = [part for detail in run.details for part in detail.get('parts', []) if part['status'] != 'split']
                 saved_leaves = sum(part['status'] == 'completed' for part in leaves)

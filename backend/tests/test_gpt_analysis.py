@@ -5,6 +5,7 @@ from backend.app.database import Database
 from backend.app.repository import StoryRepository
 from backend.app.pipeline.gpt_analyzer import GptStoryAnalyzer, parse_review_result
 from backend.app.pipeline.gpt_graph import GroundedGraph, EvidenceQuote
+from backend.app.pipeline.continuity import detect_rule_action_candidates
 
 
 def fixture(tmp_path):
@@ -66,6 +67,22 @@ def test_grounded_graph_prompt_context_is_compact_and_source_backed():
     }]
 
 
+def test_continuity_detector_finds_rule_and_later_action_with_exact_sources(tmp_path):
+    repo = StoryRepository(Database(tmp_path / 'continuity.sqlite'))
+    project = repo.create_project('전역 규칙 검사')
+    first = repo.add_document(project.id, tmp_path / 'one.txt', '1화', 'txt', 'one',
+                              '정식 계약자만 봉인검을 사용할 수 있다.', 0)
+    later = repo.add_document(project.id, tmp_path / 'seven.txt', '7화', 'txt', 'seven',
+                              '유나는 계약 없이 봉인검을 사용했다.', 6)
+    first_id = repo.replace_chunks(project.id, first.id, [first.content])[0]
+    later_id = repo.replace_chunks(project.id, later.id, [later.content])[0]
+    rows = repo.list_chunks(project.id)
+    candidates = detect_rule_action_candidates(rows, [first, later])
+    assert len(candidates) == 1
+    assert candidates[0]['evidence_chunk_ids'] == sorted([first_id, later_id])
+    assert '서로 다른 회차' in candidates[0]['description']
+
+
 def test_later_review_window_receives_prior_verified_relation_context(tmp_path):
     repo = StoryRepository(Database(tmp_path / 'cross-chapter.sqlite'))
     project = repo.create_project('회차 간 관계 비교')
@@ -93,6 +110,8 @@ def test_later_review_window_receives_prior_verified_relation_context(tmp_path):
         return {'text': '{"entities": [], "relations": [], "issues": []}'}
     result = GptStoryAnalyzer(repo, rag, SimpleNamespace(complete=complete)).analyze(project.id, 'model', 'low')
     assert result['published'] is True
+    assert result['issue_count'] == 1
+    assert repo.graph(project.id).issues[0].evidence_chunk_ids == sorted([first_ids[0], second_ids[0]])
     assert len(prompts) == 2
     detail = repo.latest_analysis_job(project.id).window_details[1]
     assert detail['cross_chapter_context'] is True
