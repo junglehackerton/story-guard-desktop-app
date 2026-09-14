@@ -83,6 +83,19 @@ def test_continuity_detector_finds_rule_and_later_action_with_exact_sources(tmp_
     assert '서로 다른 회차' in candidates[0]['description']
 
 
+def test_continuity_detector_handles_signed_contract_variant(tmp_path):
+    repo = StoryRepository(Database(tmp_path / 'continuity-variant.sqlite'))
+    project = repo.create_project('표현 변형 검사')
+    first = repo.add_document(project.id, tmp_path / 'one.txt', '1화', 'txt', 'one',
+                              '정식 계약자만 봉인검을 사용할 수 있다.', 0)
+    later = repo.add_document(project.id, tmp_path / 'seven.txt', '7화', 'txt', 'seven',
+                              '유나는 계약서에 서명하지 않았지만 봉인검을 꺼내 문을 열었다.', 6)
+    first_id = repo.replace_chunks(project.id, first.id, [first.content])[0]
+    later_id = repo.replace_chunks(project.id, later.id, [later.content])[0]
+    candidates = detect_rule_action_candidates(repo.list_chunks(project.id), [first, later])
+    assert candidates and candidates[0]['evidence_chunk_ids'] == sorted([first_id, later_id])
+
+
 def test_later_review_window_receives_prior_verified_relation_context(tmp_path):
     repo = StoryRepository(Database(tmp_path / 'cross-chapter.sqlite'))
     project = repo.create_project('회차 간 관계 비교')
