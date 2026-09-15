@@ -21,7 +21,7 @@ export function relationTypesConflict(types: Iterable<string>) {
 }
 
 export function isDanglingRelation(relation: RelationEdge, entityIds: ReadonlySet<number>) {
-  return !entityIds.has(relation.source_entity_id) || !entityIds.has(relation.target_entity_id);
+  return Boolean(relation.has_unresolved_endpoint) || !entityIds.has(relation.source_entity_id) || !entityIds.has(relation.target_entity_id);
 }
 
 export function countDanglingRelations(graph: GraphPayload) {

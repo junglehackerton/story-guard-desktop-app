@@ -1,10 +1,11 @@
+import type { ReviewGraphFocus } from "../lib/reviewGraph";
 import { JudgmentActions } from "./JudgmentActions";
 import { SourceText } from "./SourceText";
 import { DocumentPicker } from "./DocumentPicker";
 import { StorySettingForm } from "./StorySettingForm";
 import { RelationStory } from "./RelationStory";
-import { useEffect, useRef, useState } from 'react';
-import { BookOpen, FileText, ScanLine, Network, Bookmark, Settings, Sparkles, ArrowRight } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { BookOpen, FileText, ScanLine, Network, Bookmark, Settings, Sparkles, ArrowRight, Trash2 } from 'lucide-react';
 import type { Project, StoryDocument, StorySetting, GraphPayload, EvidenceChunk, IssueStatus, RelationEdge, EntityNode } from '../lib/types';
 import { RelationEvidence } from './Inspector';
 import { relationPairKey, relationTypesConflict, timelinePairsByStatus } from '../lib/relationshipHealth';
@@ -19,12 +20,26 @@ export const PAGES: Record<Page, [string,string]> = {
 const MENU = [['manuscripts',FileText],['analysis',ScanLine],['review',BookOpen],['graph',Network],['foreshadowing',Bookmark]] as const;
 export function WorkbenchNav({page,onPage,project,projects,onProject}: {page:Page;onPage:(page:Page)=>void;project:Project|null;projects:Project[];onProject:(p:Project)=>void}) {
  return <aside className="workbench-nav"><button className="wordmark" onClick={()=>onPage('welcome')}>STORY GUARD</button>
- <label className="project-switch">현재 작품<select value={project?.id ?? ''} onChange={e=>{const p=projects.find(p=>p.id===Number(e.target.value));if(p)onProject(p);}}><option value="" disabled>작품 선택</option>{projects.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}</select></label>
+ <label className="project-switch" title={project?.title ?? '작품 선택'}>현재 작품<select aria-label="현재 작품" title={project?.title ?? '작품 선택'} value={project?.id ?? ''} onChange={e=>{const p=projects.find(p=>p.id===Number(e.target.value));if(p)onProject(p);}}><option value="" disabled>작품 선택</option>{projects.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}</select></label>
  <nav aria-label="작품 메뉴">{MENU.map(([key,Icon])=><button key={key} aria-label={PAGES[key][0]} title={PAGES[key][0]} aria-current={page===key?'page':undefined} onClick={()=>onPage(key)}><Icon size={21}/>{PAGES[key][0]}</button>)}</nav>
  <nav className="nav-bottom" aria-label="앱 메뉴"><button aria-label="내 작품" title="내 작품" aria-current={page==='projects'?'page':undefined} onClick={()=>onPage('projects')}><BookOpen size={21}/>내 작품</button><button aria-label="앱 설정" title="앱 설정" aria-current={page==='settings'||page==='setup'?'page':undefined} onClick={()=>onPage('settings')}><Settings size={21}/>앱 설정</button></nav><small>원고는 이 기기에 저장됩니다.</small></aside>;
 }
-export function ProjectsPage({projects,onOpen,onCreate}: {projects:Project[];onOpen:(p:Project)=>void;onCreate:()=>void}) {
- return <div className="page-content"><div className="section-heading"><h2>최근 작품 <span className="count">{projects.length}</span></h2><button className="primary" onClick={onCreate}>+ 새 작품 만들기</button></div><div className="project-grid">{projects.map(p=><button className="project-card" key={p.id} onClick={()=>onOpen(p)}><BookOpen size={32}/><h2>{p.title}</h2><p>{p.document_count ?? 0}편 · {p.pending_document_count ? `재분석 필요 ${p.pending_document_count}편` : p.last_analyzed_at ? `최근 분석 ${formatProjectDate(p.last_analyzed_at)}` : '아직 분석하지 않음'}</p>{(p.open_issue_count ?? 0) > 0 && <span className="project-issue-count">확인 대기 {p.open_issue_count}개</span>}<span>작품 열기 <ArrowRight size={16}/></span></button>)}</div>{!projects.length&&<div className="blank-state">첫 작품을 만들어 원고를 가져오세요.</div>}</div>;
+export function ProjectsPage({projects,onOpen,onCreate,onDelete}: {projects:Project[];onOpen:(p:Project)=>void;onCreate:()=>void;onDelete:(p:Project)=>void}) {
+ const [query,setQuery]=useState('');
+ const [sort,setSort]=useState<'recent'|'title'|'documents'>('recent');
+ const [status,setStatus]=useState<'all'|'ready'|'pending'|'issues'>('all');
+ const filtered=useMemo(()=>projects.filter(project=>{
+   if(!project.title.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())) return false;
+   if(status==='pending') return (project.pending_document_count??0)>0;
+   if(status==='issues') return (project.open_issue_count??0)>0;
+   if(status==='ready') return (project.pending_document_count??0)===0 && (project.open_issue_count??0)===0;
+   return true;
+ }).sort((left,right)=>{
+   if(sort==='title') return left.title.localeCompare(right.title,'ko');
+   if(sort==='documents') return (right.document_count??0)-(left.document_count??0) || left.title.localeCompare(right.title,'ko');
+   return (Date.parse(right.last_analyzed_at??'')||0)-(Date.parse(left.last_analyzed_at??'')||0) || left.title.localeCompare(right.title,'ko');
+ }),[projects,query,sort,status]);
+ return <div className="page-content"><div className="section-heading"><div><h2>{query.trim() || status!=='all' ? '작품 결과' : '최근 작품'} <span className="count">{query.trim() || status!=='all' ? filtered.length : projects.length}</span></h2><div className="project-list-tools"><label className="project-search">작품 찾기<input type="search" aria-label="작품 검색" placeholder="작품 제목 검색" value={query} onChange={event=>setQuery(event.target.value)}/></label><label className="project-sort">정렬<select aria-label="작품 정렬" value={sort} onChange={event=>setSort(event.target.value as typeof sort)}><option value="recent">최근 분석순</option><option value="title">제목순</option><option value="documents">회차 많은 순</option></select></label></div><div className="project-status-filters" role="group" aria-label="작품 상태 필터"><button type="button" aria-pressed={status==='all'} className={status==='all'?'selected':''} onClick={()=>setStatus('all')}>전체 {projects.length}</button><button type="button" aria-pressed={status==='pending'} className={status==='pending'?'selected':''} onClick={()=>setStatus('pending')}>재분석 필요 {projects.filter(p=>(p.pending_document_count??0)>0).length}</button><button type="button" aria-pressed={status==='issues'} className={status==='issues'?'selected':''} onClick={()=>setStatus('issues')}>검토 대기 {projects.filter(p=>(p.open_issue_count??0)>0).length}</button><button type="button" aria-pressed={status==='ready'} className={status==='ready'?'selected':''} onClick={()=>setStatus('ready')}>정리됨 {projects.filter(p=>(p.pending_document_count??0)===0&&(p.open_issue_count??0)===0).length}</button></div></div><button className="primary" onClick={onCreate}>+ 새 작품 만들기</button></div><div className="project-grid">{filtered.map(p=><article className="project-card" key={p.id}><button type="button" className="project-card-open" onClick={()=>onOpen(p)}><BookOpen size={32}/><h2>{p.title}</h2><p>{p.document_count ?? 0}편 · {p.pending_document_count ? `재분석 필요 ${p.pending_document_count}편` : p.last_analyzed_at ? `최근 분석 ${formatProjectDate(p.last_analyzed_at)}` : '아직 분석하지 않음'}</p>{(p.open_issue_count ?? 0) > 0 && <span className="project-issue-count">확인 대기 {p.open_issue_count}개</span>}<span>작품 열기 <ArrowRight size={16}/></span></button><button type="button" className="project-card-delete" title={`${p.title} 삭제`} aria-label={`${p.title} 작품 삭제`} onClick={()=>onDelete(p)}><Trash2 size={14}/>삭제</button></article>)}</div>{!projects.length&&<div className="blank-state">첫 작품을 만들어 원고를 가져오세요.</div>}{projects.length>0&&!filtered.length&&<div className="blank-state"><p>조건에 맞는 작품이 없습니다.</p><button onClick={()=>{setQuery('');setStatus('all')}}>필터 초기화</button></div>}</div>;
 }
 
 function formatProjectDate(value: string) {
@@ -37,17 +52,20 @@ function SettingCard({setting,onUpdate,onDelete}:{setting:StorySetting;onUpdate:
  if(editing) return <article className="setting-card setting-edit"><StorySettingForm initial={setting} onCancel={()=>setEditing(false)} onSave={async values=>{const saved=await onUpdate({...setting,...values});if(saved)setEditing(false);return saved;}}/></article>;
  return <article className="setting-card"><div><strong>{setting.title}</strong><span className={`setting-certainty ${setting.certainty}`}>{setting.certainty==='confirmed'?'확정 설정':'구상 메모'}</span></div><p>{setting.content}</p><div><button type="button" onClick={()=>setEditing(true)}>편집</button><button type="button" onClick={()=>onDelete(setting)}>삭제</button></div></article>;
 }
-export interface SourceNavigation { documentId: number; quote?: string; }
-export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,onAnalyze,onCreateSetting,onUpdateSetting,onDeleteSetting,loading,preferredDocumentId,sourceRequest,active=true}: {documents:StoryDocument[];settings:StorySetting[];onImport:()=>void;onDelete:(d:StoryDocument)=>void;onReplace:(d:StoryDocument)=>void;onAnalyze:()=>void;onCreateSetting:(title:string,content:string,certainty:StorySetting['certainty'])=>Promise<boolean>;onUpdateSetting:(setting:StorySetting)=>Promise<boolean>;onDeleteSetting:(setting:StorySetting)=>void;loading:boolean;preferredDocumentId?:number;sourceRequest?:SourceNavigation;active?:boolean}) {
+export interface SourceNavigation { documentId: number; quote?: string; edit?: boolean; }
+export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,onEdit,onAnalyze,onCreateSetting,onUpdateSetting,onDeleteSetting,loading,preferredDocumentId,sourceRequest,active=true}: {documents:StoryDocument[];settings:StorySetting[];onImport:()=>void;onDelete:(d:StoryDocument)=>void;onReplace:(d:StoryDocument)=>void;onEdit:(d:StoryDocument,content:string)=>Promise<boolean>;onAnalyze:()=>void;onCreateSetting:(title:string,content:string,certainty:StorySetting['certainty'])=>Promise<boolean>;onUpdateSetting:(setting:StorySetting)=>Promise<boolean>;onDeleteSetting:(setting:StorySetting)=>void;loading:boolean;preferredDocumentId?:number;sourceRequest?:SourceNavigation;active?:boolean}) {
  const [selection,setSelection]=useState<SourceNavigation>();
  const [readerOpen,setReaderOpen]=useState(true);
+ const [editing,setEditing]=useState(false);
+ const [draft,setDraft]=useState('');
  const readerRef=useRef<HTMLElement>(null);
  const listRef=useRef<HTMLElement>(null);
  const consumedRequest=useRef<SourceNavigation>();
- useEffect(()=>{if(preferredDocumentId!==undefined){setSelection({documentId:preferredDocumentId});setReaderOpen(true);}},[preferredDocumentId]);
+ useEffect(()=>{if(preferredDocumentId!==undefined){setSelection({documentId:preferredDocumentId});setReaderOpen(true);setEditing(false);}},[preferredDocumentId]);
  useEffect(()=>{
   if(active && sourceRequest && consumedRequest.current!==sourceRequest && documents.some(d=>d.id===sourceRequest.documentId)){
    consumedRequest.current=sourceRequest;setSelection(sourceRequest);setReaderOpen(true);
+   setEditing(Boolean(sourceRequest.edit));
   }
  },[sourceRequest,active,documents]);
  const doc=documents.find(d=>d.id===selection?.documentId)??documents[0];
@@ -61,6 +79,7 @@ export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,
   });
   return ()=>cancelAnimationFrame(frame);
  },[selection,active,doc?.id]);
+  useEffect(()=>{ if (doc) setDraft(doc.content); }, [doc?.id, doc?.content]);
  return <div className={`manuscript-layout${readerOpen ? '' : ' list-only'}`} style={readerOpen ? undefined : {gridTemplateColumns:'minmax(0, 1fr)'}}>
   <section className="surface" ref={listRef}>
    <div className="section-heading"><h2>원고 <span className="count">{documents.length}</span></h2><div className="section-actions"><button onClick={onImport} disabled={loading}>+ 여러 원고 가져오기</button>{documents.length > 0 && <button className="primary" onClick={onAnalyze}>분석 설정으로 이동</button>}</div></div>
@@ -71,7 +90,7 @@ export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,
 
    {settings.map(setting=><SettingCard key={setting.id} setting={setting} onUpdate={onUpdateSetting} onDelete={onDeleteSetting}/>) }
   </section>
-  <section className="surface manuscript-reader" ref={readerRef} style={readerOpen ? undefined : {display:'none'}}>{doc?<><div className="section-heading"><div><span className="eyebrow">가져온 원고 · 읽기 전용</span><h2 tabIndex={-1}>{doc.chapter_index+1}화 · {doc.title}</h2></div><div><button type="button" onClick={()=>{setReaderOpen(false); listRef.current?.scrollIntoView({behavior:'smooth',block:'start'}); window.setTimeout(()=>listRef.current?.querySelector<HTMLButtonElement>('.document-picker button.selected')?.focus(),180);}}>원고 목록으로</button> <button type="button" onClick={()=>onReplace(doc)} disabled={loading}>수정본으로 교체</button> <button type="button" onClick={()=>onDelete(doc)} disabled={loading}>원고 삭제</button></div></div><SourceText text={doc.content} quote={selection?.documentId===doc.id?selection.quote:undefined}/></>:<div className="blank-state"><FileText size={40}/><h2>원고를 가져오세요</h2><p>TXT, Markdown, DOCX 파일을 읽을 수 있습니다.</p><button type="button" onClick={onImport}>파일 가져오기</button></div>}</section>
+  <section className="surface manuscript-reader" ref={readerRef} style={readerOpen ? undefined : {display:'none'}}>{doc?<><div className="section-heading"><div><span className="eyebrow">가져온 원고 · {editing ? '수정 중' : '읽기 전용'}</span><h2 tabIndex={-1}>{doc.chapter_index+1}화 · {doc.title}</h2></div><div><button type="button" onClick={()=>{setReaderOpen(false);setEditing(false);listRef.current?.scrollIntoView({behavior:'smooth',block:'start'});}}>원고 목록으로</button> <button type="button" onClick={()=>{setDraft(doc.content);setEditing(true);}} disabled={loading || editing}>원문 편집</button> <button type="button" onClick={()=>onReplace(doc)} disabled={loading}>수정본 파일 교체</button> <button type="button" onClick={()=>onDelete(doc)} disabled={loading}>원고 삭제</button></div></div>{editing ? <><textarea className="manuscript-editor" value={draft} onChange={e=>setDraft(e.target.value)} aria-label="원고 편집" rows={24}/><div className="editor-actions"><button type="button" onClick={()=>{setDraft(doc.content);setEditing(false);}}>취소</button><button type="button" className="primary" disabled={loading || !draft.trim() || draft===doc.content} onClick={async()=>{if(await onEdit(doc,draft)) setEditing(false);}}>수정 저장</button><p className="muted">저장 후 이 회차의 분석 상태가 ‘재분석 필요’로 바뀝니다.</p></div></> : <SourceText text={doc.content} quote={selection?.documentId===doc.id?selection.quote:undefined}/>}</>:<div className="blank-state"><FileText size={40}/><h2>원고를 가져오세요</h2><p>TXT, Markdown, DOCX 파일을 읽을 수 있습니다.</p><button type="button" onClick={onImport}>파일 가져오기</button></div>}</section>
  </div>;
 }
 function ReviewEmptyState({showReviewed,openCount,reviewedCount,documents,onSwitch,onAnalysis}:{showReviewed:boolean;openCount:number;reviewedCount:number;documents:StoryDocument[];onSwitch:()=>void;onAnalysis:()=>void}) {
@@ -96,16 +115,27 @@ function ReviewEmptyState({showReviewed,openCount,reviewedCount,documents,onSwit
  return <div className="blank-state"><BookOpen size={32}/><h3>{title}</h3><p>{description}</p><button className="primary" onClick={onAction}>{action}</button></div>;
 }
 
-export function ReviewPage({graph,evidence,documents,onStatus,onGraph,onOpenDocument,onAnalysis,history}: {history:import("../lib/types").ReviewHistory[];graph:GraphPayload;evidence:Record<number,EvidenceChunk[]>;documents:StoryDocument[];onStatus:(id:number,s:IssueStatus)=>Promise<boolean> | void;onGraph:(relationId?:number)=>void;onOpenDocument:(id:number,quote?:string)=>void;onAnalysis:()=>void}) {
+function ReviewEvidence({ chunks, documents, onOpenDocument, onGraph, issueId }: { chunks: EvidenceChunk[]; documents: StoryDocument[]; onOpenDocument: (id: number, quote?: string) => void; onGraph: (focus: ReviewGraphFocus) => void; issueId: number }) {
+ const [showAll, setShowAll] = useState(false);
+ useEffect(() => setShowAll(false), [chunks]);
+ if (!chunks.length) return <p>이 후보에 연결된 원문 근거가 없습니다.</p>;
+ const visible = showAll ? chunks : chunks.slice(0, 3);
+ return <>
+  {visible.map(c => { const doc = documents.find(d => d.id === c.document_id); return <div className="source-card" key={c.id}><h3><FileText size={18}/>{doc ? `${doc.chapter_index + 1}화 · ${doc.title}` : '원문'}</h3><blockquote>{c.text}</blockquote><button className="text-action" onClick={() => onOpenDocument(c.document_id, c.text)}>이 회차 원고 열기</button><button className="text-action" onClick={() => onGraph({issueId, chunkId:c.id})}>이 근거의 관계 보기</button></div>; })}
+  {chunks.length > 3 && <button type="button" className="text-action evidence-toggle" aria-expanded={showAll} onClick={() => setShowAll(value => !value)}>{showAll ? '근거 접기' : `근거 ${chunks.length - 3}개 더 보기`}</button>}
+ </>;
+}
+
+export function ReviewPage({graph,evidence,documents,onStatus,onGraph,onOpenDocument,onAnalysis,history,onEdit=()=>{}}: {history:import("../lib/types").ReviewHistory[];graph:GraphPayload;evidence:Record<number,EvidenceChunk[]>;documents:StoryDocument[];onStatus:(id:number,s:IssueStatus)=>Promise<boolean> | void;onGraph:(focus:ReviewGraphFocus)=>void;onOpenDocument:(id:number,quote?:string)=>void;onAnalysis:()=>void;onEdit?:(issue:import("../lib/types").ContinuityIssue)=>void}) {
  const [id,setId]=useState<number>();const [showReviewed,setShowReviewed]=useState(false);
  const issues=graph.issues.filter(i=>showReviewed?i.status!=='open':i.status==='open');const selected=issues.find(i=>i.id===id)??issues[0];
- const focusRelation = selected && (evidence[selected.id] ?? []).length ? graph.relations.find(r => r.evidence_chunk_ids.some(chunkId => (evidence[selected.id] ?? []).some(chunk => chunk.id === chunkId))) : undefined;
+
  return <>
   <details className="revision-history surface"><summary>이전 검토 이력 · {history.length}개</summary><p className="muted">미재검출은 문제가 해소되었다는 확정이 아닙니다. 원문 근거가 달라진 후보는 새 후보로 표시하며, 동일 원문 근거가 다시 검출되면 이전 작가 판단을 유지합니다.</p>{history.map(item=><article className="source-card" key={item.id}><span className="badge">{{pending:'재분석 대기',redetected:'동일 근거 재검출',not_redetected:'이번 분석에서 미재검출'}[item.outcome]}</span><h3>{item.title}</h3><p>당시 판단: {{open:'확인 대기',accepted:'문제 있음',ignored:'문제 아님',deferred:'판단 보류'}[item.status]}</p><p>{item.description}</p><details><summary>수정 전 원문 근거</summary>{item.evidence.map(c=><blockquote key={c.id}><small>{c.chapter_index+1}화 · {c.title}</small><p>{c.text}</p><button className="text-action" onClick={()=>onOpenDocument(c.document_id,c.text)}>이 회차 원고 열기</button></blockquote>)}</details></article>)}</details>
-  <div className="review-tabs"><button className={!showReviewed?'selected':''} onClick={()=>setShowReviewed(false)}>확인 대기 <b>{graph.issues.filter(i=>i.status==='open').length}</b></button><button className={showReviewed?'selected':''} onClick={()=>setShowReviewed(true)}>작가 판단 <b>{graph.issues.filter(i=>i.status!=='open').length}</b></button></div>
+  <p className="muted">판단은 저장 즉시 반영되며 언제든 변경할 수 있습니다. 판단 변경에는 재분석이 필요하지 않습니다. 원고·설정을 수정하면 재분석이 필요합니다. ‘문제 있음’은 수정 완료를 뜻하지 않습니다.</p><div className="review-tabs" role="tablist" aria-label="검토 결과 보기"><button role="tab" aria-selected={!showReviewed} className={!showReviewed?'selected':''} onClick={()=>setShowReviewed(false)}>확인 대기 <b>{graph.issues.filter(i=>i.status==='open').length}</b></button><button role="tab" aria-selected={showReviewed} className={showReviewed?'selected':''} onClick={()=>setShowReviewed(true)}>작가 판단 <b>{graph.issues.filter(i=>i.status!=='open').length}</b></button></div>
   <div className={`review-layout${issues.length ? "" : " review-empty"}`}><section className="surface candidate-list"><h2>검토 후보</h2>{issues.map(i=><button key={i.id} className={selected?.id===i.id?'selected':''} onClick={()=>setId(i.id)}><strong>{i.title}</strong><small>{i.description}</small></button>)}{!issues.length&&<ReviewEmptyState showReviewed={showReviewed} openCount={graph.issues.filter(i=>i.status==='open').length} reviewedCount={graph.issues.filter(i=>i.status!=='open').length} documents={documents} onSwitch={()=>setShowReviewed(!showReviewed)} onAnalysis={onAnalysis}/>}</section>
-  <section className="surface review-detail">{selected?<><span className="badge">AI 검토 후보</span><h2>{selected.title}</h2><p>{selected.description}</p><div className="soft-card"><h3>판단 전에 확인해 주세요</h3><p>원문의 시점과 사용 조건, 다른 회차에서 설명된 예외가 있는지 확인해 주세요. AI의 후보가 곧 설정 오류를 의미하지는 않습니다.</p></div><button className="link-card" onClick={()=>onGraph(focusRelation?.id)}><Network size={20}/>관계 지도에서 보기 <ArrowRight size={18}/></button><JudgmentActions key={selected.id} issue={selected} onSave={onStatus}/></>:null}</section>
-  <aside className="surface evidence-column"><h2>원문 근거</h2>{selected&&(evidence[selected.id]??[]).map(c=>{const doc=documents.find(d=>d.id===c.document_id);return <div className="source-card" key={c.id}><h3><FileText size={18}/>{doc?`${doc.chapter_index+1}화 · ${doc.title}`:'원문'}</h3><blockquote>{c.text}</blockquote><button className="text-action" onClick={()=>onOpenDocument(c.document_id,c.text)}>이 회차 원고 열기</button><button className="text-action" onClick={()=>onGraph(focusRelation?.id)}>이 근거의 관계 보기</button></div>;})}{selected&&!(evidence[selected.id]?.length)&&<p>원문 근거를 불러오는 중입니다.</p>}</aside></div>
+  <section className="surface review-detail">{selected?<><span className="badge">AI 검토 후보</span><h2>{selected.title}</h2><p>{selected.description}</p><div className="soft-card"><h3>판단 전에 확인해 주세요</h3><p>원문의 시점과 사용 조건, 다른 회차에서 설명된 예외가 있는지 확인해 주세요. AI의 후보가 곧 설정 오류를 의미하지는 않습니다.</p></div><button className="link-card" onClick={()=>onGraph({issueId:selected.id})}><Network size={20}/>관계 지도에서 보기 <ArrowRight size={18}/></button><JudgmentActions key={selected.id} issue={selected} onSave={onStatus} onAccepted={()=>onEdit(selected)}/></>:null}</section>
+  <aside className="surface evidence-column"><h2>원문 근거</h2>{selected&&<ReviewEvidence chunks={evidence[selected.id]??[]} documents={documents} onOpenDocument={onOpenDocument} onGraph={onGraph} issueId={selected.id}/>}</aside></div>
  </>;
 }
 export function GraphDetails({graph,entity,relationId,onRelation,onReview,onOpenDocument,documents=[]}: {graph:GraphPayload;entity:EntityNode|null;relationId:number|null;onRelation:(id:number)=>void;onReview:()=>void;onOpenDocument:(id:number,quote?:string)=>void;documents?:StoryDocument[]}) {

@@ -352,7 +352,22 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
 @app.put("/documents/{document_id}", response_model=StoryDocument)
 async def replace_document(document_id: int, payload: DocumentReplace) -> StoryDocument:
     try:
-        content, file_format, content_hash = read_document(Path(payload.path))
+        document_path: Path
+        if payload.content is not None:
+            with repository.database.connect() as connection:
+                existing = connection.execute("SELECT path, format, project_id FROM documents WHERE id=?", (document_id,)).fetchone()
+            if existing is None:
+                raise HTTPException(status_code=404, detail="원고를 찾을 수 없습니다.")
+            content = payload.content
+            file_format = existing["format"]
+            document_path = Path(existing["path"])
+            import hashlib
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        elif payload.path:
+            content, file_format, content_hash = read_document(Path(payload.path))
+            document_path = Path(payload.path)
+        else:
+            raise HTTPException(status_code=400, detail="수정할 원문 또는 파일이 필요합니다.")
         if not content.strip():
             raise HTTPException(status_code=400, detail="빈 원고로 교체할 수 없습니다.")
         rag = RagService(chroma_path(), embedding_model=get_settings().embedding_model, repository=repository)
@@ -366,7 +381,7 @@ async def replace_document(document_id: int, payload: DocumentReplace) -> StoryD
             raise HTTPException(status_code=404, detail="원고를 찾을 수 없습니다.")
         project_id = int(row["project_id"])
         chunks = [chunk.text for chunk in rag.split_text(content, document_id, project_id)]
-        document = repository.replace_document(document_id, Path(payload.path), file_format, content_hash, content, chunks)
+        document = repository.replace_document(document_id, document_path, file_format, content_hash, content, chunks)
     except (FileNotFoundError, KeyError) as error:
         raise HTTPException(status_code=404, detail="원고 또는 파일을 찾을 수 없습니다.") from error
     except UnsupportedDocumentFormat as error:

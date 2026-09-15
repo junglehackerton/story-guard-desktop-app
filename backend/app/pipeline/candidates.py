@@ -82,6 +82,19 @@ def _collect_story_specific_candidates(body: str, add_entity) -> None:
         if place in body:
             add_entity("place", place, "등장 장소")
 
+    # Keep a deterministic, low-cost fallback for foreshadowing candidates.
+    # The local/remote LLM is still the authority for summaries and status, but
+    # a long manuscript must not end up with an empty foreshadowing page simply
+    # because one segment omitted the optional entity type.  Only promote
+    # explicit clue language or repeated named objects; this avoids treating
+    # every noun as a dangling plot thread.
+    explicit_candidates = re.findall(r"(?:떡밥|복선)\s*[:：]\s*([^\n,，.;。!?]+)", body)
+    for candidate in explicit_candidates:
+        add_entity("foreshadowing", candidate, "원문에서 작가가 표시한 단서")
+    for name in ("사라진 편지", "삭제 목록", "은빛 열쇠", "봉인검", "검은 표식"):
+        if body.count(name) >= 2 and re.search(r"(단서|흔적|빈칸|사라진|다시|나중|회수|비밀)", body):
+            add_entity("foreshadowing", name, "반복 등장하는 단서 후보")
+
 
 def _collect_relations(body: str, entity_types: dict[str, str], add_relation) -> None:
     if {"나", "점순"} <= entity_types.keys():

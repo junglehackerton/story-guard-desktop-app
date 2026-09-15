@@ -19,6 +19,14 @@ CHECK_PROMPT = '''다음은 연결 검증을 위한 가상의 원고입니다. �
 계약 규칙 위반이라고 단정할 수 있는지 한국어로 3문장 이내로 설명하고 근거 회차를 적으세요.'''
 
 
+def response_timeout_seconds(model: str, effort: str | None) -> int:
+    """Choose a response deadline for the selected model family."""
+    base = {'low': 60, 'medium': 90, 'high': 120, 'xhigh': 150}.get(effort or 'medium', 90)
+    # Astra can spend longer in provider queue and on structured Korean review.
+    # Using Luna's deadline made valid Astra responses appear as failed chunks.
+    return min(300, base + 90) if 'astra' in model.lower() else base
+
+
 class ChatGptConnection:
     def __init__(self, data_dir: Path, transport=None):
         self.home = data_dir / 'chatgpt-auth'
@@ -216,8 +224,8 @@ class ChatGptConnection:
             # grounded Korean review. The caller still has a bounded window
             # and can split it, but a 45s hard cut caused normal provider
             # queueing to be reported as a failed segment.
-            timeout_by_effort = {'low': 60, 'medium': 90, 'high': 120, 'xhigh': 150}
-            deadline = time.monotonic() + timeout_by_effort.get(effort or 'medium', 90)
+            response_timeout = response_timeout_seconds(model, effort)
+            deadline = time.monotonic() + response_timeout
             report('wait')
             messages = []
             last_error = None
@@ -262,7 +270,10 @@ class ChatGptConnection:
                     return {'model': model, 'effort': effort, 'text': text}
             if last_error is not None:
                 raise last_error
-            raise RuntimeError(f'GPT 응답 대기 시간이 초과되었습니다 ({timeout_by_effort.get(effort or "medium", 90)}초).')
+            raise RuntimeError(
+                f'{model} 응답 대기 시간이 초과되었습니다 ({response_timeout}초). '
+                '이 모델은 추론 시간이 길 수 있어 같은 구간을 더 낮은 추론 강도나 다른 모델로 재시도할 수 있습니다.'
+            )
         finally:
             if thread_id and turn_id and not turn_finished:
                 try:

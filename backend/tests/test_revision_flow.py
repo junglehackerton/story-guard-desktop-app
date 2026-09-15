@@ -105,3 +105,28 @@ def test_replace_api_rejects_empty_and_missing_file(tmp_path, monkeypatch):
     response = client.put(f'/documents/{doc.id}',json={'path':str(valid)})
     assert response.status_code == 200 and response.json()['id'] == doc.id
     assert response.json()['chapter_index'] == doc.chapter_index
+
+
+@pytest.mark.parametrize('status', ['accepted', 'ignored', 'deferred', 'open'])
+def test_judgment_changes_persist_without_reanalysis_and_can_be_reopened(tmp_path, status):
+    repo, project, ids, rag = fixture(tmp_path)
+    issue = repo.add_issue(project.id, 'high', 'contradiction', '판단 변경', '근거', ids)
+    repo.update_issue_status(issue.id, status)
+    from backend.app.repository import StoryRepository
+    reopened = StoryRepository(repo.database)
+    assert reopened.graph(project.id).issues[0].status == status
+    assert not reopened.review_history(project.id)
+    assert reopened.latest_analysis_job(project.id) is None
+    reopened.update_issue_status(issue.id, 'open')
+    assert repo.graph(project.id).issues[0].status == 'open'
+
+
+@pytest.mark.parametrize('status', ['accepted', 'ignored', 'deferred'])
+def test_reanalysis_keeps_latest_author_decision(tmp_path, status):
+    repo, project, ids, rag = fixture(tmp_path)
+    issue = repo.add_issue(project.id, 'high', 'contradiction', '판단 변경', '근거', ids)
+    repo.update_issue_status(issue.id, 'accepted')
+    repo.update_issue_status(issue.id, status)
+    payload = {'entities': [], 'relations': [], 'issues': [{'title':'같은 후보','description':'근거 동일','severity':'high','evidence_chunk_ids':ids}]}
+    GptStoryAnalyzer(repo, rag, SimpleNamespace(complete=lambda *a,**k: {'text':json.dumps(payload)})).analyze(project.id,'model','low')
+    assert repo.graph(project.id).issues[0].status == status

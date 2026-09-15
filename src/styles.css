@@ -52,6 +52,21 @@ select {
   font: inherit;
 }
 
+select {
+  min-height: 38px;
+  padding: 8px 34px 8px 12px;
+  color: #252A27;
+  background: #FFFDF8 url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%2324635B' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") no-repeat right 12px center;
+  border: 1px solid #DADFD8;
+  border-radius: 8px;
+  appearance: none;
+}
+
+select:disabled {
+  color: #8A918C;
+  background-color: #F2F0EB;
+}
+
 button {
   border: 0;
 }
@@ -1598,6 +1613,7 @@ select:focus-visible {
 .relation-evidence summary { color: #24635B; cursor: pointer; }
 .relation-evidence blockquote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid #24635B; background: #FFFDF8; }
 .relation-evidence small { color: #626B65; }
+.relation-evidence .evidence-toggle { display: block; margin-top: 10px; }
 
 .workspace > :not(.graph-stage) { flex-shrink: 0; }
 @media (max-width: 900px) { .workspace { overflow-y: visible; } }

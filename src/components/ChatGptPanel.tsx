@@ -26,10 +26,19 @@ export function formatMemoryGigabytes(megabytes: number) {
   return `${(megabytes / 1000).toFixed(2)}GB`;
 }
 
-export function ChatGptPanel({ projectId, projectTitle, hasDocuments = false, documentCount = 0, manuscriptChars = 0, documentCharCounts = [], analyzing = false, onAnalyze, showAnalysis = true, compact = false, chapters = [], analysisRange = { startChapter: null, endChapter: null }, onAnalysisRangeChange }: {
+function modelLatencyHint(model?: ChatGptModel) {
+  if (model?.id.toLowerCase().includes("astra")) {
+    return "Astra는 더 깊게 검토할 수 있지만 응답 대기가 길어질 수 있습니다. 시간 초과 시 실패 구간 재시도에서 Luna 등 다른 모델을 선택할 수 있습니다.";
+  }
+  return "모델별로 응답 시간이 다릅니다. 긴 원고는 실패 구간만 다른 모델로 재시도할 수 있습니다.";
+}
+
+export function ChatGptPanel({ projectId, projectTitle, hasDocuments = false, documentCount = 0, manuscriptChars = 0, documentCharCounts = [], analyzing = false, onAnalyze, showAnalysis = true, showModelControls = true, compact = false, chapters = [], analysisRange = { startChapter: null, endChapter: null }, onAnalysisRangeChange }: {
   projectId?: number; projectTitle?: string; hasDocuments?: boolean; analyzing?: boolean;
   documentCount?: number; manuscriptChars?: number; documentCharCounts?: number[];
   showAnalysis?: boolean;
+  /** Keep model selection with the analysis action; settings can focus on connection health. */
+  showModelControls?: boolean;
   compact?: boolean;
   chapters?: { chapterIndex: number; title: string }[];
   analysisRange?: { startChapter: number | null; endChapter: number | null };
@@ -190,11 +199,13 @@ export function ChatGptPanel({ projectId, projectTitle, hasDocuments = false, do
     </div>}
     {status?.phase === "expired" && <p role="status">인증 대기 시간이 지났습니다. 다시 연결해 주세요.</p>}
     {status?.phase === "connected" && <div className="chatgpt-check">
-      <label>사용 가능한 모델 <select aria-label="ChatGPT 모델" value={model} disabled={busy || !models.length} onChange={e => { setModel(e.target.value); setEffort(""); setResult(""); }}>
-        {models.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}
-      </select></label>
-      <ReasoningEffortSelect model={selectedModel} value={selectedEffort} disabled={busy} onChange={value => { setEffort(value); setResult(""); }} />
-      <p>추론 강도가 높을수록 더 오래 검토할 수 있으며 응답 시간이 늘어날 수 있습니다.</p>
+      {showModelControls && <>
+        <label>사용 가능한 모델 <select aria-label="ChatGPT 모델" value={model} disabled={busy || !models.length} onChange={e => { setModel(e.target.value); setEffort(""); setResult(""); }}>
+          {models.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}
+        </select></label>
+        <ReasoningEffortSelect model={selectedModel} value={selectedEffort} disabled={busy} onChange={value => { setEffort(value); setResult(""); }} />
+        <p>{modelLatencyHint(selectedModel)}</p>
+      </>}
       {!models.length && <p>모델 목록을 불러오지 못했다면 상태 확인 후 다시 연결해 주세요.</p>}
       {showAnalysis && <div>
         <strong>{projectTitle ? `분석할 작품 · ${projectTitle}` : "작품을 먼저 선택해 주세요"}</strong>
@@ -224,7 +235,7 @@ export function ChatGptPanel({ projectId, projectTitle, hasDocuments = false, do
         <label><input type="checkbox" checked={reuseResults} disabled={busy || analyzing} onChange={e => setReuseResults(e.target.checked)} /> 동일한 원문·검색 근거·모델·추론 강도의 검증된 결과 재사용 (추가 GPT 요청 절약)</label>
         <button disabled={busy || analyzing || !model || !hasDocuments || !manuscriptConsent || !onAnalyze} onClick={() => act(async () => { await onAnalyze?.(model, selectedEffort || undefined, !reuseResults, analysisRange); })}>{analyzing ? "작품 분석 중…" : "이 작품 GPT 분석"}</button>
       </div>}
-      {showAnalysis && !compact && <><label><input type="checkbox" checked={consent} disabled={busy} onChange={e => setConsent(e.target.checked)} /> 가상 원고 4문장을 OpenAI에 전송하고 내 계정의 사용 한도를 사용하는 데 동의합니다.</label>
+      {!showAnalysis && !compact && <><label><input type="checkbox" checked={consent} disabled={busy} onChange={e => setConsent(e.target.checked)} /> 가상 원고 4문장을 OpenAI에 전송하고 내 계정의 사용 한도를 사용하는 데 동의합니다.</label>
       <button disabled={busy || !model || !consent} onClick={() => act(async () => { setResult(""); setResult((await api.chatGptCheck(model, selectedEffort || undefined)).text); })}>{busy ? "확인 중…" : "샘플로 연결 검증"}</button></>}
     </div>}
     {(error || status?.error) && <p role="alert">{error || status?.error}</p>}

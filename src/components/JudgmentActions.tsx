@@ -1,9 +1,10 @@
 import { useRef, useState } from 'react';
 import type { ContinuityIssue, IssueStatus } from '../lib/types';
 
-export function JudgmentActions({ issue, onSave }: {
+export function JudgmentActions({ issue, onSave, onAccepted }: {
   issue: ContinuityIssue;
   onSave: (id: number, status: IssueStatus) => Promise<boolean> | void;
+  onAccepted?: () => void;
 }) {
   const pending = useRef(false);
   const [saving, setSaving] = useState(false);
@@ -14,6 +15,7 @@ export function JudgmentActions({ issue, onSave }: {
     setSaving(true); setError('');
     try {
       if (await onSave(issue.id, status) === false) throw new Error('save failed');
+      if (status === 'accepted') onAccepted?.();
     } catch {
       setError('판단 저장을 확인하지 못했습니다. 현재 표시된 판단은 바꾸지 않았습니다. 다시 선택해 저장해 주세요.');
     } finally { pending.current = false; setSaving(false); }

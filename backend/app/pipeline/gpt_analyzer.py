@@ -107,6 +107,7 @@ class GptStoryAnalyzer:
     # The character ceiling keeps latency and context pressure bounded before
     # the provider has a chance to time out.
     MAX_REVIEW_WINDOW_CHARS = 5200
+    REVIEW_VERSION = 'gpt-review-v5-foreshadowing'
 
     def __init__(self, repository, rag, connection):
         self.repository = repository
@@ -271,7 +272,7 @@ class GptStoryAnalyzer:
                 progress=30,
             )
             run = GptReviewRun(self.repository.database, job.id, project_id,
-                ['gpt-review-v4-split', model, effort, schema, rows,
+                [self.REVIEW_VERSION, model, effort, schema, rows,
                  [(doc.id, doc.content_hash, doc.chapter_index, doc.title) for doc in documents], [setting.model_dump() for setting in original_settings]],
                 review_rows, doc_names, model, effort, force, start_chapter, end_chapter)
             cached_count = request_count = 0
@@ -371,7 +372,8 @@ class GptStoryAnalyzer:
                     # The catalog is a consistency hint, not evidence. Cap it and
                     # prefer names visible in this request so the prompt does not
                     # grow linearly with the entire manuscript.
-                    all_catalog = sorted(extracted_graph.entities)
+                    all_catalog = sorted(key for key, value in extracted_graph.entities.items()
+                                         if not value.get('is_unresolved'))
                     visible_text = ' '.join(item['text'] for item in context)
                     visible_catalog = [item for item in all_catalog if item[1] in visible_text]
                     catalog_items = (visible_catalog + [item for item in all_catalog if item not in visible_catalog])[:40]
@@ -384,6 +386,15 @@ class GptStoryAnalyzer:
                         '관계 지도는 현재 구간에 직접 서술된 사실을 중심으로 추출하세요. 관계 evidence에는 현재 구간 ID 목록 중 하나의 인용을 반드시 포함하세요. '
                         '이미 추출한 목록은 이름 일관성 참고용이며 근거가 아닙니다. 같은 대상을 다시 추출하면 기존 type과 name을 그대로 재사용하세요. '
                         '함께 인물·아이템·장소·규칙의 관계 지도를 추출하세요. entities의 id는 응답 안에서 고유하며 relations의 source와 target은 그 id를 참조해야 합니다. '
+                        '설정 충돌 유무와 별개로 떡밥 후보도 검토하세요. 독자가 이후의 답을 기대하게 되는 구체적인 질문, '
+                        '만남·탐색의 약속, 정체가 감춰진 단서, 원인이 설명되지 않은 사건을 type=foreshadowing으로 추출하세요. '
+                        '단순 반복 소품이나 분위기 묘사만으로 후보를 만들지 말고, 후보가 없으면 억지로 채우지 마세요. '
+                        '아이템 자체와 그 아이템이 제기하는 질문은 구분하세요. 기존 item/event를 바꾸지 말고 '
+                        '질문·약속을 나타내는 구체적인 이름의 foreshadowing 엔티티를 별도로 만들고 관련 대상에 연결하세요. '
+                        '후보 evidence에는 현재 구간의 정확한 원문 인용을 최소 1개 포함하세요. 충돌의 청크 2개 조건을 후보 도입에 적용하지 마세요. '
+                        'summary에는 무엇을 밝혀야 하는지, 원문이 왜 답을 기대하게 하는지, 제공된 근거에서 확인되는 진행·회수를 설명하세요. '
+                        '이미 답이 나온 단서도 회수 근거가 있으면 그 내용을 기록하세요. 이후 언급이 없거나 검색되지 않았다는 이유만으로 '
+                        '미회수 오류를 선언하지 말고, 회수 여부를 판단할 근거가 부족하면 확인 필요라고 설명하세요. '
                         '이전 목록에 있더라도 관계의 양 끝 대상은 이번 응답의 entities에도 반드시 포함하세요. source/target에는 이름이 아니라 이번 응답의 id를 넣으세요. '
                         '각 엔티티와 관계의 evidence에 제공된 chunk_id와 해당 원문의 연속된 정확한 인용문 quote를 넣으세요. '
                         '관계마다 explanation에 누가 누구에게 무엇을 했으며 어떤 조건인지 한두 문장으로 설명하세요. '
@@ -643,7 +654,8 @@ class GptStoryAnalyzer:
             key = (str(entity.type), str(entity.name))
             ids = evidence_by_entity.get(key, set())
             if ids:
-                result.entities[key] = {'summary': entity.summary, 'ids': set(ids)}
+                result.entities[key] = {'summary': entity.summary, 'ids': set(ids),
+                                        'is_unresolved': entity.is_unresolved}
         for relation in published.relations:
             source = entity_by_id.get(int(relation.source_entity_id))
             target = entity_by_id.get(int(relation.target_entity_id))
@@ -699,5 +711,11 @@ class GptStoryAnalyzer:
                     db.execute('UPDATE review_history SET outcome=? WHERE id=?',
                         ('redetected' if previous['fingerprint'] in fingerprints else 'not_redetected', previous['id']))
             message = f'GPT 설정 충돌 후보 {len(issues)}개 검토 완료. 검색 범위 밖의 충돌이 없음을 보장하지 않습니다.'
+            unresolved_count = sum(any(extracted_graph.entities[key].get('is_unresolved')
+                                      for key in (source, target))
+                                   for source, target, _ in extracted_graph.relations)
+            if unresolved_count:
+                message += (f' 연결 확인이 필요한 분석 결과 {unresolved_count}개를 관계 지도에 보존했습니다. '
+                            'AI 추출 누락일 수 있으며 작가의 설정 오류로 확정하지 않습니다.')
             db.execute("UPDATE analysis_jobs SET status='completed',current_step='completed',progress=100,message=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
                        (message, job_id))

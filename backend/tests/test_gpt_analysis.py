@@ -261,8 +261,8 @@ def test_chapter_range_limits_review_windows_without_dropping_unselected_data(tm
     assert repo.latest_analysis_job(project.id).review_context['start_chapter'] == 1
     assert repo.latest_analysis_job(project.id).review_context['end_chapter'] == 1
     assert len(prompts) == 1
-    assert str(second_ids[0]) in prompts[0]
-    assert str(ids[0]) not in prompts[0]
+    current_ids = json.loads(prompts[0].split('현재 구간 ID 목록: ', 1)[1].split('\n', 1)[0])
+    assert current_ids == second_ids
 
 
 def test_chapter_range_reanalysis_preserves_graph_from_unselected_chapters(tmp_path):
@@ -618,14 +618,13 @@ def test_graph_relation_labels_normalize_whitespace_and_unicode(tmp_path):
     assert relations[0].type == '계약 없이 사용'
 
 
-@pytest.mark.parametrize('corruption', ['quote', 'chunk', 'endpoint'])
+@pytest.mark.parametrize('corruption', ['quote', 'chunk'])
 def test_invalid_graph_preserves_previous_graph(tmp_path, corruption):
     repo, project, ids, rag = fixture(tmp_path)
     old = repo.upsert_entity(project.id, 'character', '기존 인물', [], '보존', None)
     payload = graph_payload(ids)
     if corruption == 'quote': payload['relations'][0]['evidence'][0]['quote'] = '원고에 없는 문장'
     if corruption == 'chunk': payload['relations'][0]['evidence'][0]['chunk_id'] = 999
-    if corruption == 'endpoint': payload['relations'][0]['target'] = 'unknown'
     connection = SimpleNamespace(complete=lambda *a, **k: {'text': json.dumps(payload)})
     result = GptStoryAnalyzer(repo, rag, connection).analyze(project.id, 'model', None)
     assert result['published'] is False

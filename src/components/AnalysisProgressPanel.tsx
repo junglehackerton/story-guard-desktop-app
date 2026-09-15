@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle2, Loader2, RotateCcw } from "lucide-react";
-import type { AnalysisJob } from "../lib/types";
+import { api } from "../lib/api";
+import type { AnalysisJob, ChatGptModel } from "../lib/types";
 
 const STEP_LABELS: Record<string, string> = {
   idle: "대기",
@@ -77,14 +78,40 @@ function iconForStatus(job: AnalysisJob) {
   return <Loader2 aria-hidden="true" className="analysis-progress-spinner" size={18} />;
 }
 
-export function AnalysisProgressPanel({ job, onRetry, onCancel }: { job: AnalysisJob; onRetry?: () => void; onCancel?: () => void }) {
+export function AnalysisProgressPanel({ job, onRetry, onCancel, defaultModel, defaultEffort }: {
+  job: AnalysisJob;
+  onRetry?: (model?: string, effort?: string) => void;
+  onCancel?: () => void;
+  defaultModel?: string;
+  defaultEffort?: string;
+}) {
   const [recordFilter, setRecordFilter] = useState(job.status === 'completed' ? 'completed' : 'attention');
   const [recordPage, setRecordPage] = useState(0);
+  const [retryModels, setRetryModels] = useState<ChatGptModel[]>([]);
+  const retryDefaultModel = defaultModel ?? job.review_context?.model;
+  const retryDefaultEffort = defaultEffort ?? job.review_context?.effort;
+  const [retryModel, setRetryModel] = useState(retryDefaultModel ?? "");
+  const [retryEffort, setRetryEffort] = useState(retryDefaultEffort ?? "");
   useEffect(() => { setRecordFilter(job.status === 'completed' ? 'completed' : 'attention'); setRecordPage(0); }, [job.id, job.status]);
   const progress = clampProgress(job.progress);
   const currentStepLabel = STEP_LABELS[job.current_step] ?? job.current_step;
   const hasSkippedWindows = job.status === "partial" || (job.status === "completed" && job.message.includes("실패하여 건너뛰었고"));
   const canRetry = Boolean(onRetry && (job.status === "failed" || job.status === "cancelled" || hasSkippedWindows));
+  useEffect(() => {
+    if (!canRetry || !retryDefaultModel) return;
+    let disposed = false;
+    setRetryModel(retryDefaultModel);
+    setRetryEffort(retryDefaultEffort ?? "");
+    api.chatGptModels().then(values => {
+      if (!disposed) setRetryModels(values);
+    }).catch(() => { if (!disposed) setRetryModels([]); });
+    return () => { disposed = true; };
+  }, [canRetry, retryDefaultModel, retryDefaultEffort]);
+  const selectedRetryModel = retryModels.find(value => value.id === retryModel);
+  const retryEfforts = selectedRetryModel?.efforts ?? [];
+  const selectedRetryEffort = retryEfforts.some(value => value.value === retryEffort)
+    ? retryEffort
+    : selectedRetryModel?.default_effort ?? retryEffort;
   const stopped = ['failed', 'partial', 'cancelled'].includes(job.status);
   // Older releases kept running/queued records after their job had ended.
   const displayStatus = (status: string) => stopped && status === 'running' ? 'interrupted'
@@ -132,9 +159,20 @@ export function AnalysisProgressPanel({ job, onRetry, onCancel }: { job: Analysi
       {windows.length > 0 && job.status === "running" && estimatedRemaining > 0 && <p className="analysis-progress-eta" aria-label="예상 잔여 시간">현재 처리 속도 기준 {formatRemainingSeconds(estimatedRemaining)} · 원고 크기와 GPT 응답에 따라 달라질 수 있습니다.</p>}
       {deferredCount > 0 && <p>아직 요청하지 않은 구간 {deferredCount}개가 있습니다. 오류 원인을 해결한 뒤 같은 원고·설정으로 재시도하면 저장된 성공 구간은 다시 요청하지 않습니다.</p>}
       {canRetry && onRetry && <div className="analysis-retry-summary">
-        {job.review_context?.model && <><strong>재시도에 사용할 설정</strong><p>{job.review_context.model} · {job.review_context.effort ? EFFORT_LABELS[job.review_context.effort] ?? job.review_context.effort : '모델 기본값'}</p></>}
+        <strong>재시도에 사용할 설정</strong>
+        {retryDefaultModel && <div className="analysis-retry-options">
+          <label>모델 <select aria-label="재시도 모델" value={retryModel} onChange={event => { setRetryModel(event.target.value); setRetryEffort(""); }} disabled={!retryModels.length}>
+            {!retryModels.length && <option value={retryModel}>{retryModel}</option>}
+            {retryModels.map(value => <option key={value.id} value={value.id}>{value.name}</option>)}
+          </select></label>
+          <label>추론 강도 <select aria-label="재시도 추론 강도" value={selectedRetryEffort} onChange={event => setRetryEffort(event.target.value)} disabled={!retryEfforts.length}>
+            {!selectedRetryModel && <option value="">모델 기본값</option>}
+            {retryEfforts.map(value => <option key={value.value} value={value.value}>{EFFORT_LABELS[value.value] ?? value.value}</option>)}
+          </select></label>
+        </div>}
+        {retryDefaultModel && <p className="analysis-retry-selection">{retryModel || retryDefaultModel} · {selectedRetryEffort ? EFFORT_LABELS[selectedRetryEffort] ?? selectedRetryEffort : '모델 기본값'}</p>}
         <p>같은 원고·설정의 검증된 구간은 재사용합니다. 변경된 원고나 설정은 다시 검토하며, 새 요청에는 계정 사용량이 발생합니다.</p>
-        <button type="button" className="analysis-progress-retry" onClick={onRetry}>
+        <button type="button" className="analysis-progress-retry" onClick={() => onRetry(retryModel || retryDefaultModel, selectedRetryEffort || retryDefaultEffort || undefined)}>
           <RotateCcw aria-hidden="true" size={15} /> {windows.length ? "남은 구간 이어서 분석" : "다시 분석"}
         </button>
       </div>}

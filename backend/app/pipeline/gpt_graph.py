@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import unicodedata
 import math
@@ -50,6 +51,8 @@ class GroundedGraph:
         """
         rows = []
         for (source, target, label), evidence_ids in self.relations.items():
+            if any(self.entities.get(key, {}).get('is_unresolved') for key in (source, target)):
+                continue
             claims = self.claims.get((source, target, label), [])
             explanation = claims[-1].get('explanation', '') if claims else ''
             rows.append({
@@ -169,12 +172,17 @@ class GroundedGraph:
             pending_entities.setdefault(key, {'summary': entity.summary, 'ids': set()})['ids'].update(ids)
             if current_chunk_id in ids:
                 selected_keys.add(key)
+        # Model-local IDs are not identities across responses. Scope diagnostic
+        # nodes to this response so two unrelated "e9" references cannot merge.
+        scope = hashlib.sha256(json.dumps([
+            sorted(context), sorted((e.id, e.type, e.name) for e in entities),
+        ], ensure_ascii=False).encode()).hexdigest()[:16]
+        by_name = {}
+        for key in pending_entities:
+            by_name.setdefault(self._label(key[1]), set()).add(key)
         for relation in relations:
-            if relation.source not in references or relation.target not in references:
-                raise RuntimeError('관계 지도의 연결 대상이 추출된 엔티티에 없습니다.')
-            source, target = references[relation.source], references[relation.target]
             relation_label = self._label(relation.type)
-            if source == target or not relation_label:
+            if not relation_label:
                 raise RuntimeError('관계 지도의 연결 또는 관계 이름이 올바르지 않습니다.')
             if relation_label.casefold() in {'관계', '관련', '관련됨', 'related', 'related_to', 'co_occurs'}:
                 raise RuntimeError('관계 유형에 구체적인 행동이나 상태가 필요합니다.')
@@ -183,17 +191,44 @@ class GroundedGraph:
             ids = self._evidence(relation.evidence, context)
             if current_chunk_id not in ids:
                 continue
+            endpoints = []
+            missing = []
+            for reference in (relation.source, relation.target):
+                key = references.get(reference)
+                if key is None:
+                    matches = by_name.get(self._label(reference), set())
+                    if len(matches) == 1:
+                        key = next(iter(matches))
+                    else:
+                        key = ('event', f'미확인 대상 #{scope} ({reference})')
+                        pending_entities.setdefault(key, {
+                            'summary': f'분석 확인 필요: AI가 관계에서 참조한 {reference!r} 대상이 '
+                            '응답의 대상 목록에 없습니다. 원고의 설정 오류로 확정한 것이 아닙니다. '
+                            '연결된 관계의 원문 근거를 확인하세요.',
+                            'ids': set(), 'is_unresolved': True,
+                        })['ids'].update(ids)
+                        missing.append(reference)
+                endpoints.append(key)
+            source, target = endpoints
+            if source == target:
+                raise RuntimeError('관계 지도의 연결 또는 관계 이름이 올바르지 않습니다.')
             selected_keys.update((source, target))
             key = (source, target, relation_label)
             self.relations.setdefault(key, set()).update(ids)
-            claim = {'explanation': relation.explanation.strip(), 'basis': relation.basis,
+            explanation = relation.explanation.strip()
+            if missing:
+                explanation = ('분석 확인 필요: 연결 대상 ' + ', '.join(missing) +
+                    '을 추출 결과에서 확인하지 못했습니다. 작가의 설정 오류로 단정하지 않습니다. '
+                    'AI가 제안한 관계: ' + explanation)
+            claim = {'explanation': explanation, 'basis': 'inferred' if missing else relation.basis,
                      'quotes': [quote.model_dump() for quote in relation.evidence]}
             if claim not in self.claims.setdefault(key, []):
                 self.claims[key].append(claim)
         for key in selected_keys:
             entity = pending_entities[key]
             if key not in self.entities:
-                self.entities[key] = {"summary": entity["summary"], "ids": set()}
+                self.entities[key] = {"summary": entity["summary"], "ids": set(),
+                                      "is_unresolved": entity.get('is_unresolved', False)}
             self.entities[key]["ids"].update(entity["ids"])
 
     def store(self, db, project_id, rows, documents, model, effort):
@@ -208,10 +243,11 @@ class GroundedGraph:
             ids = sorted(entity['ids'])
             doc_ids = {by_id[value]['document_id'] for value in ids}
             first = min(doc_ids, key=lambda value: doc_order[value])
-            db.execute('''INSERT INTO entities(project_id,type,name,aliases,summary,first_seen_document_id)
-                VALUES(?,?,?,'[]',?,?) ON CONFLICT(project_id,type,name) DO UPDATE SET
-                summary=excluded.summary,first_seen_document_id=excluded.first_seen_document_id''',
-                (project_id, kind, name, entity['summary'], first))
+            db.execute('''INSERT INTO entities(project_id,type,name,aliases,summary,first_seen_document_id,is_unresolved)
+                VALUES(?,?,?,'[]',?,?,?) ON CONFLICT(project_id,type,name) DO UPDATE SET
+                summary=excluded.summary,first_seen_document_id=excluded.first_seen_document_id,
+                is_unresolved=excluded.is_unresolved''',
+                (project_id, kind, name, entity['summary'], first, int(entity.get('is_unresolved', False))))
             entity_ids[(kind, name)] = db.execute('SELECT id FROM entities WHERE project_id=? AND type=? AND name=?',
                 (project_id, kind, name)).fetchone()['id']
             for doc_id in doc_ids:

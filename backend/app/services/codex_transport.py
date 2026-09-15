@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import threading
 import tempfile
+import time
 
 
 def isolated_environment(home: Path) -> dict[str, str]:
@@ -55,6 +56,7 @@ class CodexTransport:
                 return
             self.home.mkdir(parents=True, exist_ok=True, mode=0o700)
             if self.runtime_home is None:
+                self._cleanup_stale_runtime_homes()
                 self.runtime_home = Path(tempfile.mkdtemp(prefix='storyguard-codex-'))
                 self.runtime_home.chmod(0o700)
             auth_file = self.home / 'auth.json'
@@ -84,6 +86,27 @@ class CodexTransport:
             except Exception:
                 self.close()
                 raise RuntimeError('Codex app-server 초기화에 실패했습니다. 실행 파일 버전과 설치 상태를 확인해 주세요.') from None
+
+    @staticmethod
+    def _cleanup_stale_runtime_homes(max_age_seconds: int = 12 * 60 * 60) -> None:
+        """Remove abandoned app-server sandboxes left by a crash or force quit.
+
+        Normal shutdown already removes ``runtime_home``.  A killed process
+        cannot run ``close()``, however, so its PyInstaller/Codex state would
+        otherwise accumulate in the system temp directory on every retry.
+        Only our own prefix and entries older than the safety window are
+        touched; a currently running server gets a fresh directory and is not
+        eligible during ordinary analysis runs.
+        """
+        temp_root = Path(tempfile.gettempdir())
+        now = time.time()
+        for candidate in temp_root.glob('storyguard-codex-*'):
+            try:
+                if not candidate.is_dir() or now - candidate.stat().st_mtime < max_age_seconds:
+                    continue
+                shutil.rmtree(candidate, ignore_errors=True)
+            except OSError:
+                continue
 
     def _send(self, message):
         with self._write_lock:

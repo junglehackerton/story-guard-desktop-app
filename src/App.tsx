@@ -1,6 +1,7 @@
+import { relatedRelations, type ReviewGraphFocus } from "./lib/reviewGraph";
 import { ProjectMutationScope } from "./lib/projectMutationScope";
 import { DocumentPicker } from "./components/DocumentPicker";
-import { WorkbenchNav, ProjectsPage, ManuscriptsPage, ReviewPage, GraphDetails, PAGES, type Page } from "./components/Workbench";
+import { WorkbenchNav, ProjectsPage, ManuscriptsPage, ReviewPage, PAGES, type Page } from "./components/Workbench";
 import { lazy, Suspense, type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
@@ -30,8 +31,19 @@ import type {
   StorySetting,
   ForeshadowingStatus,
 } from "./lib/types";
-const GraphView = lazy(() => import("./components/GraphView").then(({ GraphView: view }) => ({ default: view })));
+const GraphView = lazy(() => import("./components/RelationshipExplorer").then(({ RelationshipExplorer: view }) => ({ default: view })));
 import { Inspector } from "./components/Inspector";
+
+function formatNotice(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value instanceof Error) return value.message;
+  if (value && typeof value === "object") {
+    const detail = (value as { detail?: unknown }).detail;
+    if (typeof detail === "string") return detail;
+    try { return JSON.stringify(value); } catch { return "알 수 없는 오류가 발생했습니다."; }
+  }
+  return String(value ?? "");
+}
 import { Sidebar } from "./components/Sidebar";
 import { ChatGptPanel } from "./components/ChatGptPanel";
 import { SetupPanel } from "./components/SetupPanel";
@@ -285,6 +297,7 @@ export default function App() {
   const [page, setPage] = useState<Page>(() =>
     startupRoute(Boolean(window.localStorage.getItem(SELECTED_PROJECT_STORAGE_KEY))),
   );
+  const [reviewGraphFocus, setReviewGraphFocus] = useState<ReviewGraphFocus | null>(null);
   const [selectedRelationId, setSelectedRelationId] = useState<number | null>(null);
   const [graphSearch, setGraphSearch] = useState("");
   const [projects, setProjects] = useState<Project[]>([]);
@@ -292,9 +305,10 @@ export default function App() {
   const [projectTitleDraft, setProjectTitleDraft] = useState("");
   const [editingProjectTitle, setEditingProjectTitle] = useState(false);
   const [projectModalOpen, setProjectModalOpen] = useState(false);
+  const [projectDeleteCandidate, setProjectDeleteCandidate] = useState<Project | null>(null);
   const [newProjectTitle, setNewProjectTitle] = useState("");
   const [documentPathModalOpen, setDocumentPathModalOpen] = useState(false);
-  const [sourceRequest, setSourceRequest] = useState<{documentId:number;quote?:string}>();
+  const [sourceRequest, setSourceRequest] = useState<{documentId:number;quote?:string;edit?:boolean}>();
   const [replacementDocument, setReplacementDocument] = useState<StoryDocument | null>(null);
   const [reviewHistory, setReviewHistory] = useState<import("./lib/types").ReviewHistory[]>([]);
   const [documentPathDraft, setDocumentPathDraft] = useState("");
@@ -360,7 +374,7 @@ export default function App() {
   }, [page]);
 
   useEffect(() => {
-    const modalOpen = projectModalOpen || documentPathModalOpen;
+    const modalOpen = projectModalOpen || documentPathModalOpen || projectDeleteCandidate !== null;
     if (!modalOpen) {
       if (modalWasOpenRef.current) {
         modalWasOpenRef.current = false;
@@ -454,7 +468,10 @@ export default function App() {
         ? relations
             .filter((relation) => isCoreRelation(relation) || isMembershipRelation(relation) || relation.is_recent)
             .sort((left, right) => relationScore(right) - relationScore(left))
-            .slice(0, 64)
+            // Core is the writer's overview, not a second full export. Keep
+            // the evidence rail exhaustive while limiting the initial canvas
+            // to a readable set for long manuscripts.
+            .slice(0, graph.entities.length > 36 ? 36 : 64)
         : relations;
     // Diagnostic mode must inspect the complete extraction result. Applying
     // the core-confidence slice first could hide precisely the weak or
@@ -630,7 +647,7 @@ export default function App() {
       const created = await api.createStorySetting(selectedProject.id, {title, content, certainty});
       if (write.isCurrent()) {
         setStorySettings(items => [...items.filter(item => item.id !== created.id), created]);
-        setNotice("설정 메모를 저장했습니다.");
+        setNotice("설정 메모를 저장했습니다. 검토 결과에 반영하려면 재분석이 필요합니다.");
       }
       return true;
     } catch (error) {
@@ -646,7 +663,7 @@ export default function App() {
       const updated = await api.updateStorySetting(setting.id, {title: setting.title, content: setting.content, certainty: setting.certainty});
       if (write.isCurrent()) {
         setStorySettings(items => items.map(item => item.id === updated.id ? updated : item));
-        setNotice("설정 메모를 갱신했습니다.");
+        setNotice("설정 메모를 갱신했습니다. 검토 결과에 반영하려면 재분석이 필요합니다.");
       }
       return true;
     } catch (error) {
@@ -662,7 +679,7 @@ export default function App() {
       await api.deleteStorySetting(setting.id);
       if (write.isCurrent()) {
         setStorySettings(items => items.filter(item => item.id !== setting.id));
-        setNotice("설정 메모를 삭제했습니다.");
+        setNotice("설정 메모를 삭제했습니다. 검토 결과에 반영하려면 재분석이 필요합니다.");
       }
     } catch (error) {
       if (write.isCurrent()) setNotice(error instanceof Error ? error.message : "설정 메모 삭제 실패");
@@ -865,11 +882,13 @@ export default function App() {
   useEffect(() => {
     if (
       selectedEntity &&
-      !filteredGraph.entities.some((entity) => entity.id === selectedEntity.id)
+      !graph.entities.some((entity) => entity.id === selectedEntity.id)
     ) {
       setSelectedEntity(null);
     }
-  }, [filteredGraph.entities, selectedEntity]);
+    // The explorer receives the full graph. Legacy core/health filters must
+    // not clear a node selected in that explorer (for example, 서우).
+  }, [graph.entities, selectedEntity]);
 
   useEffect(() => {
     if (!setupProgress?.running) {
@@ -1059,29 +1078,28 @@ export default function App() {
     }
   }
 
-  async function deleteSelectedProject() {
-    if (!selectedProject) {
-      return;
-    }
-    const confirmed = window.confirm(
-      `'${selectedProject.title}' 작품을 삭제할까요?\n이 작품의 원고, 청크, 엔티티, 관계, 이슈가 모두 삭제됩니다.`,
-    );
-    if (!confirmed) {
-      return;
-    }
-    const deletedProject = selectedProject;
+  function requestDeleteProject(projectToDelete = selectedProject) {
+    if (projectToDelete) setProjectDeleteCandidate(projectToDelete);
+  }
+
+  async function executeDeleteProject(projectToDelete: Project) {
+    const deletedProject = projectToDelete;
+    setProjectDeleteCandidate(null);
     setLoading(true);
     try {
       await api.deleteProject(deletedProject.id);
       clearGraphPositions(deletedProject.id);
       window.localStorage.removeItem(SELECTED_PROJECT_STORAGE_KEY);
-      prepareProjectData(null);
-      setSelectedProject(null);
-      setChapterRange({ startChapter: null, endChapter: null });
-      setSelectedEntity(null);
-      setAnalysisJob(null);
-      const nextSelectedProject = await refreshProjects(null);
-      await refreshProjectData(nextSelectedProject);
+      const wasSelected = selectedProject?.id === deletedProject.id;
+      if (wasSelected) {
+        prepareProjectData(null);
+        setSelectedProject(null);
+        setChapterRange({ startChapter: null, endChapter: null });
+        setSelectedEntity(null);
+        setAnalysisJob(null);
+      }
+      const nextSelectedProject = await refreshProjects(wasSelected ? null : selectedProject?.id);
+      if (wasSelected) await refreshProjectData(nextSelectedProject);
       setNotice(`작품 삭제: ${deletedProject.title}`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "작품 삭제 실패");
@@ -1170,6 +1188,24 @@ export default function App() {
     setDocumentPathDraft("");
     modalTriggerRef.current = globalThis.document.activeElement instanceof HTMLElement ? globalThis.document.activeElement : null;
     setDocumentPathModalOpen(true);
+  }
+
+  async function editDocument(document: StoryDocument, content: string): Promise<boolean> {
+    if (!selectedProject || workspaceBusy) return false;
+    const write = mutationScope.current.begin(selectedProject.id, `document-edit:${document.id}`);
+    if (!write) return false;
+    setLoading(true);
+    try {
+      const updated = await api.editDocument(document.id, content);
+      if (write.isCurrent()) {
+        setDocuments(items => items.map(item => item.id === updated.id ? updated : item));
+        setNotice('원고를 저장했습니다. 이 회차는 재분석이 필요합니다.');
+      }
+      return true;
+    } catch (error) {
+      if (write.isCurrent()) setNotice(error instanceof Error ? error.message : '원고 저장 실패');
+      return false;
+    } finally { write.finish(); setLoading(false); }
   }
 
   async function chooseDocumentFile(replacement: StoryDocument | null) {
@@ -1332,7 +1368,8 @@ export default function App() {
           ...current,
           issues: current.issues.map((issue) => (issue.id === issueId ? updated : issue)),
         }));
-        setNotice("작가 판단을 저장했습니다.");
+        setProjects(current => current.map(project => project.id === selectedProject.id ? {...project, open_issue_count: graph.issues.filter(issue => (issue.id === issueId ? status : issue.status) === "open").length} : project));
+        setNotice("작가 판단을 저장했습니다. 재분석 없이 반영됩니다.");
       }
       return true;
     } catch (error) {
@@ -1391,7 +1428,7 @@ export default function App() {
   const projectDataBlocked = selectedProject !== null && snapshotProjectId !== selectedProject.id;
 
   return (
-    <div className={`app-shell workbench page-${page}`}>
+    <div className={`app-shell workbench page-${page}`} style={{ gridTemplateColumns: "216px minmax(0, 1fr)" }}>
       <WorkbenchNav page={page} onPage={setPage} project={selectedProject} projects={projects} onProject={selectProject}/>
       <main ref={workspaceRef} className="workspace">
         <header className="workspace-header">
@@ -1437,7 +1474,7 @@ export default function App() {
                       className="icon-button danger"
                       type="button"
                       title="작품 삭제"
-                      onClick={deleteSelectedProject}
+                      onClick={() => requestDeleteProject()}
                       disabled={workspaceBusy}
                     >
                       <Trash2 size={16} />
@@ -1449,9 +1486,9 @@ export default function App() {
           </div>
           <div className="status-strip">
             {!['welcome','projects','setup','settings'].includes(page) && <button type="button" onClick={() => setPage(page === "graph" ? "analysis" : "graph")}>{page === "graph" ? "새 분석" : "관계 지도"}</button>}
-            {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && <span role={projectDataError ? "alert" : undefined}>{projectDataLoading ? '작품 데이터를 새로 확인하는 중입니다.' : notice}</span>}
+            {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && <span role={projectDataError ? "alert" : undefined}>{projectDataLoading ? '작품 데이터를 새로 확인하는 중입니다.' : formatNotice(notice)}</span>}
             {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && projectDataError && <button type="button" disabled={projectDataLoading} onClick={() => void refreshProjectData(selectedProject)}>다시 시도</button>}
-            {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && <><strong>{filteredGraph.entities.length} nodes</strong><strong>{filteredGraph.relations.length}/{graph.relations.length} links</strong></>}
+            {!['welcome','projects','setup','settings'].includes(page) && !projectDataBlocked && <><strong aria-label={`대상 ${graph.entities.length}개`}>대상 {graph.entities.length}개</strong><strong aria-label={`관계 ${graph.relations.length}개`}>관계 {graph.relations.length}개</strong></>}
           </div>
         </header>
         {activeAnalysisProject && activeAnalysisProject.id !== selectedProject?.id && <aside className="background-analysis" role="status"><span><strong>{activeAnalysisProject.title}</strong> 작품을 분석 중입니다. 다른 작품은 읽을 수 있으며 새 분석은 완료 후 시작할 수 있습니다.</span><button onClick={() => {selectProject(activeAnalysisProject); setPage('analysis');}}>진행 상황 보기</button></aside>}
@@ -1459,23 +1496,23 @@ export default function App() {
           <div className="surface">
             <h2>{projectDataLoading ? '작품을 불러오는 중입니다' : '작품을 불러오지 못했습니다'}</h2>
             <p>{selectedProject?.title}</p>
-            <p role={projectDataLoading ? 'status' : 'alert'}>{projectDataLoading ? '원고·설정·검토 결과를 함께 준비하고 있습니다.' : notice}</p>
+            <p role={projectDataLoading ? 'status' : 'alert'}>{projectDataLoading ? '원고·설정·검토 결과를 함께 준비하고 있습니다.' : formatNotice(notice)}</p>
             {!projectDataLoading && <button className="primary" onClick={() => void refreshProjectData(selectedProject)}>다시 시도</button>}
             <button onClick={() => setPage('projects')}>내 작품으로 이동</button>
           </div>
         </section>}
-        <section hidden={page !== 'projects'}><ProjectsPage projects={projects} onCreate={createProject} onOpen={project=>{selectProject(project);setPage('manuscripts');}}/></section>
-        <section hidden={page !== 'manuscripts' || projectDataBlocked}><ManuscriptsPage key={selectedProject?.id ?? "no-project"} active={page==='manuscripts'} sourceRequest={sourceRequest} documents={documents} settings={storySettings} onCreateSetting={createStorySetting} onUpdateSetting={updateStorySetting} onDeleteSetting={deleteStorySetting} onImport={importDocument} onDelete={deleteDocument} onReplace={replaceDocument} onAnalyze={()=>setPage('analysis')} loading={workspaceBusy}/></section>
-        <section hidden={page !== 'review' || projectDataBlocked}><ReviewPage key={selectedProject?.id ?? "review-no-project"} history={reviewHistory} graph={graph} documents={documents} evidence={evidenceByIssueId} onStatus={updateIssueStatus} onOpenDocument={(documentId,quote) => {setSourceRequest({documentId,quote});setPage('manuscripts');}} onGraph={(relationId) => {const relation = relationId == null ? undefined : graph.relations.find(item => item.id === relationId); setSelectedRelationId(relationId ?? null); setSelectedEntity(relation ? graph.entities.find(entity => entity.id === relation.source_entity_id) ?? null : null); setPage('graph');}} onAnalysis={()=>setPage(documents.length ? 'analysis' : 'manuscripts')}/></section>
+        <section hidden={page !== 'projects'}><ProjectsPage projects={projects} onCreate={createProject} onDelete={requestDeleteProject} onOpen={project=>{selectProject(project);setPage('manuscripts');}}/></section>
+        <section hidden={page !== 'manuscripts' || projectDataBlocked}><ManuscriptsPage key={selectedProject?.id ?? "no-project"} active={page==='manuscripts'} sourceRequest={sourceRequest} documents={documents} settings={storySettings} onCreateSetting={createStorySetting} onUpdateSetting={updateStorySetting} onDeleteSetting={deleteStorySetting} onImport={importDocument} onDelete={deleteDocument} onReplace={replaceDocument} onEdit={editDocument} onAnalyze={()=>setPage('analysis')} loading={workspaceBusy}/></section>
+        <section hidden={page !== 'review' || projectDataBlocked}><ReviewPage key={selectedProject?.id ?? "review-no-project"} history={reviewHistory} graph={graph} documents={documents} evidence={evidenceByIssueId} onStatus={updateIssueStatus} onOpenDocument={(documentId,quote) => {setSourceRequest({documentId,quote});setPage('manuscripts');}} onEdit={(issue) => {const chunk = (evidenceByIssueId[issue.id] ?? [])[0]; if (chunk) {setSourceRequest({documentId:chunk.document_id, quote:chunk.text, edit:true}); setPage('manuscripts');} else setNotice('이 후보에 연결된 원문 근거가 없어 편집 화면을 열 수 없습니다.');}} onGraph={(focus) => {setReviewGraphFocus(focus); const issue = graph.issues.find(item => item.id === focus.issueId); const relation = relatedRelations(graph.relations, focus.chunkId == null ? issue?.evidence_chunk_ids ?? [] : [focus.chunkId])[0]; setSelectedRelationId(relation?.id ?? null); setSelectedEntity(null); setPage('graph');}} onAnalysis={()=>setPage(documents.length ? 'analysis' : 'manuscripts')}/></section>
         <section hidden={page !== 'welcome'} className="welcome-page surface"><span className="eyebrow">작가의 판단을 돕는 도구</span><h2>이야기에 몰입하세요.<br/>설정의 연결은 함께 살펴볼게요.</h2><p>원고를 가져오면 인물과 설정의 관계를 정리하고,<br/>다시 확인할 부분을 원문 근거와 함께 보여드립니다.</p><div className="welcome-steps"><div>01<br/><strong>원고 가져오기</strong></div><div>02<br/><strong>내 AI로 분석하기</strong></div><div>03<br/><strong>근거 읽고 판단하기</strong></div></div><button className="primary" onClick={()=>setPage('setup')}>시작하기 →</button><p className="muted">원고는 로컬에 저장됩니다. 분석 시 동의한 원문은 외부 GPT로 전송됩니다.</p></section>
-        <section hidden={page !== 'foreshadowing' || projectDataBlocked} className="page-content"><div className="surface"><h2>추출된 떡밥 후보</h2><p className="muted">AI는 등장 단서를 후보로 제시합니다. 마지막 언급 이후 공백만으로 미회수라고 단정하지 않고, 작가가 상태를 결정합니다.</p>{graph.entities.filter(e=>e.type==='foreshadowing').map(e=>{const current=foreshadowingStatuses.find(item=>item.entity_id===e.id)?.status??'unreviewed';return <div className="source-card foreshadowing-card" key={e.id}><div><h3>{e.name}</h3><span className={`setting-certainty ${current}`}>{{unreviewed:'검토 전',in_progress:'진행 중',resolved:'회수 확인',intentional:'의도적 미회수'}[current]}</span></div><p>{e.summary}</p><p className="muted">등장 회차 {e.document_ids.map(id=>documents.find(d=>d.id===id)?.chapter_index).filter((v):v is number=>v!==undefined).sort((a,b)=>a-b).map(ch=>`${ch+1}화`).join(' · ')||'확인 중'}</p><div className="foreshadowing-actions"><select aria-label={`${e.name} 상태`} value={current} onChange={event=>void updateForeshadowingStatus(e.id,event.target.value as ForeshadowingStatus['status'])}><option value="unreviewed">검토 전</option><option value="in_progress">진행 중</option><option value="resolved">회수 확인</option><option value="intentional">의도적 미회수</option></select><button onClick={()=>{setSelectedEntity(e);setPage('graph');}}>관계 지도에서 확인</button></div></div>})}{!graph.entities.some(e=>e.type==='foreshadowing')&&<div className="blank-state"><p>{graph.entities.length ? '현재 분석 결과에 떡밥 유형 후보가 없습니다. 원문에서 단서를 찾으려면 다시 분석해 보세요.' : '원고를 가져온 뒤 분석을 시작하면 떡밥 후보가 여기에 표시됩니다.'}</p><button className="primary" onClick={()=>setPage(graph.entities.length ? 'analysis' : 'manuscripts')}>{graph.entities.length ? '분석 설정으로 이동' : '원고 가져오기'}</button></div>}</div></section>
+        <section hidden={page !== 'foreshadowing' || projectDataBlocked} className="page-content"><div className="surface"><h2>추출된 떡밥 후보</h2><p className="muted">AI는 등장 단서를 후보로 제시합니다. 마지막 언급 이후 공백만으로 미회수라고 단정하지 않고, 작가가 상태를 결정합니다.</p>{graph.entities.filter(e=>e.type==='foreshadowing').map(e=>{const current=foreshadowingStatuses.find(item=>item.entity_id===e.id)?.status??'unreviewed';return <div className="source-card foreshadowing-card" key={e.id}><div><h3>{e.name}</h3><span className={`setting-certainty ${current}`}>{{unreviewed:'검토 전',in_progress:'진행 중',resolved:'회수 확인',intentional:'의도적 미회수'}[current]}</span></div><p>{e.summary}</p><p className="muted">등장 회차 {e.document_ids.map(id=>documents.find(d=>d.id===id)?.chapter_index).filter((v):v is number=>v!==undefined).sort((a,b)=>a-b).map(ch=>`${ch+1}화`).join(' · ')||'확인 중'}</p><div className="foreshadowing-actions"><select aria-label={`${e.name} 상태`} value={current} onChange={event=>void updateForeshadowingStatus(e.id,event.target.value as ForeshadowingStatus['status'])}><option value="unreviewed">검토 전</option><option value="in_progress">진행 중</option><option value="resolved">회수 확인</option><option value="intentional">의도적 미회수</option></select><button onClick={()=>{setSelectedEntity(e);setPage('graph');}}>관계 지도에서 확인</button></div></div>})}{!graph.entities.some(e=>e.type==='foreshadowing')&&<div className="blank-state"><p>{graph.entities.length ? '현재 저장된 분석에는 떡밥 후보가 없습니다. 작품에 떡밥이 없다는 뜻은 아닙니다. 분석 설정에서 새 분석을 실행하면 질문·약속·숨겨진 단서를 원문 근거와 함께 검토합니다.' : '원고를 가져온 뒤 분석을 시작하면 떡밥 후보가 여기에 표시됩니다.'}</p><button className="primary" onClick={()=>setPage(graph.entities.length ? 'analysis' : 'manuscripts')}>{graph.entities.length ? '분석 설정으로 이동' : '원고 가져오기'}</button></div>}</div></section>
         <section hidden={!['analysis','settings','setup'].includes(page) || (page === 'analysis' && projectDataBlocked)} className="analysis-layout">
           <div className="surface analysis-target">
             {page === 'analysis' ? <><h2>분석 대상</h2><div className="soft-card"><strong>{selectedProject?.title ?? '작품을 선택하세요'}</strong><p>전체 원고 · {documents.length}편 · {formatManuscriptChars(documents)}</p><p className="muted">원고 전체를 로컬에서 색인한 뒤, 선택한 회차 범위를 여러 구간으로 묶어 순서대로 검토합니다. 첫 실행은 검색 색인 시간이 필요하고, 이미 검증된 구간은 재시도 때 재사용합니다.</p></div><p className="muted analysis-list-hint">회차를 누르면 원고가 열립니다. 분석 회차 범위는 오른쪽 GPT 분석 패널에서 선택합니다.</p><DocumentPicker key={selectedProject?.id ?? 'analysis-no-project'} documents={documents} onSelect={documentId=>{setSourceRequest({documentId});setPage('manuscripts');}}/><button onClick={()=>setPage('manuscripts')}>{documents.length ? '원고·설정 관리' : '원고 가져오기'}</button><hr/><h3>이번 분석에서 확인할 내용</h3><p>설정 충돌 후보와 인물·아이템·규칙의 관계를 원문 근거와 함께 정리합니다.</p></> : page === 'setup' ? <><h2>준비 순서</h2><div className="soft-card"><strong>1. 내 GPT 연결</strong><p>작품 분석에 사용할 계정을 연결합니다.</p><strong>2. 원고 검색 모델 준비</strong><p>Qwen 또는 EmbeddingGemma 중 하나를 선택합니다.</p><strong>3. 내 작품으로 이동</strong><p>준비가 끝나면 원고를 가져오고 분석을 시작합니다.</p></div><button className="primary" onClick={()=>setPage('projects')}>내 작품으로 이동</button></> : <><h2>저장·분석 환경</h2><div className="soft-card"><strong>원고는 이 기기에 저장됩니다.</strong><p>GPT 분석을 실행할 때 동의한 원문과 검색 근거만 외부 GPT로 전송됩니다.</p></div><button onClick={()=>setPage('manuscripts')}>원고·설정 열기</button></>}
           </div>
           {page === 'analysis' && <div className="surface analysis-readiness"><strong>원고 검색 준비</strong><p className="muted">{setupStatus?.embedding_model ?? 'Qwen3-Embedding-0.6B-Q8_0.gguf'} · {setupStatus?.embedding_model_ready ? '검색 모델 준비 완료' : '검색 모델 준비 필요'}</p><p className="muted">원고를 수정하면 검색 자료와 분석 결과가 최신 상태가 아니게 됩니다. 다시 분석하면 현재 원문 기준으로 갱신됩니다.</p></div>}
           <div className="analysis-options">
-        <ChatGptPanel projectId={selectedProject?.id} projectTitle={selectedProject?.title} hasDocuments={documents.length > 0} documentCount={documents.length} manuscriptChars={documents.reduce((total, document) => total + document.content.length, 0)} documentCharCounts={documents.map(document => document.content.length)} chapters={documents.map(document => ({ chapterIndex: document.chapter_index, title: document.title }))} analysisRange={analysisRange} onAnalysisRangeChange={setAnalysisRange} analyzing={workspaceBusy} onAnalyze={analyze} showAnalysis={page === 'analysis'} compact={page === 'analysis' || page === 'settings'} />
+        <ChatGptPanel projectId={selectedProject?.id} projectTitle={selectedProject?.title} hasDocuments={documents.length > 0} documentCount={documents.length} manuscriptChars={documents.reduce((total, document) => total + document.content.length, 0)} documentCharCounts={documents.map(document => document.content.length)} chapters={documents.map(document => ({ chapterIndex: document.chapter_index, title: document.title }))} analysisRange={analysisRange} onAnalysisRangeChange={setAnalysisRange} analyzing={workspaceBusy} onAnalyze={analyze} showAnalysis={page === 'analysis'} showModelControls={page !== 'settings'} compact={page === 'analysis' || page === 'settings'} />
         {(page === "setup" || page === "settings") && (
           <SetupPanel
             status={setupStatus}
@@ -1487,103 +1524,37 @@ export default function App() {
         {page === 'analysis' && analysisJob?.project_id === selectedProject?.id && analysisJob && analysisJob.status !== "idle" && (
           <AnalysisProgressPanel
             job={analysisJob}
-            onRetry={!workspaceBusy && retryRequest ? () => void analyze(retryRequest.model, retryRequest.effort, false, retryRequest.range ?? analysisRangeRef.current) : undefined}
+            defaultModel={retryRequest?.model}
+            defaultEffort={retryRequest?.effort}
+            onRetry={!workspaceBusy && retryRequest ? (model, effort) => void analyze(model ?? retryRequest.model, effort, false, retryRequest.range ?? analysisRangeRef.current) : undefined}
             onCancel={workspaceBusy ? () => void cancelAnalysis() : undefined}
           />
         )}
-          {page === 'settings' && <details className="surface" open><summary>고급 · 로컬 생성 모델</summary><p>개인 GPT 분석에는 로컬 생성 모델이 필요하지 않습니다. 로컬 모델을 사용하는 경우에만 선택하세요.</p><select aria-label="로컬 생성 모델" value={settings.generation_model} onChange={e=>updateGenerationModel(e.target.value)}>{[...new Set([settings.generation_model,...(localAi?.models??[])])].map(m=><option key={m}>{m}</option>)}</select></details>}
+          {page === 'settings' && <details className="surface"><summary>고급 · 로컬 생성 모델</summary><p>개인 GPT 분석에는 로컬 생성 모델이 필요하지 않습니다. 로컬 모델을 사용하는 경우에만 선택하세요.</p><select aria-label="로컬 생성 모델" value={settings.generation_model} onChange={e=>updateGenerationModel(e.target.value)}>{[...new Set([settings.generation_model,...(localAi?.models??[])])].map(m=><option key={m}>{m}</option>)}</select></details>}
           </div>
         </section>
         <section hidden={page !== 'graph' || projectDataBlocked} className="graph-page">
-        <div className="graph-search"><input aria-label="인물·아이템·설정 검색" placeholder="인물·아이템·설정 검색" value={graphSearch} onChange={e=>setGraphSearch(e.target.value)}/><span>○ 인물　▢ 아이템　□ 규칙　◇ 사건</span></div>
-        <div className="range-controls" aria-label="회차 분석 범위">
-          <div>
-            <span className="label">표시 회차</span>
-            <strong>{graphRangeLabel}</strong>
-            {(chapterRange.startChapter !== loadedChapterRange.startChapter || chapterRange.endChapter !== loadedChapterRange.endChapter) && <span role="status">{projectDataLoading ? '선택한 회차를 불러오는 중' : '조회 실패 · 이전 범위 표시 중'}</span>}
-          </div>
-          <button
-            type="button"
-            className={chapterRange.startChapter === null && chapterRange.endChapter === null ? "active" : ""}
-            onClick={selectAllChapters}
-            disabled={documents.length === 0}
-          >
-            전체 누적
-          </button>
-          <label>
-            시작
-            <select
-              value={chapterRange.startChapter ?? "all"}
-              onChange={(event) => updateRangeStart(event.target.value)}
-              disabled={documents.length === 0}
-            >
-              <option value="all">1화</option>
-              {chapterOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            끝
-            <select
-              value={chapterRange.endChapter ?? "all"}
-              onChange={(event) => updateRangeEnd(event.target.value)}
-              disabled={documents.length === 0}
-            >
-              <option value="all">마지막</option>
-              {chapterOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <span className={graph.range.continuity_ready ? "range-message ready" : "range-message"}>
-            {graph.range.message}
-          </span>
+        <div className="graph-range-compact" aria-label="관계 지도 회차 범위">
+          <div><span className="label">표시 회차</span><strong>{graphRangeLabel}</strong>{(chapterRange.startChapter !== loadedChapterRange.startChapter || chapterRange.endChapter !== loadedChapterRange.endChapter) && <span role="status">{projectDataLoading ? '선택한 회차를 불러오는 중' : '조회 실패 · 이전 범위 표시 중'}</span>}</div>
+          <button type="button" className={chapterRange.startChapter === null && chapterRange.endChapter === null ? "active" : ""} onClick={selectAllChapters} disabled={documents.length === 0}>전체 누적</button>
+          <label>시작<select aria-label="관계 지도 시작 회차" value={chapterRange.startChapter ?? "all"} onChange={(event) => updateRangeStart(event.target.value)} disabled={documents.length === 0}><option value="all">1화</option>{chapterOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+          <label>끝<select aria-label="관계 지도 종료 회차" value={chapterRange.endChapter ?? "all"} onChange={(event) => updateRangeEnd(event.target.value)} disabled={documents.length === 0}><option value="all">마지막</option>{chapterOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
         </div>
-        <div className="graph-controls">
-          <div className="relation-scope" aria-label="관계 표시 범위">
-            <button
-              type="button"
-              className={relationScope === "core" ? "active" : ""}
-              onClick={() => setRelationScope("core")}
-            >
-              핵심 관계
-            </button>
-            <button
-              type="button"
-              className={relationScope === "all" ? "active" : ""}
-              onClick={() => setRelationScope("all")}
-            >
-              전체 관계
-            </button>
-            <button type="button" className={healthOnly ? "active health-filter" : "health-filter"} onClick={() => setHealthOnly(value => !value)}>
-              점검 필요
-            </button>
-          </div>
-          {ENTITY_TYPES.map((type) => (
-            <button
-              key={type}
-              className={visibleTypes.has(type) ? `active entity-${type}` : ""}
-              onClick={() => toggleEntityType(type)}
-            >
-              {ENTITY_TYPE_LABELS[type]}
-            </button>
-          ))}
-        </div>
-        <div className="graph-body"><Suspense fallback={<div className="graph-loading" role="status">관계 지도를 준비하는 중…</div>}><GraphView
+        <div className="graph-body graph-body-explorer"><Suspense fallback={<div className="graph-loading" role="status">관계 지도를 준비하는 중…</div>}><GraphView
+          key={selectedProject?.id}
           projectId={selectedProject?.id ?? null}
-          graph={searchedGraph}
+          reviewFocus={reviewGraphFocus}
+          reviewEvidence={reviewGraphFocus ? evidenceByIssueId[reviewGraphFocus.issueId] ?? [] : []}
+          onCloseReview={() => setReviewGraphFocus(null)}
+          onBackReview={() => setPage("review")}
+          graph={graph}
           visible={page === 'graph'}
           selectedRelationId={selectedRelationId}
           selectedEntityId={selectedEntity?.id ?? null}
           onSelectEntity={setSelectedEntity}
           onSelectRelation={setSelectedRelationId}
+          onOpenEvidence={(documentId, quote) => { setSourceRequest({ documentId, quote }); setPage('manuscripts'); }}
         /></Suspense>
-        <GraphDetails onOpenDocument={(documentId,quote) => {setSourceRequest({documentId,quote});setPage("manuscripts");}} documents={documents} graph={searchedGraph} entity={selectedEntity} relationId={selectedRelationId} onRelation={setSelectedRelationId} onReview={()=>setPage('review')}/>
         </div></section>
       </main>
       <StartupLoader status={startupStatus} onRetry={retryStartup} />
@@ -1658,6 +1629,19 @@ export default function App() {
               <button type="submit" disabled={workspaceBusy}>{loading ? "저장 중…" : replacementDocument ? "수정본으로 교체" : "추가"}</button>
             </div>
           </form>
+        </div>
+      )}
+      {projectDeleteCandidate && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={() => setProjectDeleteCandidate(null)}>
+          <section className="modal danger-modal" role="dialog" aria-modal="true" aria-labelledby="delete-project-heading" onMouseDown={(event) => event.stopPropagation()}>
+            <span className="label">작품 삭제</span>
+            <h2 id="delete-project-heading">정말 삭제할까요?</h2>
+            <p><strong>{projectDeleteCandidate.title}</strong>의 원고, 분석 결과, 관계 지도, 검토 기록이 모두 삭제됩니다. 삭제한 작품은 복구할 수 없습니다.</p>
+            <div className="modal-actions">
+              <button type="button" autoFocus onClick={() => setProjectDeleteCandidate(null)}>취소</button>
+              <button type="button" className="danger" onClick={() => void executeDeleteProject(projectDeleteCandidate)}>영구 삭제</button>
+            </div>
+          </section>
         </div>
       )}
     </div>

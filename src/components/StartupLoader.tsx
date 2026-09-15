@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { LoaderCircle, RefreshCw } from "lucide-react";
 
 export type StartupMode = "loading" | "error";
@@ -16,6 +17,12 @@ interface StartupLoaderProps {
 }
 
 export function StartupLoader({ status, onRetry }: StartupLoaderProps) {
+  const [slow, setSlow] = useState(false);
+  useEffect(() => {
+    if (!status.visible || status.mode === "error") { setSlow(false); return; }
+    const timer = window.setTimeout(() => setSlow(true), 8000);
+    return () => window.clearTimeout(timer);
+  }, [status.visible, status.mode]);
   if (!status.visible) {
     return null;
   }
@@ -55,6 +62,7 @@ export function StartupLoader({ status, onRetry }: StartupLoaderProps) {
             </div>
           </div>
         )}
+        {!failed && slow && <p className="startup-slow" role="status">로컬 백엔드를 준비하는 데 시간이 걸리고 있습니다. 잠시만 기다려 주세요.</p>}
         {failed ? (
           <button type="button" className="startup-retry" onClick={onRetry}>
             <RefreshCw size={16} />
