@@ -15,7 +15,8 @@ export default function DemoPage() {
     if (!sentence.trim() || used || busy) return;
     setBusy(true);
     try {
-      const response = await fetch("/api/demo/analyze", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ text: sentence.trim() }) });
+      const apiBase = (import.meta.env.VITE_DEMO_API_URL || "").replace(/\/$/, "");
+      const response = await fetch(`${apiBase}/api/demo/analyze`, { method: "POST", headers: { "content-type": "application/json" }, credentials: "include", body: JSON.stringify({ text: sentence.trim() }) });
       if (!response.ok) throw new Error((await response.json().catch(() => null))?.detail || "분석을 완료하지 못했습니다.");
       const result = await response.json() as { summary?: string };
       setAnalysis(result.summary || "분석 결과가 준비되었습니다.");
