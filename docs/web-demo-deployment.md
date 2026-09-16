@@ -19,14 +19,14 @@ npm run preview:demo
 
 ## 임베딩 준비
 
-브라우저는 모델을 받지 않습니다. 고정 샘플을 짧은 원문 구간으로 나누어 Qwen으로 사전 계산하고, 새 문장만 서버에서 계산합니다. 데스크톱과 같은 `LocalLlmEmbeddings` 및 질의 지시문을 사용합니다. 데모 색인은 짧은 겹침 구간으로 따로 생성하므로 데스크톱 Chroma 검색과 결과 순위가 완전히 같다고 보장하지는 않습니다.
+브라우저는 모델을 받지 않습니다. 고정 샘플을 짧은 원문 구간으로 나누어 Qwen으로 사전 계산하고, 새 문장만 서버에서 계산합니다. 데스크톱과 같은 `LocalLlmEmbeddings` 및 질의 지시문을 사용합니다. 데모 색인은 짧은 겹침 구간으로 따로 생성하므로 데스크톱 Chroma 검색과 결과 순위가 완전히 같다고 보장하지는 않습니다. `index.npz`에는 이 사전 임베딩 벡터와 원문 위치 메타데이터가 함께 들어 있습니다.
 
 ```sh
 export STORY_GUARD_DEMO_MODEL_DIR=/absolute/path/to/models
 npm run demo:index
 ```
 
-모델 폴더에는 기존 `Qwen3-Embedding-0.6B-Q8_0.gguf`가 필요합니다. 결과는 `output/web-demo/index.npz`입니다. 새 문장 검토는 지정한 회차까지의 관련 원문 최대 8구간을 GPT에 전달합니다. 모델 SHA-256, 질의 지시문, 샘플 버전을 확인하여 다른 모델의 벡터와 섞이지 않게 합니다.
+모델 폴더에는 기존 `Qwen3-Embedding-0.6B-Q8_0.gguf`가 필요합니다. 결과는 `output/web-demo/index.npz`로 생성되며, 배포에 사용할 고정본은 `deploy/demo-index.npz`로 관리합니다. 새 문장 검토는 지정한 회차까지의 관련 원문 최대 8구간을 GPT에 전달합니다. 모델 SHA-256, 질의 지시문, 샘플 버전을 확인하여 다른 모델의 벡터와 섞이지 않게 합니다.
 
 샘플을 갱신할 때:
 
