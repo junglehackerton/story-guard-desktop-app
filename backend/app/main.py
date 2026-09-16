@@ -95,58 +95,8 @@ setup_manager = EnvironmentSetupManager(save_environment_settings, load_environm
 app = FastAPI(title="Story Guard API", version="0.1.0")
 
 
-class DemoAnalysisRequest(BaseModel):
-    text: str = Field(min_length=1, max_length=1200)
-
-
-_demo_visitors: set[str] = set()
-_demo_lock = threading.Lock()
-
-
-@app.post("/api/demo/analyze")
-async def demo_analyze(payload: DemoAnalysisRequest, request: Request, response: Response) -> dict[str, str]:
-    """Run the single public-demo review against pre-indexed sample context."""
-    visitor = request.cookies.get("story_guard_demo_visitor") or secrets.token_urlsafe(24)
-    with _demo_lock:
-        if visitor in _demo_visitors:
-            raise HTTPException(status_code=429, detail="이 브라우저는 데모 GPT 분석을 이미 사용했습니다.")
-    api_key = os.getenv("STORY_GUARD_DEMO_OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise HTTPException(status_code=503, detail="데모 GPT 키가 아직 설정되지 않았습니다. 미리 색인된 결과는 계속 탐색할 수 있습니다.")
-    prompt = (
-        "한국어 소설의 설정 연결을 검토하세요. 제공된 원문과 새 문장만 사용하고 3문장 이내로 답하세요. "
-        "새 문장이 기존 설정과 충돌하는지, 확인할 근거가 무엇인지 설명하세요.\n"
-        "미리 색인된 원문:\n"
-        "문을 열기 전에 반드시 두 번 두드릴 것. 윤해주는 철거 직전의 백로호텔 정문을 두 번 두드렸다.\n"
-        "민규백은 지하 문서금고 계약의 취소를 요구했고, 서우는 계약서를 보관하고 있다.\n"
-        f"새 문장:\n{payload.text}"
-    )
-    try:
-        import httpx
-        async with httpx.AsyncClient(timeout=45) as client:
-            result = await client.post(
-                "https://api.openai.com/v1/responses",
-                headers={"authorization": f"Bearer {api_key}"},
-                json={"model": os.getenv("STORY_GUARD_DEMO_MODEL", "gpt-4o-mini"), "input": prompt, "max_output_tokens": 220},
-            )
-            result.raise_for_status()
-            data = result.json()
-        summary = data.get("output_text", "").strip()
-        if not summary:
-            for item in data.get("output", []):
-                for content in item.get("content", []):
-                    if content.get("type") in {"output_text", "text"}:
-                        summary += content.get("text", "")
-        summary = summary.strip()
-        if not summary:
-            raise RuntimeError("GPT 응답이 비어 있습니다.")
-    except Exception as error:
-        logging.getLogger(__name__).warning("demo GPT request failed: %s", error)
-        raise HTTPException(status_code=502, detail="데모 GPT 응답을 받지 못했습니다. 잠시 후 다시 시도해 주세요.") from error
-    with _demo_lock:
-        _demo_visitors.add(visitor)
-    response.set_cookie("story_guard_demo_visitor", visitor, max_age=60 * 60 * 24 * 30, httponly=True, samesite="lax")
-    return {"summary": summary}
+# The public web demo runs separately in backend.app.demo_server.
+# Keep desktop database and account routes on loopback only.
 
 # Importing several chapters in quick succession should produce one derived
 # index build.  Starting a sync for every file reloads the local embedding

@@ -44,3 +44,6 @@ output/
 .playwright-cli/
 .omx/
 .superpowers/
+
+# Standalone web demo build
+demo-dist/

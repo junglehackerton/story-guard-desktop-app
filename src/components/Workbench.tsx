@@ -9,6 +9,7 @@ import { BookOpen, FileText, ScanLine, Network, Bookmark, Settings, Sparkles, Ar
 import type { Project, StoryDocument, StorySetting, GraphPayload, EvidenceChunk, IssueStatus, RelationEdge, EntityNode } from '../lib/types';
 import { RelationEvidence } from './Inspector';
 import { relationPairKey, relationTypesConflict, timelinePairsByStatus } from '../lib/relationshipHealth';
+import storyGuardMark from '../demo/assets/story-guard-mark.png';
 import { groupRelationshipEdges } from '../lib/relationshipGrouping';
 export type Page = 'welcome' | 'setup' | 'projects' | 'manuscripts' | 'analysis' | 'review' | 'graph' | 'foreshadowing' | 'settings';
 export const PAGES: Record<Page, [string,string]> = {
@@ -18,11 +19,11 @@ export const PAGES: Record<Page, [string,string]> = {
  foreshadowing:['떡밥 후보','현재는 AI가 찾은 단서 후보만 보여줍니다.'], settings:['앱 설정','AI 연결과 로컬 환경을 관리하세요.'],
 };
 const MENU = [['manuscripts',FileText],['analysis',ScanLine],['review',BookOpen],['graph',Network],['foreshadowing',Bookmark]] as const;
-export function WorkbenchNav({page,onPage,project,projects,onProject}: {page:Page;onPage:(page:Page)=>void;project:Project|null;projects:Project[];onProject:(p:Project)=>void}) {
- return <aside className="workbench-nav"><button className="wordmark" onClick={()=>onPage('welcome')}>STORY GUARD</button>
+export function WorkbenchNav({page,onPage,project,projects,onProject,demo=false,onReset}: {demo?:boolean;onReset?:()=>void;page:Page;onPage:(page:Page)=>void;project:Project|null;projects:Project[];onProject:(p:Project)=>void}) {
+ return <aside className="workbench-nav"><button className="wordmark" onClick={()=>onPage('welcome')}><img src={storyGuardMark} alt="" aria-hidden="true"/><span>STORY GUARD</span></button>
  <label className="project-switch" title={project?.title ?? '작품 선택'}>현재 작품<select aria-label="현재 작품" title={project?.title ?? '작품 선택'} value={project?.id ?? ''} onChange={e=>{const p=projects.find(p=>p.id===Number(e.target.value));if(p)onProject(p);}}><option value="" disabled>작품 선택</option>{projects.map(p=><option key={p.id} value={p.id}>{p.title}</option>)}</select></label>
  <nav aria-label="작품 메뉴">{MENU.map(([key,Icon])=><button key={key} aria-label={PAGES[key][0]} title={PAGES[key][0]} aria-current={page===key?'page':undefined} onClick={()=>onPage(key)}><Icon size={21}/>{PAGES[key][0]}</button>)}</nav>
- <nav className="nav-bottom" aria-label="앱 메뉴"><button aria-label="내 작품" title="내 작품" aria-current={page==='projects'?'page':undefined} onClick={()=>onPage('projects')}><BookOpen size={21}/>내 작품</button><button aria-label="앱 설정" title="앱 설정" aria-current={page==='settings'||page==='setup'?'page':undefined} onClick={()=>onPage('settings')}><Settings size={21}/>앱 설정</button></nav><small>원고는 이 기기에 저장됩니다.</small></aside>;
+ {demo ? <nav className="nav-bottom" aria-label="데모 메뉴"><button onClick={onReset}>체험 판단 초기화</button></nav> : <nav className="nav-bottom" aria-label="앱 메뉴"><button aria-label="내 작품" title="내 작품" aria-current={page==='projects'?'page':undefined} onClick={()=>onPage('projects')}><BookOpen size={21}/>내 작품</button><button aria-label="앱 설정" title="앱 설정" aria-current={page==='settings'||page==='setup'?'page':undefined} onClick={()=>onPage('settings')}><Settings size={21}/>앱 설정</button></nav>}<small>{demo ? "공개 샘플 · 판단은 이 브라우저에 저장" : "원고는 이 기기에 저장됩니다."}</small></aside>;
 }
 export function ProjectsPage({projects,onOpen,onCreate,onDelete}: {projects:Project[];onOpen:(p:Project)=>void;onCreate:()=>void;onDelete:(p:Project)=>void}) {
  const [query,setQuery]=useState('');
@@ -53,7 +54,7 @@ function SettingCard({setting,onUpdate,onDelete}:{setting:StorySetting;onUpdate:
  return <article className="setting-card"><div><strong>{setting.title}</strong><span className={`setting-certainty ${setting.certainty}`}>{setting.certainty==='confirmed'?'확정 설정':'구상 메모'}</span></div><p>{setting.content}</p><div><button type="button" onClick={()=>setEditing(true)}>편집</button><button type="button" onClick={()=>onDelete(setting)}>삭제</button></div></article>;
 }
 export interface SourceNavigation { documentId: number; quote?: string; edit?: boolean; }
-export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,onEdit,onAnalyze,onCreateSetting,onUpdateSetting,onDeleteSetting,loading,preferredDocumentId,sourceRequest,active=true}: {documents:StoryDocument[];settings:StorySetting[];onImport:()=>void;onDelete:(d:StoryDocument)=>void;onReplace:(d:StoryDocument)=>void;onEdit:(d:StoryDocument,content:string)=>Promise<boolean>;onAnalyze:()=>void;onCreateSetting:(title:string,content:string,certainty:StorySetting['certainty'])=>Promise<boolean>;onUpdateSetting:(setting:StorySetting)=>Promise<boolean>;onDeleteSetting:(setting:StorySetting)=>void;loading:boolean;preferredDocumentId?:number;sourceRequest?:SourceNavigation;active?:boolean}) {
+export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,onEdit,onAnalyze,onCreateSetting,onUpdateSetting,onDeleteSetting,loading,preferredDocumentId,sourceRequest,active=true,readOnly=false}: {readOnly?:boolean;documents:StoryDocument[];settings:StorySetting[];onImport:()=>void;onDelete:(d:StoryDocument)=>void;onReplace:(d:StoryDocument)=>void;onEdit:(d:StoryDocument,content:string)=>Promise<boolean>;onAnalyze:()=>void;onCreateSetting:(title:string,content:string,certainty:StorySetting['certainty'])=>Promise<boolean>;onUpdateSetting:(setting:StorySetting)=>Promise<boolean>;onDeleteSetting:(setting:StorySetting)=>void;loading:boolean;preferredDocumentId?:number;sourceRequest?:SourceNavigation;active?:boolean}) {
  const [selection,setSelection]=useState<SourceNavigation>();
  const [readerOpen,setReaderOpen]=useState(true);
  const [editing,setEditing]=useState(false);
@@ -65,7 +66,7 @@ export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,
  useEffect(()=>{
   if(active && sourceRequest && consumedRequest.current!==sourceRequest && documents.some(d=>d.id===sourceRequest.documentId)){
    consumedRequest.current=sourceRequest;setSelection(sourceRequest);setReaderOpen(true);
-   setEditing(Boolean(sourceRequest.edit));
+   setEditing(!readOnly && Boolean(sourceRequest.edit));
   }
  },[sourceRequest,active,documents]);
  const doc=documents.find(d=>d.id===selection?.documentId)??documents[0];
@@ -82,15 +83,15 @@ export function ManuscriptsPage({documents,settings,onImport,onDelete,onReplace,
   useEffect(()=>{ if (doc) setDraft(doc.content); }, [doc?.id, doc?.content]);
  return <div className={`manuscript-layout${readerOpen ? '' : ' list-only'}`} style={readerOpen ? undefined : {gridTemplateColumns:'minmax(0, 1fr)'}}>
   <section className="surface" ref={listRef}>
-   <div className="section-heading"><h2>원고 <span className="count">{documents.length}</span></h2><div className="section-actions"><button onClick={onImport} disabled={loading}>+ 여러 원고 가져오기</button>{documents.length > 0 && <button className="primary" onClick={onAnalyze}>분석 설정으로 이동</button>}</div></div>
+   <div className="section-heading"><h2>원고 <span className="count">{documents.length}</span></h2><div className="section-actions">{!readOnly && <button onClick={onImport} disabled={loading}>+ 여러 원고 가져오기</button>}{documents.length > 0 && <button className="primary" onClick={onAnalyze}>분석 설정으로 이동</button>}</div></div>
    <DocumentPicker documents={documents} selectedId={doc?.id} revealKey={consumedRequest.current} onSelect={documentId=>{setSelection({documentId});setReaderOpen(true);}}/>
 
    <hr/><div className="section-heading setting-heading"><div><h3>설정 메모</h3><p className="muted">확정 설정만 충돌 판정의 기준으로 사용합니다. 구상 메모는 참고 후보로 남깁니다.</p></div></div>
-   <StorySettingForm disabled={loading} onSave={({title,content,certainty})=>onCreateSetting(title,content,certainty)}/>
+   {!readOnly && <StorySettingForm disabled={loading} onSave={({title,content,certainty})=>onCreateSetting(title,content,certainty)}/>}
 
    {settings.map(setting=><SettingCard key={setting.id} setting={setting} onUpdate={onUpdateSetting} onDelete={onDeleteSetting}/>) }
   </section>
-  <section className="surface manuscript-reader" ref={readerRef} style={readerOpen ? undefined : {display:'none'}}>{doc?<><div className="section-heading"><div><span className="eyebrow">가져온 원고 · {editing ? '수정 중' : '읽기 전용'}</span><h2 tabIndex={-1}>{doc.chapter_index+1}화 · {doc.title}</h2></div><div><button type="button" onClick={()=>{setReaderOpen(false);setEditing(false);listRef.current?.scrollIntoView({behavior:'smooth',block:'start'});}}>원고 목록으로</button> <button type="button" onClick={()=>{setDraft(doc.content);setEditing(true);}} disabled={loading || editing}>원문 편집</button> <button type="button" onClick={()=>onReplace(doc)} disabled={loading}>수정본 파일 교체</button> <button type="button" onClick={()=>onDelete(doc)} disabled={loading}>원고 삭제</button></div></div>{editing ? <><textarea className="manuscript-editor" value={draft} onChange={e=>setDraft(e.target.value)} aria-label="원고 편집" rows={24}/><div className="editor-actions"><button type="button" onClick={()=>{setDraft(doc.content);setEditing(false);}}>취소</button><button type="button" className="primary" disabled={loading || !draft.trim() || draft===doc.content} onClick={async()=>{if(await onEdit(doc,draft)) setEditing(false);}}>수정 저장</button><p className="muted">저장 후 이 회차의 분석 상태가 ‘재분석 필요’로 바뀝니다.</p></div></> : <SourceText text={doc.content} quote={selection?.documentId===doc.id?selection.quote:undefined}/>}</>:<div className="blank-state"><FileText size={40}/><h2>원고를 가져오세요</h2><p>TXT, Markdown, DOCX 파일을 읽을 수 있습니다.</p><button type="button" onClick={onImport}>파일 가져오기</button></div>}</section>
+  <section className="surface manuscript-reader" ref={readerRef} style={readerOpen ? undefined : {display:'none'}}>{doc?<><div className="section-heading"><div><span className="eyebrow">가져온 원고 · {editing ? '수정 중' : '읽기 전용'}</span><h2 tabIndex={-1}>{doc.chapter_index+1}화 · {doc.title}</h2></div><div><button type="button" onClick={()=>{setReaderOpen(false);setEditing(false);listRef.current?.scrollIntoView({behavior:'smooth',block:'start'});}}>원고 목록으로</button> {!readOnly && <><button type="button" onClick={()=>{setDraft(doc.content);setEditing(true);}} disabled={loading || editing}>원문 편집</button> <button type="button" onClick={()=>onReplace(doc)} disabled={loading}>수정본 파일 교체</button> <button type="button" onClick={()=>onDelete(doc)} disabled={loading}>원고 삭제</button></>}</div></div>{editing ? <><textarea className="manuscript-editor" value={draft} onChange={e=>setDraft(e.target.value)} aria-label="원고 편집" rows={24}/><div className="editor-actions"><button type="button" onClick={()=>{setDraft(doc.content);setEditing(false);}}>취소</button><button type="button" className="primary" disabled={loading || !draft.trim() || draft===doc.content} onClick={async()=>{if(await onEdit(doc,draft)) setEditing(false);}}>수정 저장</button><p className="muted">저장 후 이 회차의 분석 상태가 ‘재분석 필요’로 바뀝니다.</p></div></> : <SourceText text={doc.content} quote={selection?.documentId===doc.id?selection.quote:undefined}/>}</>:<div className="blank-state"><FileText size={40}/><h2>원고를 가져오세요</h2><p>TXT, Markdown, DOCX 파일을 읽을 수 있습니다.</p><button type="button" onClick={onImport}>파일 가져오기</button></div>}</section>
  </div>;
 }
 function ReviewEmptyState({showReviewed,openCount,reviewedCount,documents,onSwitch,onAnalysis}:{showReviewed:boolean;openCount:number;reviewedCount:number;documents:StoryDocument[];onSwitch:()=>void;onAnalysis:()=>void}) {

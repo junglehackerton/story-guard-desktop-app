@@ -351,3 +351,13 @@ section:has(.review-tabs) > p.muted{margin:0;padding:12px 32px 0;line-height:1.6
 
 .review-source-comparison { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
 .review-source-comparison blockquote { max-height: 180px; overflow: auto; white-space: pre-wrap; }
+.workbench-nav .wordmark{display:flex;align-items:center;gap:10px}
+.workbench-nav .wordmark img{width:32px;height:32px;object-fit:contain;border-radius:9px}
+.workbench-nav .wordmark span{font-size:20px;letter-spacing:1px}
+@media(max-width:1000px){.workbench-nav .wordmark span{font-size:16px}}
+@media(max-width:700px){.demo-workbench .workbench-nav .wordmark img{width:30px;height:30px}.demo-workbench .workbench-nav .wordmark span{font-size:18px}}
+.workbench-nav .wordmark{gap:5px}
+.workbench-nav .wordmark img{margin:0}
+.workbench-nav .wordmark{width:100%;box-sizing:border-box;min-width:0;padding:8px 6px;gap:4px;justify-content:flex-start;overflow:hidden}
+.workbench-nav .wordmark img{width:28px;height:28px;flex:0 0 28px}
+.workbench-nav .wordmark span{font-size:18px;letter-spacing:.5px;min-width:0;white-space:nowrap}

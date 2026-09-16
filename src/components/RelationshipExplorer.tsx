@@ -6,6 +6,7 @@ import type { EntityNode, GraphPayload, RelationEdge, EvidenceChunk } from "../l
 type Props = {
   projectId: number | null;
   reviewFocus?: ReviewGraphFocus | null;
+  compactReview?: boolean;
   reviewEvidence?: EvidenceChunk[];
   onCloseReview?: () => void;
   onBackReview?: () => void;
@@ -35,7 +36,7 @@ function isIssue(relation: RelationEdge) {
 
 /** A writer-first relationship explorer. The canvas is a compact index; the
  * relation cards below remain exhaustive and carry the evidence interaction. */
-export function RelationshipExplorer({ graph, selectedEntityId, selectedRelationId, onSelectEntity, onSelectRelation, onOpenEvidence, reviewFocus, reviewEvidence = [], onCloseReview, onBackReview }: Props) {
+export function RelationshipExplorer({ graph, selectedEntityId, selectedRelationId, onSelectEntity, onSelectRelation, onOpenEvidence, reviewFocus, reviewEvidence = [], onCloseReview, onBackReview, compactReview = false }: Props) {
   // Keep the review handoff visible even if a background refresh briefly
   // replaces the issue list while the graph page is mounting. The evidence
   // payload is already enough to explain what was selected.
@@ -201,7 +202,7 @@ export function RelationshipExplorer({ graph, selectedEntityId, selectedRelation
     return () => { cy.destroy(); cyRef.current = null; };
   }, [entities, entityById, focus, mode, onSelectEntity, onSelectRelation, positions, selectedEntityId, selectedRelationId, visiblePairs]);
   return <div className="relationship-explorer">
-    {reviewIssue && <section className="surface" aria-label="검토 후보의 관계와 근거"><span className="badge">{judgmentLabel[reviewIssue.status]}</span><h2>{reviewIssue.title}</h2><p>{reviewIssue.description}</p><p>원문 근거를 공유하는 관련 관계 {reviewRelations.length}개입니다. 모든 연결이 오류라는 뜻은 아닙니다.</p><button onClick={onBackReview}>검토 결과로 돌아가 판단 변경</button><button onClick={onCloseReview}>검토 범위 해제</button><div className="review-source-comparison">{reviewEvidence.filter(chunk => reviewFocus?.chunkId == null || chunk.id === reviewFocus.chunkId).map(chunk => <article className="source-card" key={chunk.id}><blockquote>{chunk.text}</blockquote><button onClick={() => onOpenEvidence?.(chunk.document_id, chunk.text)}>이 근거 원고 열기</button></article>)}</div>{!reviewRelations.length && <p role="status">이 근거에 연결된 관계가 아직 없습니다. 원문에서 검토할 수 있으며, 관계를 새로 추출하려면 재분석이 필요합니다.</p>}</section>}
+    {reviewIssue && <section className="surface" aria-label="검토 후보의 관계와 근거"><span className="badge">{judgmentLabel[reviewIssue.status]}</span><h2>{reviewIssue.title}</h2>{!compactReview && <p>{reviewIssue.description}</p>}<p>원문 근거를 공유하는 관련 관계 {reviewRelations.length}개입니다. 모든 연결이 오류라는 뜻은 아닙니다.</p><button onClick={onBackReview}>검토 결과로 돌아가 판단 변경</button><button onClick={onCloseReview}>검토 범위 해제</button><details open={compactReview ? undefined : true}><summary>{compactReview ? '분석 설명과 원문 근거 펼치기' : '원문 근거 비교'}</summary>{compactReview && <p>{reviewIssue.description}</p>}<div className="review-source-comparison">{reviewEvidence.filter(chunk => reviewFocus?.chunkId == null || chunk.id === reviewFocus.chunkId).map(chunk => <article className="source-card" key={chunk.id}><blockquote>{chunk.text}</blockquote><button onClick={() => onOpenEvidence?.(chunk.document_id, chunk.text)}>이 근거 원고 열기</button></article>)}</div></details>{!reviewRelations.length && <p role="status">이 근거에 연결된 관계가 아직 없습니다. 원문에서 검토할 수 있으며, 관계를 새로 추출하려면 재분석이 필요합니다.</p>}</section>}
 
     <div className="explorer-toolbar">
       <div><span className="network-eyebrow">RELATIONSHIP EXPLORER</span><h2>{focus ? `${entityLabel(focus)}의 관계` : "이야기의 연결"}</h2><p>{focus ? `직접 연결 ${focusPairs.length}개 · 관계를 선택하면 원문 근거를 확인합니다.` : `${entities.length}개 대상 · ${pairs.length}개 관계 그룹을 탐색합니다.`}</p></div>

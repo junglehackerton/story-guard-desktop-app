@@ -22,6 +22,51 @@ npm run build
 
 원고와 분석 데이터는 사용자 컴퓨터 안에 저장됩니다. 사용자가 선택해 연결한 GPT 계정으로 분석할 때만 필요한 원문 구간이 해당 제공자에 전송되며, 팀 공용 API 키를 사용하지 않습니다.
 
+## 웹 데모 배포
+
+웹 데모는 데스크톱 앱과 분리된 공개 샘플 체험판입니다. 브라우저에는 사전 계산된 샘플 그래프와 임베딩만 포함하고, 사용자가 입력한 새 문장 검토는 서버가 보관한 API 키로 OpenAI Responses API를 호출합니다. API 키를 React/Vite 환경 변수나 저장소에 넣지 마세요.
+
+```bash
+npm run build:demo
+# 공개 서버에서 실행할 때
+STORY_GUARD_DEMO_OPENAI_API_KEY="${OPENAI_API_KEY}" \
+STORY_GUARD_DEMO_MODEL=gpt-4o-mini \
+STORY_GUARD_DEMO_INPUT_USD_PER_M=0.15 \
+STORY_GUARD_DEMO_OUTPUT_USD_PER_M=0.60 \
+STORY_GUARD_DEMO_KRW_PER_USD=1400 \
+.venv/bin/python -m uvicorn backend.app.demo_server:app --host 0.0.0.0 --port 8000 --workers 1
+```
+
+실제 배포 전에는 모델 공식 가격, 예산 상한, 영속 SQLite 경로, HTTPS 프록시를 설정해야 합니다. 전체 환경 변수와 Qwen 사전 색인·패키징 절차는 [`docs/web-demo-deployment.md`](docs/web-demo-deployment.md)에 정리되어 있습니다.
+
+팀 내부에서 서버 없이 화면만 검토할 때는 아래처럼 단일 HTML을 만듭니다. 정적 모드에서는 서버 상태 확인과 분석 요청을 건너뛰며, 준비된 원문·검토·관계 지도만 탐색할 수 있습니다.
+
+```bash
+npm run build:demo:static
+python3 scripts/make-static-demo-html.py
+# 결과: demo-static.html
+```
+
+자세한 범위는 [`docs/web-demo-static-preview.md`](docs/web-demo-static-preview.md)를 참고하세요.
+
+## 팀 구현과 비교할 때
+
+현재 브랜치는 `codex/web-demo-release-prep`이며, 웹 데모 소개·실제 화면 미리보기·독립 세션 분석·동시 요청 제한을 포함합니다. 팀원이 만든 구현과 비교할 때는 같은 샘플과 같은 시나리오로 다음을 확인한 뒤 선택합니다.
+
+브랜치별 변경은 아래처럼 비교할 수 있습니다.
+
+```bash
+git diff hackathon/codex/relationship-graph-v1...codex/web-demo-release-prep
+```
+
+1. 첫 화면에서 서비스 목적과 체험 시작점이 바로 이해되는가
+2. 황동 열쇠 문장을 수정했을 때 해당 방문자의 검토 결과와 관계 지도가 실제로 바뀌는가
+3. 다른 브라우저의 분석 결과와 판단이 섞이지 않는가
+4. GPT API 키가 서버에만 있고 일일 3회·동시 4명·예산 제한이 지켜지는가
+5. `npm run build:demo`와 백엔드 테스트가 통과하고 배포 주소에서 새로고침 후에도 샘플이 열리는가
+
+기능 수가 더 많은 구현보다, 위 시나리오에서 결과가 독립적으로 재현되고 심사자가 흐름을 이해할 수 있는 구현을 선택하는 것이 안전합니다.
+
 ## 주요 기능
 
 - `txt`, `md`, `docx` 원고 파일 가져오기
