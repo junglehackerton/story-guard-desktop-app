@@ -39,7 +39,7 @@ STORY_GUARD_DEMO_KRW_PER_USD=1400 \
 
 실제 배포 전에는 모델 공식 가격, 예산 상한, 영속 SQLite 경로, HTTPS 프록시를 설정해야 합니다. 전체 환경 변수와 Qwen 사전 색인·패키징 절차는 [`docs/web-demo-deployment.md`](docs/web-demo-deployment.md)에 정리되어 있습니다.
 
-GitHub 소스에는 용량과 운영 분리 때문에 Qwen GGUF와 `index.npz`를 커밋하지 않습니다. 실제 서버 배포에서는 아래 패키징 명령으로 샘플 스냅샷·Qwen 모델·1차 임베딩 인덱스를 한 묶음으로 만들어 서버에 배치해야 합니다.
+GitHub 소스에는 Qwen GGUF 모델을 커밋하지 않지만, 1차 임베딩 인덱스는 배포 재현을 위해 `deploy/demo-index.npz`로 함께 관리합니다. 실제 서버 배포에서는 아래 패키징 명령으로 샘플 스냅샷·Qwen 모델·1차 임베딩 인덱스를 한 묶음으로 만들어 서버에 배치해야 합니다.
 
 ```bash
 .venv/bin/python scripts/package-web-demo.py \
@@ -48,7 +48,7 @@ GitHub 소스에는 용량과 운영 분리 때문에 Qwen GGUF와 `index.npz`�
 .venv/bin/python scripts/verify-web-demo-package.py output/web-demo-release-VERSION
 ```
 
-검증된 묶음에는 `assets/models/Qwen3-Embedding-0.6B-Q8_0.gguf`와 `assets/index.npz`가 포함되며, API 키와 사용량 DB는 포함되지 않습니다.
+검증된 묶음에는 `assets/models/Qwen3-Embedding-0.6B-Q8_0.gguf`와 `assets/index.npz`가 포함되며, API 키와 사용량 DB는 포함되지 않습니다. 인덱스는 스냅샷 버전과 Qwen 모델 해시가 맞을 때만 사용됩니다.
 
 팀 내부에서 서버 없이 화면만 검토할 때는 아래처럼 단일 HTML을 만듭니다. 정적 모드에서는 서버 상태 확인과 분석 요청을 건너뛰며, 준비된 원문·검토·관계 지도만 탐색할 수 있습니다.
 

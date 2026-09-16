@@ -88,7 +88,7 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output',type=Path,required=True)
     parser.add_argument('--model-dir',type=Path,required=True)
-    parser.add_argument('--index',type=Path,default=ROOT/'output/web-demo/index.npz')
+    parser.add_argument('--index',type=Path,default=ROOT/'deploy/demo-index.npz')
     args=parser.parse_args()
     manifest=package(args.output,args.model_dir,args.index)
     print(f"Packaged {len(manifest['files'])} files; sample {manifest['sample_version']}; {args.output.resolve()}")
