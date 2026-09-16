@@ -166,7 +166,7 @@
 .demo-completion-modal .demo-completion-actions a{color:#24635b;border:1px solid #a8c4bb;background:#fffdf8}
 @media(max-width:700px){.demo-completion-backdrop{padding:14px;align-items:end}.demo-completion-modal{padding:26px 22px;border-radius:16px 16px 10px 10px}.demo-completion-modal h2{font-size:23px}.demo-completion-modal .demo-completion-actions{flex-direction:column;align-items:stretch}.demo-completion-modal .demo-completion-actions button,.demo-completion-modal .demo-completion-actions a{width:100%;justify-content:center;box-sizing:border-box}}
 @media(max-width:700px){.demo-completion-actions{flex-direction:column;align-items:stretch}.demo-completion-actions a,.demo-completion-actions button{justify-content:center;width:100%;box-sizing:border-box}}
-.demo-intro-download{background:#fffdf8}
+.demo-intro-download{background:transparent}
 .demo-intro-download-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:16px;margin-top:34px}
 .demo-intro-download-grid article{display:grid;gap:16px;padding:22px;border:1px solid #cfdad3;border-radius:12px;background:#f6f7f2}
 .demo-intro-download-grid article>div{display:grid;gap:6px}
@@ -176,3 +176,7 @@
 .demo-intro-download-grid a.primary{color:#fff;background:#24635b;border-color:#24635b}
 .demo-intro-download-grid a span{font-size:15px;color:inherit}
 @media(max-width:800px){.demo-intro-download-grid{grid-template-columns:1fr}}
+/* 앵커로 직접 진입한 소개 섹션도 reveal 대기 없이 읽을 수 있게 표시 */
+.demo-intro-reveal:target{opacity:1;transform:none}
+/* 스크롤 컨테이너·앵커 진입에서 콘텐츠가 희미해지지 않도록 기본 표시를 유지 */
+.demo-intro-page .demo-intro-reveal{opacity:1;transform:none}
