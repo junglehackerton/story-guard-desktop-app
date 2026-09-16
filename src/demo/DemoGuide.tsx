@@ -12,10 +12,9 @@ type Props = {
   onClues: () => void;
   onAnalyze: () => void;
   onTutorial: () => void;
-  onFinish: () => void;
 };
 
-export function DemoGuide({status,onSave,onSource,onGraph,onReview,onClues,onAnalyze,onTutorial,onFinish}: Props) {
+export function DemoGuide({status,onSave,onSource,onGraph,onReview,onClues,onAnalyze,onTutorial}: Props) {
   function excerpt(index: number) {
     const source = guideSources[index];
     const chunk = sample.chunks.find(c => c.id === source.chunkId)!;
@@ -51,6 +50,5 @@ export function DemoGuide({status,onSave,onSource,onGraph,onReview,onClues,onAna
       <div className="demo-next-actions"><button className="primary" onClick={onGraph}>이 후보의 관계 지도 보기</button><button onClick={onReview}>다른 검토 후보 보기</button><button onClick={onClues}>떡밥의 상태 판단하기</button></div>
       <div className="demo-live-invitation"><div><h3>직접 문장을 바꿔 보고 싶다면</h3><p>새 문장 검토는 서버의 AI로 실제 분석합니다. 연결 상태와 하루 이용 한도가 적용됩니다.</p></div><button onClick={onAnalyze}>새 문장으로 실시간 분석</button></div>
     </section>
-    {status!=='open' && <section className="surface demo-completion" aria-labelledby="demo-completion-title"><span className="badge">체험 완료</span><h2 id="demo-completion-title">여기까지가 웹 체험판입니다.</h2><p>실제 작품을 기기에 보관하고 전체 회차를 분석하려면 최종 설치형 프로그램을 사용하세요. 출시 안내와 설치 파일은 GitHub Releases에서 공개합니다.</p><div className="demo-completion-actions"><a className="primary" href="https://github.com/wanted-storyguard/StoryGaurd/releases" target="_blank" rel="noreferrer">프로그램 다운로드 안내</a><button onClick={onFinish}>소개 페이지로 돌아가기</button></div></section>}
   </div>;
 }
