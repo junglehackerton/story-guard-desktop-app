@@ -45,10 +45,10 @@ export function DemoGuide({status,onSave,onSource,onGraph,onReview,onClues,onAna
       {status!=='open' && <button className="text-action" onClick={() => void onSave(guideIssueId,'open')}>확인 대기로 되돌리기</button>}
     </section>
     <section className="surface demo-guide-next">
-      <h2>3. 인물·사건·단서까지 이어서 살펴보세요</h2>
-      <p>하나의 문장만 검사하는 데서 끝나지 않습니다. 회차를 가로지르는 관계와 단서의 근거를 따라가 보세요.</p>
-      <div className="demo-next-actions"><button className="primary" onClick={onGraph}>이 후보의 관계 지도 보기</button><button onClick={onReview}>다른 검토 후보 보기</button><button onClick={onClues}>떡밥의 상태 판단하기</button></div>
-      <div className="demo-live-invitation"><div><h3>직접 문장을 바꿔 보고 싶다면</h3><p>새 문장 검토는 서버의 AI로 실제 분석합니다. 연결 상태와 하루 이용 한도가 적용됩니다.</p></div><button onClick={onAnalyze}>새 문장으로 실시간 분석</button></div>
+      <h2>3. 열쇠 사례의 연결을 확인하세요</h2>
+      <p>앞에서 비교한 열쇠가 어떤 인물·아이템·장소와 이어지는지 관계 지도에서 원문 근거와 함께 살펴보세요.</p>
+      <div className="demo-next-actions"><button className="primary" onClick={onGraph}>열쇠 사례의 관계 지도 보기</button></div>
+      <div className="demo-live-invitation"><div><h3>다른 문장을 AI로 확인해 보려면</h3><p>열쇠 사례의 기존 원문 범위를 기준으로 새 문장을 비교합니다. 이 기능은 실제 AI 요청과 하루 이용 한도를 사용합니다.</p></div><button onClick={onAnalyze}>새 문장으로 실시간 분석</button></div>
     </section>
   </div>;
 }

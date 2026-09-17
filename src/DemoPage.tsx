@@ -11,7 +11,7 @@ import './demo.css';
 import reviewPreview from './demo/assets/review-preview.jpg';
 import graphPreview from './demo/assets/graph-preview.jpg';
 import storyGuardMark from './demo/assets/story-guard-mark.png';
-import { DemoRelationshipMap } from './demo/DemoRelationshipMap';
+import { RelationshipExplorer } from './components/RelationshipExplorer';
 const noop = () => {};
 const unchanged = async () => false;
 const clueLabels = {unreviewed:'검토 전',in_progress:'진행 중',resolved:'회수 확인',intentional:'의도적 미회수'};
@@ -77,14 +77,29 @@ export default function DemoPage() {
   const [introOpen, setIntroOpen] = useState(initialIntroOpen);
   const [liveAnalysis, setLiveAnalysis] = useState<LiveAnalysis | null>(null);
   const [completionOpen, setCompletionOpen] = useState(false);
+  const [downloadOpen, setDownloadOpen] = useState(false);
   const workspace = useRef<HTMLElement>(null);
   const graph = {...sample.graph, issues: [...sample.graph.issues].sort((a,b)=>Number(b.id===guideIssueId)-Number(a.id===guideIssueId)).map(i => ({...i, status: judgments[i.id] ?? i.status}))};
   const evidence = Object.fromEntries(graph.issues.map(i => [i.id, sample.chunks.filter(c => i.evidence_chunk_ids.includes(c.id))]));
   const liveEvidence = liveAnalysis?.evidence.map(item => sample.chunks.find(chunk => chunk.id === item.id) ?? ({id:item.id, document_id:item.document_id, project_id:sample.project.id, chunk_index:0, text:item.text, start_offset:0, end_offset:item.text.length} as typeof sample.chunks[number])) ?? [];
-  const liveTarget = (liveAnalysis && graph.entities.find(entity => liveAnalysis.text.includes(entity.name)))
+  const liveRelationData = liveAnalysis?.new_relations ?? [];
+  const liveEntities = [...graph.entities];
+  const liveRelations = [...graph.relations];
+  liveRelationData.forEach((item, index) => {
+    const findOrCreate = (name: string, type?: string) => {
+      const existing = liveEntities.find(entity => entity.name === name);
+      if (existing) return existing;
+      const entity = {id: -1000 - index * 2 - (name === item.target ? 1 : 0), project_id: sample.project.id, type: (['character','item','place','event'].includes(type ?? '') ? type : 'item') as EntityNode['type'], name, aliases: [], summary: '이번 AI 분석에서 새로 확인된 대상입니다.', first_seen_document_id: null, mention_count: 1, document_ids: [], document_count: 0, last_seen_document_id: null, appearance_state: 'new' as const, visual_weight: 1};
+      liveEntities.push(entity); return entity;
+    };
+    const source = findOrCreate(item.source, item.source_type); const target = findOrCreate(item.target, item.target_type);
+    liveRelations.push({id: -1000 - index, project_id: sample.project.id, source_entity_id: source.id, target_entity_id: target.id, type: 'AI 분석 관계', display_label: `NEW · ${item.label}`, confidence: 1, strength: 1, is_weak: false, is_recent: true, evidence_chunk_ids: liveEvidence.map(item => item.id), origin: 'gpt', claims: [{explanation: '이번 GPT 분석에서 새로 제안된 관계입니다.', basis: 'inferred', quotes: []}]});
+  });
+  const liveTarget = (liveAnalysis && liveRelationData[0] && liveEntities.find(entity => entity.name === liveRelationData[0].source))
+    || (liveAnalysis && graph.entities.find(entity => liveAnalysis.text.includes(entity.name)))
     || (liveAnalysis ? graph.entities.find(entity => entity.name.includes('황동 열쇠')) : null)
     || (liveAnalysis ? graph.entities.find(entity => liveEvidence.some(item => item.text.includes(entity.name))) : null) || null;
-  const liveGraph = liveAnalysis?.resolved ? {...graph, issues: graph.issues.map(issue => issue.id===guideIssueId ? {...issue, status:'accepted' as const, description:liveAnalysis.summary} : issue)} : liveAnalysis && liveAnalysis.verdict !== 'clear' ? {...graph, issues: [...graph.issues, {id:-1, project_id:sample.project.id, severity:liveAnalysis.verdict==='conflict'?'high' as const:'medium' as const, category:'contradiction' as const, title:'새 문장 검토 · '+(liveAnalysis.verdict==='conflict'?'충돌 후보':'근거 부족'), description:liveAnalysis.summary, evidence_chunk_ids:liveEvidence.map(item=>item.id), status:'open' as const}]} : graph;
+  const liveGraph = liveAnalysis?.verdict === 'clear' ? {...graph, entities: liveEntities, relations: liveRelations, issues: graph.issues.map(issue => issue.id===guideIssueId ? {...issue, status:'accepted' as const, description:liveAnalysis.summary} : issue)} : liveAnalysis ? {...graph, entities: liveEntities, relations: liveRelations, issues: [...graph.issues, {id:-1, project_id:sample.project.id, severity:liveAnalysis.verdict==='conflict'?'high' as const:'medium' as const, category:'contradiction' as const, title:'새 문장 검토 · '+(liveAnalysis.verdict==='conflict'?'충돌 후보':'근거 부족'), description:liveAnalysis.summary, evidence_chunk_ids:liveEvidence.map(item=>item.id), status:'open' as const}]} : graph;
   const liveEvidenceMap = liveAnalysis ? {...evidence, [-1]: liveEvidence} : evidence;
   useEffect(() => { workspace.current?.scrollTo(0,0); workspace.current?.closest('.app-shell')?.scrollTo(0,0); }, [page,guided]);
   function navigate(next: Page) {
@@ -103,12 +118,16 @@ export default function DemoPage() {
   }
   function allReviews() { setGuided(false); setPage('review'); }
   function openSource(documentId: number, quote?: string) { setSourceReturn(page); setSource({documentId, quote}); setPage('manuscripts'); }
+  function reviewRelation(_id: number) { setDownloadOpen(true); }
   async function save(id: number, status: IssueStatus) {
     const previous = judgments[id] ?? 'open';
     const next = {...judgments, [id]: status}; setJudgments(next);
     try { localStorage.setItem(storageKey, JSON.stringify(next)); }
     catch { setNotice('브라우저 저장이 차단되어 판단은 이 화면을 닫기 전까지만 유지됩니다.'); }
-    if (id === guideIssueId && previous === 'open' && status !== 'open') {
+    // The guided first-step judgment should stay focused on the sample flow.
+    // Show the desktop-app handoff only after the visitor makes a judgment
+    // from the full review-results screen.
+    if (!guided && id === guideIssueId && previous === 'open' && status !== 'open') {
       try {
         if (sessionStorage.getItem('storyguard-demo-completion-seen-v1') !== 'yes') {
           sessionStorage.setItem('storyguard-demo-completion-seen-v1', 'yes');
@@ -128,25 +147,22 @@ export default function DemoPage() {
     catch { setNotice('브라우저 저장소를 사용할 수 없어 초기화하지 못했습니다.'); }
   }
   if (introOpen) return <DemoIntro onEnter={enterDemo}/>;
-  if (page==='graph') return <DemoRelationshipMap
-    graph={liveGraph}
-    selectedEntityId={entity?.id ?? null}
-    selectedRelationId={relation}
-    reviewFocus={focus}
-    reviewEvidence={focus ? liveEvidenceMap[focus.issueId] : []}
-    onSelectEntity={setEntity}
-    onSelectRelation={setRelation}
-    onOpenEvidence={openSource}
-    onReview={()=>setPage('review')}
-    onIntro={()=>setIntroOpen(true)}
-  />;
+  if (page==='graph') return <div className={`app-shell workbench demo-workbench page-${page}`}>
+    <WorkbenchNav demo page={page} onPage={navigate} project={sample.project} projects={[sample.project]} onProject={startGuide} onReset={reset}/>
+    <main className="workspace" ref={workspace}>
+      <header className="workspace-header"><div className="title-area"><h1 className="page-title">관계 지도</h1><p className="page-description">작품 속 인물, 아이템, 규칙, 사건의 관계를 한눈에 확인하세요.</p><div className="project-title-row"><h2>{sample.project.title}</h2></div></div><div className="status-strip"><span className="badge">웹 체험판</span><strong>공개 샘플 10화</strong><button className="demo-intro-back" onClick={()=>setIntroOpen(true)}>서비스 소개</button></div></header>
+      {liveAnalysis && <LiveAnalysisBanner analysis={liveAnalysis} onGraph={()=>{setEntity(liveTarget);setRelation(null);setFocus(null);}}/>}
+      <section className="page-content"><RelationshipExplorer compactReview projectId={sample.project.id} graph={liveGraph} selectedEntityId={entity?.id ?? null} selectedRelationId={relation} onSelectEntity={setEntity} onSelectRelation={setRelation} onReviewRelation={reviewRelation} onOpenEvidence={openSource} reviewFocus={focus} reviewEvidence={focus ? liveEvidenceMap[focus.issueId] : []} onCloseReview={()=>setFocus(null)} onBackReview={()=>setPage('review')}/></section>
+    </main>
+    {downloadOpen && <div className="demo-completion-backdrop" role="presentation"><section className="demo-completion-modal" role="dialog" aria-modal="true" aria-labelledby="demo-download-title"><span className="badge">DESKTOP APP</span><h2 id="demo-download-title">작업을 계속 이어가려면<br/>Story Guard를 설치하세요.</h2><p>원고를 기기에 보관하고, 인물·아이템·장소의 관계를 직접 확인하며 계속 분석하려면 데스크톱 앱을 사용하세요.</p><div className="demo-completion-actions"><button onClick={()=>setDownloadOpen(false)}>관계 지도 계속 보기</button><a className="primary" href="https://github.com/wanted-storyguard/StoryGaurd/releases" target="_blank" rel="noreferrer">프로그램 다운로드 안내</a></div></section></div>}
+  </div>;
   return <div className={`app-shell workbench demo-workbench page-${page}`}>
     <WorkbenchNav demo page={page} onPage={navigate} project={sample.project} projects={[sample.project]} onProject={startGuide} onReset={reset}/>
     <main className="workspace" ref={workspace}>
       <header className="workspace-header"><div className="title-area"><h1 className="page-title">{guided && page==='review' ? '원문으로 확인하고, 작가가 판단하세요' : PAGES[page][0]}</h1><p className="page-description">{guided && page==='review' ? '긴 소설에서 앞뒤가 달라진 설정을 근거와 함께 찾습니다.' : PAGES[page][1]}</p><div className="project-title-row"><h2>{sample.project.title}</h2></div></div><div className="status-strip"><span className="badge">웹 체험판</span><strong>공개 샘플 10화</strong><button className="demo-intro-back" onClick={()=>setIntroOpen(true)}>서비스 소개</button></div></header>
       {!(guided && page==='review') && <aside className="demo-notice"><div><strong>{page==='analysis' ? '직접 입력하는 실시간 AI 분석' : '저장된 실제 분석 결과를 탐색 중입니다.'}</strong><p>{page==='analysis' ? 'AI 연결 없이도 샘플의 근거 비교와 작가 판단을 체험할 수 있습니다.' : '샘플 원고는 읽기 전용입니다. 판단은 이 브라우저에 저장되며 다른 방문자에게 영향을 주지 않습니다.'}</p></div><button onClick={startGuide}>첫 사례로 돌아가기</button></aside>}
       {notice && <p className="demo-storage-notice" role="status">{notice}</p>}
-      <section className="page-content" hidden={page!=='analysis'}><DemoAnalysis active={page==='analysis'} onSource={openSource} onResult={setLiveAnalysis} onGraph={()=>{setEntity(liveTarget);setRelation(null);setFocus(null);setPage('graph');}} onReview={allReviews}/></section>
+      <section className="page-content" hidden={page!=='analysis'}><DemoAnalysis active={page==='analysis'} onSource={openSource} onResult={(result)=>{setLiveAnalysis(result); if(result) setCompletionOpen(true);}} onGraph={()=>{setEntity(liveTarget);setRelation(null);setFocus(null);setPage('graph');}} onReview={allReviews}/></section>
       <section className="page-content" hidden={page!=='manuscripts'}>
         {source && <button className="demo-source-return" onClick={()=>setPage(sourceReturn)}>← {sourceReturn==='review' && guided ? '열쇠 사례의 근거 비교로' : '이전 화면으로'} 돌아가기</button>}
         <ManuscriptsPage readOnly active={page==='manuscripts'} documents={sample.documents} settings={[]} sourceRequest={source} loading={false} onImport={noop} onDelete={noop} onReplace={noop} onEdit={unchanged} onAnalyze={()=>setPage('analysis')} onCreateSetting={unchanged} onUpdateSetting={unchanged} onDeleteSetting={noop}/>
@@ -156,7 +172,7 @@ export default function DemoPage() {
         const current = clues[e.id] ?? 'unreviewed'; const chapters = evidenceChapters(e.id);
         return <article className="source-card foreshadowing-card" key={e.id}><div><h3>{e.name}</h3><span className={`setting-certainty ${current}`}>{clueLabels[current]}</span></div><p>{e.summary}</p><div className="demo-chapter-links"><span>근거 회차</span>{chapters.length ? chapters.map(d=><button className="text-action" key={d.id} onClick={()=>openSource(d.id)}>{d.chapter_index+1}화 원문</button>) : <span>저장된 회차 근거 없음 · 등장 시점 확인 필요</span>}</div><div className="foreshadowing-actions"><label>작가 판단<select aria-label={`${e.name} 상태`} value={current} onChange={event=>saveClue(e.id,event.target.value as ForeshadowingStatusValue)}>{Object.entries(clueLabels).map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label><button onClick={()=>{setEntity(e);setRelation(null);setFocus(null);setPage('graph');}}>관계 지도에서 확인</button></div></article>;
       })}</div></section>}
-      <footer className="demo-footer">데스크톱 앱은 원고를 기기에 보관합니다. 웹 체험은 공개 샘플을 사용하며, 직접 입력한 새 문장 검토는 서버와 외부 AI에서 처리합니다.</footer>
+      <footer className="demo-footer">데스크톱 앱은 원고를 기기에 보관합니다. 웹 체험은 공개 샘플을 사용하며, 수정한 문장 검토는 서버와 외부 AI에서 처리합니다.</footer>
     </main>
     {tutorialOpen && <div className="demo-tutorial-backdrop" role="presentation"><section className="demo-tutorial" role="dialog" aria-modal="true" aria-labelledby="demo-tutorial-title">
       <span className="badge">STORY GUARD · 3분 체험</span>
@@ -167,6 +183,7 @@ export default function DemoPage() {
       <p className="demo-tutorial-note">샘플 원고는 읽기 전용이며, 판단은 이 브라우저에만 저장됩니다.</p>
       <div className="demo-tutorial-actions"><button onClick={beginTutorial} className="primary">열쇠 사례 시작하기</button><button onClick={beginTutorial}>설명 없이 둘러보기</button></div>
     </section></div>}
-    {completionOpen && <div className="demo-completion-backdrop" role="presentation"><section className="demo-completion-modal" role="dialog" aria-modal="true" aria-labelledby="demo-completion-title"><span className="badge">체험 1단계 완료</span><h2 id="demo-completion-title">AI가 찾은 근거를 확인했습니다.</h2><p>이제 관계 지도와 검토 결과에서 판단이 어떻게 반영되는지 이어서 확인해 보세요.</p><div className="demo-completion-modal-note"><strong>웹 체험판 안내</strong><span>전체 원고를 기기에 보관하고 계속 분석하려면 최종 설치형 프로그램을 사용합니다.</span></div><div className="demo-completion-actions"><button className="primary" onClick={()=>setCompletionOpen(false)}>결과 계속 보기</button><a href="https://github.com/wanted-storyguard/StoryGaurd/releases" target="_blank" rel="noreferrer">프로그램 다운로드 안내</a></div></section></div>}
+    {completionOpen && <div className="demo-completion-backdrop" role="presentation"><section className="demo-completion-modal" role="dialog" aria-modal="true" aria-labelledby="demo-completion-title"><span className="badge">체험 분석 완료</span><h2 id="demo-completion-title">수정한 문장의 분석이 끝났습니다.</h2><p>변경된 관계 지도를 확인해 분석 결과가 어떻게 달라졌는지 살펴보세요.</p><div className="demo-completion-modal-note"><strong>Story Guard 데스크톱 앱</strong><span>전체 원고를 보관하고 모든 관계를 계속 분석하려면 프로그램을 설치하세요.</span></div><div className="demo-completion-actions"><button className="primary" onClick={()=>{setCompletionOpen(false); setEntity(liveTarget); setRelation(null); setFocus(null); setPage('graph');}}>변경된 관계 지도 보기</button><a href="https://github.com/wanted-storyguard/StoryGaurd/releases" target="_blank" rel="noreferrer">프로그램 다운로드 안내</a></div></section></div>}
+    {downloadOpen && <div className="demo-completion-backdrop" role="presentation"><section className="demo-completion-modal" role="dialog" aria-modal="true" aria-labelledby="demo-download-title"><span className="badge">웹 체험판 안내</span><h2 id="demo-download-title">이 관계를 직접 판단하려면<br/>작업실이 필요합니다.</h2><p>웹 체험판은 열쇠 사례의 판단 흐름만 제공합니다. 다른 관계를 수정하고 전체 원고를 계속 분석하려면 데스크톱 앱을 사용하세요.</p><div className="demo-completion-actions"><button onClick={()=>setDownloadOpen(false)}>관계 지도 계속 보기</button><a className="primary" href="https://github.com/wanted-storyguard/StoryGaurd/releases" target="_blank" rel="noreferrer">프로그램 다운로드 안내</a></div></section></div>}
   </div>;
 }

@@ -2,6 +2,19 @@ import { relatedRelations, relationJudgments, judgmentLabel, type ReviewGraphFoc
 import { useEffect, useMemo, useRef, useState } from "react";
 import cytoscape, { type Core } from "cytoscape";
 import type { EntityNode, GraphPayload, RelationEdge, EvidenceChunk } from "../lib/types";
+import haejuPortrait from "../demo/assets/evidence-board/haeju.jpg";
+import mingyubaekPortrait from "../demo/assets/evidence-board/mingyubaek.jpg";
+import baekroHotel from "../demo/assets/evidence-board/baekro-hotel.jpg";
+import guestLedger from "../demo/assets/evidence-board/guest-ledger.jpg";
+import generatedMalePortrait from "../demo/assets/evidence-board/generated/character-male.jpg";
+import generatedBrassKey from "../demo/assets/evidence-board/generated/brass-key-generated.jpg";
+import generatedCoastalHotel from "../demo/assets/evidence-board/generated/coastal-hotel.jpg";
+import generatedOmalsoon from "../demo/assets/evidence-board/generated/ohmalsun.jpg";
+import generatedSeowoo from "../demo/assets/evidence-board/generated/seowoo-generated.jpg";
+import generatedTechnician from "../demo/assets/evidence-board/generated/technician.jpg";
+import generatedMinseoryeong from "../demo/assets/evidence-board/generated/minseoryeong-generated.jpg";
+import generatedKangtaeoh from "../demo/assets/evidence-board/generated/kangtaeoh.jpg";
+import generatedJindogyeom from "../demo/assets/evidence-board/generated/jindogyeom.jpg";
 
 type Props = {
   projectId: number | null;
@@ -16,12 +29,34 @@ type Props = {
   selectedRelationId?: number | null;
   onSelectEntity: (entity: EntityNode | null) => void;
   onSelectRelation?: (id: number | null) => void;
+  onReviewRelation?: (id: number) => void;
   onOpenEvidence?: (documentId: number, quote: string) => void;
 };
 
 type Pair = { key: string; source: EntityNode; target: EntityNode; members: RelationEdge[] };
 const typeLabel: Record<string, string> = { character: "인물", place: "장소", organization: "조직", item: "아이템", event: "사건", rule: "규칙", foreshadowing: "떡밥" };
 const typeColor: Record<string, string> = { character: "#24635B", place: "#4F817D", organization: "#8A5A20", item: "#B78343", event: "#7B6B4B", rule: "#39796E", foreshadowing: "#6687BD" };
+const entityAssets = [
+  { names: ["해주", "윤해주"], src: haejuPortrait },
+  { names: ["민규백"], src: mingyubaekPortrait },
+  { names: ["민서령"], src: generatedMinseoryeong },
+  { names: ["서우"], src: generatedSeowoo },
+  { names: ["호텔", "백로호텔"], src: baekroHotel },
+  { names: ["백로도", "항구", "개인 선착장", "경매장", "서관 숙소"], src: generatedCoastalHotel },
+  { names: ["장부", "수첩", "명부"], src: guestLedger },
+  { names: ["열쇠", "녹색 플라스틱 머리가 달린 황동 열쇠"], src: generatedBrassKey },
+  { names: ["금고", "지하 문서금고", "금고 부품", "장부 원본"], src: guestLedger },
+  { names: ["백로라는 이름의 파일", "기록 테이프", "사진", "편지", "문 밖에 끼운 보강봉"], src: guestLedger },
+  { names: ["오말순"], src: generatedOmalsoon },
+  { names: ["기술자"], src: generatedTechnician },
+  { names: ["강태오"], src: generatedKangtaeoh },
+  { names: ["진도겸"], src: generatedJindogyeom },
+  { names: ["윤재문"], src: generatedMalePortrait },
+];
+function assetForEntity(entity: EntityNode | null | undefined) {
+  if (!entity) return null;
+  return entityAssets.find(asset => asset.names.some(name => entity.name === name || entity.name.includes(name)))?.src ?? null;
+}
 
 function entityLabel(entity: EntityNode) { return entity.is_unresolved ? "미확인 대상" : entity.name; }
 function pairKey(a: number, b: number) { return [a, b].sort((x, y) => x - y).join(":"); }
@@ -36,7 +71,7 @@ function isIssue(relation: RelationEdge) {
 
 /** A writer-first relationship explorer. The canvas is a compact index; the
  * relation cards below remain exhaustive and carry the evidence interaction. */
-export function RelationshipExplorer({ graph, selectedEntityId, selectedRelationId, onSelectEntity, onSelectRelation, onOpenEvidence, reviewFocus, reviewEvidence = [], onCloseReview, onBackReview, compactReview = false }: Props) {
+export function RelationshipExplorer({ graph, selectedEntityId, selectedRelationId, onSelectEntity, onSelectRelation, onReviewRelation, onOpenEvidence, reviewFocus, reviewEvidence = [], onCloseReview, onBackReview, compactReview = false }: Props) {
   // Keep the review handoff visible even if a background refresh briefly
   // replaces the issue list while the graph page is mounting. The evidence
   // payload is already enough to explain what was selected.
@@ -157,6 +192,14 @@ export function RelationshipExplorer({ graph, selectedEntityId, selectedRelation
     const others = canvasEntities.filter(entity => entity.id !== center.id);
     const radiusX = Math.max(90, Math.min(canvasSize.width / 2 - 54, 120 + others.length * 14));
     const radiusY = Math.max(70, Math.min(canvasSize.height / 2 - 48, 76 + others.length * 6));
+    if (others.length === 1) {
+      result.set(others[0].id, { x: centerX + radiusX, y: centerY });
+      return result;
+    }
+    if (others.length === 2) {
+      others.forEach((entity, index) => result.set(entity.id, { x: centerX + (index === 0 ? -radiusX : radiusX), y: centerY }));
+      return result;
+    }
     others.forEach((entity, index) => { const angle = -Math.PI / 2 + (index / Math.max(1, others.length)) * Math.PI * 2; result.set(entity.id, { x: centerX + Math.cos(angle) * radiusX, y: centerY + Math.sin(angle) * radiusY }); });
     return result;
   }, [canvasEntities, canvasSize, focus, mode, pairs]);
@@ -175,10 +218,15 @@ export function RelationshipExplorer({ graph, selectedEntityId, selectedRelation
     // making them appear stacked in the center.
     const positionIds = new Set(canvasEntities.map(entity => entity.id));
     const pairLimit = mode === "all" ? 36 : focus ? 24 : 10;
-    const shownPairs = visiblePairs.filter(pair => positionIds.has(pair.source.id) && positionIds.has(pair.target.id)).slice(0, pairLimit);
+    // An empty issue filter means there are no flagged relations for this
+    // focus, not that the focus has no relationships. Keep the graph useful
+    // by falling back to the complete focused set while the cards remain
+    // empty and accurately report that there is nothing to review.
+    const graphPairs = visiblePairs.length ? visiblePairs : focusPairs;
+    const shownPairs = graphPairs.filter(pair => positionIds.has(pair.source.id) && positionIds.has(pair.target.id)).slice(0, pairLimit);
     const shownIds = new Set(shownPairs.flatMap(pair => [pair.source.id, pair.target.id]));
     const elements = [
-      ...entities.filter(entity => shownIds.has(entity.id)).map(entity => ({ data: { id: String(entity.id), label: entity.is_unresolved ? "미확인 대상" : entity.name, type: entity.type, unresolved: entity.is_unresolved ? 1 : 0 }, position: positions.get(entity.id) ?? { x: 400, y: 210 }, classes: entity.id === selectedEntityId ? "center" : "" })),
+      ...entities.filter(entity => shownIds.has(entity.id)).map(entity => ({ data: { id: String(entity.id), label: entity.is_unresolved ? "미확인 대상" : entity.name, type: entity.type, image: assetForEntity(entity) ?? "", unresolved: entity.is_unresolved ? 1 : 0 }, position: positions.get(entity.id) ?? { x: 400, y: 210 }, classes: `${entity.id === selectedEntityId ? "center " : ""}${assetForEntity(entity) ? "has-image" : ""}` })),
       ...shownPairs.map(pair => ({ data: { id: `r-${pair.key}`, relationId: pair.members[0].id, source: String(pair.source.id), target: String(pair.target.id), label: pair.members[0].display_label || pair.members[0].type }, classes: `${pair.members.some(needsReview) ? "issue " : ""}${pair.members.some(member => member.id === selectedRelationId) ? "selected" : ""}` })),
     ];
     const cy = cytoscape({ container: canvasRef.current, elements, userZoomingEnabled: true, userPanningEnabled: true, boxSelectionEnabled: false, minZoom: 0.35, maxZoom: 2.5, style: [
@@ -190,7 +238,11 @@ export function RelationshipExplorer({ graph, selectedEntityId, selectedRelation
       { selector: "node[type='event']", style: { "background-color": "#E9E2D5", "border-color": "#7B6B4B" } },
       { selector: "node[type='rule']", style: { "background-color": "#DDEBE4", "border-color": "#39796E" } },
       { selector: "node[type='foreshadowing']", style: { "background-color": "#E2E8F4", "border-color": "#6687BD" } },
+      { selector: "node.has-image", style: { "shape": "round-rectangle", "background-image": "data(image)", "background-fit": "cover", "background-clip": "node", "width": 76, "height": 76, "border-width": 3, "text-valign": "bottom", "text-margin-y": 11, "text-background-color": "#FFFDF8", "text-background-opacity": 0.9, "text-background-padding": "3" } },
+      { selector: "node.has-image[type='place']", style: { "width": 94, "height": 66 } },
+      { selector: "node.has-image[type='item']", style: { "width": 74, "height": 66 } },
       { selector: "node.center", style: { "background-color": "#24635B", "color": "#FFFDF8", "border-width": 4, "width": 88, "height": 88 } },
+      { selector: "node.center.has-image", style: { "color": "#252A27", "background-color": "#FFFDF8", "text-background-color": "#FFFDF8", "text-background-opacity": 0.95, "border-color": "#24635B" } },
       { selector: "node[unresolved=1]", style: { "border-style": "dashed", "border-color": "#AD443B", "background-color": "#FFF0EE", "color": "#AD443B" } },
       { selector: "edge", style: { "line-color": "#A7B5AF", "width": 2, "curve-style": "bezier", "target-arrow-shape": "triangle", "target-arrow-color": "#A7B5AF", "label": "" } },
       { selector: "edge.issue", style: { "line-color": "#AD443B", "target-arrow-color": "#AD443B", "line-style": "dashed", "width": 3 } },
@@ -198,6 +250,7 @@ export function RelationshipExplorer({ graph, selectedEntityId, selectedRelation
     ], layout: { name: "preset", animate: false, fit: false } as cytoscape.LayoutOptions });
     cy.on("tap", "node", event => selectEntity(entityById.get(Number(event.target.id())) ?? null));
     cy.on("tap", "edge", event => onSelectRelation?.(Number(event.target.data("relationId"))));
+    cy.on("tap", event => { if (event.target === cy) { onSelectRelation?.(null); } });
     cyRef.current = cy;
     return () => { cy.destroy(); cyRef.current = null; };
   }, [entities, entityById, focus, mode, onSelectEntity, onSelectRelation, positions, selectedEntityId, selectedRelationId, visiblePairs]);
@@ -216,18 +269,18 @@ export function RelationshipExplorer({ graph, selectedEntityId, selectedRelation
       <button role="tab" aria-selected={mode === "all"} className={mode === "all" ? "active" : ""} onClick={() => setMode("all")}>전체 구조</button>
       {focus && <button className="subtle" onClick={() => selectEntity(null)}>중심 해제</button>}
     </div>
-    {mode === "timeline" && timelineChapters.length > 1 && <div className="explorer-timeline" aria-label="회차별 관계 흐름">
-      <div><strong>회차별 관계 흐름</strong><span>{timelineChapter === null ? "전체 회차" : `${timelineChapter + 1}화까지`}</span><button type="button" onClick={() => setTimelineChapter(null)} disabled={timelineChapter === null}>전체 보기</button></div>
-      <input type="range" min={timelineChapters[0]} max={timelineChapters[timelineChapters.length - 1]} value={timelineChapter ?? timelineChapters[timelineChapters.length - 1]} onChange={event => setTimelineChapter(Number(event.target.value))} aria-label="표시 회차" />
-      <small>{timelineChapters[0] + 1}화 · 관계가 생기거나 바뀐 시점만 누적해서 봅니다 · 언급이 없다고 단절로 확정하지 않습니다</small>
-    </div>}
     <div className="explorer-grid">
       <section className="explorer-canvas" aria-label="관계 탐색 지도">
         <div className="explorer-canvas-head"><strong>{focus ? "직접 연결 관계" : "핵심 관계 미리보기"}</strong><span>확인 {canvasConfirmedCount} · 점검 {canvasIssueCount}</span></div>
-        {canvasEntities.length ? <div ref={canvasRef} role="img" aria-label="선택 대상 중심 관계 지도" className="explorer-cytoscape"/> : <div className="explorer-empty">조건에 맞는 관계가 없습니다.</div>}
+        {canvasEntities.length ? <div ref={canvasRef} role="img" aria-label="선택 대상 중심 관계 지도" className={`explorer-cytoscape ${visiblePairs.length <= 4 ? "compact" : ""}`}/> : <div className="explorer-empty">조건에 맞는 관계가 없습니다.</div>}
         <div className="explorer-legend"><span><i className="confirmed"/>확인된 관계</span><span title="근거가 없거나 관계 신뢰도가 낮은 연결"><i className="issue"/>점검 필요 · 관련 검토/근거 부족</span><span>노드를 누르면 중심이 바뀝니다</span></div>
+        {mode === "timeline" && timelineChapters.length > 1 && <div className="explorer-timeline" aria-label="회차별 관계 흐름">
+          <div><strong>회차별 관계 흐름</strong><span>{timelineChapter === null ? "전체 회차" : `${timelineChapter + 1}화까지`}</span><button type="button" onClick={() => setTimelineChapter(null)} disabled={timelineChapter === null}>전체 보기</button></div>
+          <input type="range" min={timelineChapters[0]} max={timelineChapters[timelineChapters.length - 1]} value={timelineChapter ?? timelineChapters[timelineChapters.length - 1]} onChange={event => setTimelineChapter(Number(event.target.value))} aria-label="표시 회차" />
+          <small>{timelineChapters[0] + 1}화 · 관계가 생기거나 바뀐 시점만 누적해서 봅니다 · 언급이 없다고 단절로 확정하지 않습니다</small>
+        </div>}
       </section>
-      <aside className="explorer-inspector"><div className="inspector-heading"><strong>{focus ? "중심 대상" : "중심 대상 선택"}</strong><select aria-label="중심 대상 선택" value={selectedEntityId ?? ""} onChange={event => selectEntity(entityById.get(Number(event.target.value)) ?? null)}><option value="">대상 선택</option>{entityGroups.map(([type, items]) => <optgroup key={type} label={typeLabel[type] ?? type}>{items.map(entity => <option key={entity.id} value={entity.id}>{entityLabel(entity)}</option>)}</optgroup>)}</select></div>{focus ? <><span className="inspector-type">{focus.is_unresolved ? "미확인 대상 · 분석 확인 필요" : typeLabel[focus.type]} · {focus.document_count}개 회차</span><h3>{entityLabel(focus)}</h3><p>{focus.summary || "추출된 요약이 없습니다."}</p><div className="inspector-stats"><strong>{focusPairs.length}<small>관계 그룹</small></strong><strong>{focus.mention_count}<small>언급 횟수</small></strong></div></> : <div className="inspector-empty">인물이나 아이템을 선택하면 직접 연결 관계와 근거를 이곳에서 설명합니다.</div>}{selectedRelation && selectedPair && <div className="inspector-relation"><span className="inspector-type">선택한 관계</span><h3>{entityLabel(selectedPair.source)} → {entityLabel(selectedPair.target)}</h3><strong>{selectedRelation.display_label || selectedRelation.type}</strong><p>{selectedRelation.claims?.[0]?.explanation || "원문에서 추출된 관계 후보입니다."}</p><small>원문 근거 {selectedRelation.evidence_chunk_ids.length}개 · {selectedRelation.has_unresolved_endpoint ? "대상 연결 미확인" : `신뢰도 ${Math.round(selectedRelation.confidence * 100)}%`}</small>{selectedRelation.claims?.[0]?.quotes?.[0] && <button type="button" className="evidence-link" onClick={() => onOpenEvidence?.(selectedRelation.claims![0].quotes[0].document_id, selectedRelation.claims![0].quotes[0].quote)}>원문에서 근거 보기 · {selectedRelation.claims[0].quotes[0].chapter_index + 1}화</button>}</div>}</aside>
+      <aside className="explorer-inspector"><div className="inspector-heading"><strong>{focus ? "중심 대상" : "중심 대상 선택"}</strong><select aria-label="중심 대상 선택" value={selectedEntityId ?? ""} onChange={event => selectEntity(entityById.get(Number(event.target.value)) ?? null)}><option value="">대상 선택</option>{entityGroups.map(([type, items]) => <optgroup key={type} label={typeLabel[type] ?? type}>{items.map(entity => <option key={entity.id} value={entity.id}>{entityLabel(entity)}</option>)}</optgroup>)}</select></div>{focus ? <><span className="inspector-type">{focus.is_unresolved ? "미확인 대상 · 분석 확인 필요" : typeLabel[focus.type]} · {focus.document_count}개 회차</span><h3>{entityLabel(focus)}</h3><p>{focus.summary || "추출된 요약이 없습니다."}</p><div className="inspector-stats"><strong>{focusPairs.length}<small>관계 그룹</small></strong><strong>{focus.mention_count}<small>언급 횟수</small></strong></div></> : <div className="inspector-empty">인물이나 아이템을 선택하면 직접 연결 관계와 근거를 이곳에서 설명합니다.</div>}{selectedRelation && selectedPair && <div className="inspector-relation"><span className="inspector-type">선택한 관계</span><h3>{entityLabel(selectedPair.source)} → {entityLabel(selectedPair.target)}</h3><strong>{selectedRelation.display_label || selectedRelation.type}</strong><p>{selectedRelation.claims?.[0]?.explanation || "원문에서 추출된 관계 후보입니다."}</p><small>원문 근거 {selectedRelation.evidence_chunk_ids.length}개 · {selectedRelation.has_unresolved_endpoint ? "대상 연결 미확인" : `신뢰도 ${Math.round(selectedRelation.confidence * 100)}%`}</small>{selectedRelation.claims?.[0]?.quotes?.[0] && <button type="button" className="evidence-link" onClick={() => onOpenEvidence?.(selectedRelation.claims![0].quotes[0].document_id, selectedRelation.claims![0].quotes[0].quote)}>원문에서 근거 보기 · {selectedRelation.claims[0].quotes[0].chapter_index + 1}화</button>}{needsReview(selectedRelation) && <><p className="inspector-review-hint">점검 필요 관계입니다. 원문을 확인한 뒤 검토 결과에서 작가 판단을 선택하세요.</p><button type="button" className="primary" onClick={() => onReviewRelation?.(selectedRelation.id)}>검토 결과에서 판단하기</button></>}</div>}</aside>
     </div>
     <section className="explorer-relations"><div className="explorer-section-head"><div><span className="network-eyebrow">RELATION CARDS</span><h3>{mode === "timeline" ? "회차별 관계 흐름" : mode === "issues" ? "점검이 필요한 관계" : "관계와 원문 근거"}</h3></div><span>{visiblePairs.length}개 그룹</span></div>{renderedPairs.map(pair => { const representative = [...pair.members].sort((a, b) => (b.evidence_chunk_ids.length - a.evidence_chunk_ids.length) || b.confidence - a.confidence)[0]; const issue = pair.members.some(needsReview); return <button type="button" key={pair.key} className={`relation-card ${issue ? "issue" : ""} ${pair.members.some(member => member.id === selectedRelationId) ? "selected" : ""}`} onClick={() => onSelectRelation?.(representative.id)}><span className="relation-card-top"><b>{entityLabel(pair.source)} <em>→</em> {entityLabel(pair.target)}</b><small>{pair.members.length}개 주장</small></span><strong>{representative.display_label || representative.type}</strong>{[...new Map(pair.members.flatMap(member => relationJudgments(member, graph.issues ?? [])).map(issue => [issue.id, issue])).values()].map(issue => <span className="badge" key={issue.id}>관련 검토 · {judgmentLabel[issue.status]}</span>)}<p>{representative.claims?.[0]?.explanation || "원문에서 추출된 관계 후보입니다."}</p><span className="relation-meta">{issue ? "확인 필요" : "근거 확인"} · 근거 {representative.evidence_chunk_ids.length}개 · {representative.has_unresolved_endpoint ? "대상 연결 미확인" : `신뢰도 ${Math.round(representative.confidence * 100)}%`}{mode === "timeline" && (pairChapters.get(pair.key)?.length ?? 0) > 0 ? ` · ${(pairChapters.get(pair.key)![0] ?? 0) + 1}화부터` : ""}</span></button>; })}{visiblePairs.length > 12 && <button type="button" className="relation-more" onClick={() => setShowAllRelations(value => !value)}>{showAllRelations ? "핵심 관계만 보기" : `관계 ${visiblePairs.length - 12}개 더 보기`}</button>}{!visiblePairs.length && <div className="explorer-empty relation-empty">관계 카드가 없습니다. 검색어나 점검 범위를 바꿔보세요.</div>}</section>
   </div>;
