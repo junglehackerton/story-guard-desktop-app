@@ -1,8 +1,9 @@
 import cytoscape, { type Core } from 'cytoscape';
-import { BookOpen, CircleHelp, Monitor, Moon, Plus, RotateCcw, Sun, X } from 'lucide-react';
+import { CircleHelp, Monitor, Moon, Plus, RotateCcw, Sun, X } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { EntityNode, EvidenceChunk, GraphPayload, RelationEdge } from '../lib/types';
 import { relatedRelations, type ReviewGraphFocus } from '../lib/reviewGraph';
+import storyGuardMark from './assets/story-guard-mark.png';
 
 type ThemeChoice = 'light' | 'dark' | 'system';
 type MatchMode = 'all' | 'any';
@@ -232,7 +233,7 @@ export function DemoRelationshipMap({
   const themeIcon = themeChoice === 'light' ? <Sun size={15}/> : themeChoice === 'dark' ? <Moon size={15}/> : <Monitor size={15}/>;
   return <main className="demo-map-shell" data-theme={theme}>
     <header className="demo-map-header">
-      <button className="demo-map-brand" onClick={onIntro} aria-label="StoryGuard 서비스 소개로 이동"><BookOpen size={22}/><span>StoryGuard</span><small>백로호텔의 마지막 손님</small></button>
+      <button className="demo-map-brand" onClick={onIntro} aria-label="Story Guard 서비스 소개로 이동"><img className="story-guard-mark" src={storyGuardMark} alt="" aria-hidden="true"/><span>STORY GUARD</span><small>백로호텔의 마지막 손님</small></button>
       <nav aria-label="체험 화면"><button onClick={onReview}>설정 검토</button><button className="active" aria-current="page">관계 지도</button></nav>
       <div className="demo-map-header-actions">
         <label className="demo-theme-picker">{themeIcon}<span className="sr-only">화면 테마</span><select value={themeChoice} onChange={event => setThemeChoice(event.target.value as ThemeChoice)}><option value="light">라이트</option><option value="dark">다크</option><option value="system">시스템</option></select></label>
