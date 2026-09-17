@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import unicodedata
+import math
 from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from backend.app.models import EntityType
@@ -40,37 +42,114 @@ class GroundedGraph:
         self.relations = {}
         self.claims = {}
 
+    def prompt_context(self, limit: int = 40) -> list[dict]:
+        """Return a compact, source-backed global relation catalog for GPT.
+
+        This is context only; it is never treated as new evidence. Keeping
+        the catalog bounded lets later chapters compare against earlier
+        rules/relationships without replaying the entire manuscript.
+        """
+        rows = []
+        for (source, target, label), evidence_ids in self.relations.items():
+            if any(self.entities.get(key, {}).get('is_unresolved') for key in (source, target)):
+                continue
+            claims = self.claims.get((source, target, label), [])
+            explanation = claims[-1].get('explanation', '') if claims else ''
+            rows.append({
+                'source': source[1],
+                'target': target[1],
+                'relation': label,
+                'evidence_chunk_ids': sorted(evidence_ids)[:5],
+                'explanation': explanation[:240],
+            })
+        rows.sort(key=lambda row: (-len(row['evidence_chunk_ids']), row['source'], row['target'], row['relation']))
+        return rows[:max(0, limit)]
+
     @staticmethod
     def _evidence(quotes, context):
         ids = set()
         for quote in quotes:
-            source = context.get(quote.chunk_id, {}).get('text', '')
-            if not source:
+            # A window includes adjacent chunks. Models occasionally attach
+            # the preceding/following chunk id to a quote that crosses the
+            # boundary. Search the supplied context and canonicalize the id
+            # to the chunk that actually contains the quote; this keeps the
+            # evidence grounded while avoiding a needless whole-window retry.
+            if quote.chunk_id not in context:
                 continue
-            if quote.quote not in source:
-                # GPT responses often preserve the words but normalize a
-                # paragraph break to a space (or vice versa). Match only
-                # whitespace differences, then replace the response with the
-                # exact slice from the source so highlighting remains safe.
-                words = re.findall(r'\S+', unicodedata.normalize('NFC', quote.quote))
-                if not words:
+            matched = None
+            for candidate_id, row in context.items():
+                source = row.get('text', '')
+                if not source:
                     continue
-                pattern = r'\s+'.join(re.escape(word) for word in words)
-                match = re.search(pattern, unicodedata.normalize('NFC', source))
-                if match is None:
-                    # Models may also normalize Korean punctuation (for
-                    # example quote marks or a comma) while preserving every
-                    # lexical character. Permit non-word separators only;
-                    # never accept a paraphrase or reordered text.
-                    compact = ''.join(ch for ch in unicodedata.normalize('NFC', quote.quote) if ch.isalnum() or ch == '_')
-                    if compact:
-                        loose = r'\W*'.join(re.escape(ch) for ch in compact)
-                        match = re.search(loose, unicodedata.normalize('NFC', source))
-                if match is None:
-                    continue
-                quote.quote = source[match.start():match.end()]
+                span = GroundedGraph._quote_span(quote.quote, source)
+                if span is not None:
+                    matched = (candidate_id, source, span)
+                    # Prefer the model-provided id when it is valid and has a
+                    # match; otherwise use the containing chunk we found.
+                    if candidate_id == quote.chunk_id:
+                        break
+            if matched is None:
+                continue
+            candidate_id, source, (start, end) = matched
+            quote.chunk_id = int(candidate_id)
+            quote.quote = source[start:end]
             ids.add(quote.chunk_id)
         return ids
+
+    @staticmethod
+    def _quote_span(quote: str, source: str):
+        """Return an exact source span for a lightly normalized model quote."""
+        if quote in source:
+            start = source.index(quote)
+            return start, start + len(quote)
+        normalized_quote = unicodedata.normalize('NFC', quote)
+        normalized_source = unicodedata.normalize('NFC', source)
+        words = re.findall(r'\S+', normalized_quote)
+        if not words:
+            return None
+        pattern = r'\s+'.join(re.escape(word) for word in words)
+        match = re.search(pattern, normalized_source)
+        if match is None:
+            # Permit punctuation/quote-mark normalization, but retain every
+            # lexical character so a paraphrase can never become evidence.
+            compact = ''.join(ch for ch in normalized_quote if ch.isalnum() or ch == '_')
+            if compact:
+                loose = r'\W*'.join(re.escape(ch) for ch in compact)
+                match = re.search(loose, normalized_source)
+        if match is None:
+            # A model may change one inflection (for example "사용했다" to
+            # "쓴다") while preserving the cited sentence. Recover only when
+            # most lexical tokens occur in the same source sentence, then
+            # return that sentence's exact source slice. This keeps evidence
+            # source-grounded while avoiding a needless retry for harmless
+            # Korean morphology changes; unrelated summaries still fail.
+            quote_tokens = re.findall(r'[\w가-힣]+', normalized_quote)
+            if len(quote_tokens) >= 2:
+                sentence_pattern = r'[^.!?。\n]+[.!?。]?'
+                candidates = list(re.finditer(sentence_pattern, normalized_source))
+                best = None
+                for candidate in candidates:
+                    source_tokens = set(re.findall(r'[\w가-힣]+', candidate.group(0)))
+                    overlap = sum(token in source_tokens for token in quote_tokens)
+                    threshold = max(2, math.ceil(len(quote_tokens) * 0.6))
+                    if overlap >= threshold and (best is None or overlap > best[0]):
+                        best = (overlap, candidate)
+                if best is not None:
+                    match = best[1]
+        if match is None:
+            return None
+        # NFC can combine code points, so map normalized offsets back to the
+        # original string instead of slicing with potentially shifted offsets.
+        if len(normalized_source) == len(source):
+            return match.start(), match.end()
+        offsets = []
+        for index, char in enumerate(source):
+            offsets.extend([index] * len(unicodedata.normalize('NFC', char)))
+        if match.start() >= len(offsets):
+            return None
+        start = offsets[match.start()]
+        end_index = min(match.end() - 1, len(offsets) - 1)
+        return start, offsets[end_index] + 1
 
     @staticmethod
     def _label(value: str) -> str:
@@ -93,12 +172,17 @@ class GroundedGraph:
             pending_entities.setdefault(key, {'summary': entity.summary, 'ids': set()})['ids'].update(ids)
             if current_chunk_id in ids:
                 selected_keys.add(key)
+        # Model-local IDs are not identities across responses. Scope diagnostic
+        # nodes to this response so two unrelated "e9" references cannot merge.
+        scope = hashlib.sha256(json.dumps([
+            sorted(context), sorted((e.id, e.type, e.name) for e in entities),
+        ], ensure_ascii=False).encode()).hexdigest()[:16]
+        by_name = {}
+        for key in pending_entities:
+            by_name.setdefault(self._label(key[1]), set()).add(key)
         for relation in relations:
-            if relation.source not in references or relation.target not in references:
-                raise RuntimeError('관계 지도의 연결 대상이 추출된 엔티티에 없습니다.')
-            source, target = references[relation.source], references[relation.target]
             relation_label = self._label(relation.type)
-            if source == target or not relation_label:
+            if not relation_label:
                 raise RuntimeError('관계 지도의 연결 또는 관계 이름이 올바르지 않습니다.')
             if relation_label.casefold() in {'관계', '관련', '관련됨', 'related', 'related_to', 'co_occurs'}:
                 raise RuntimeError('관계 유형에 구체적인 행동이나 상태가 필요합니다.')
@@ -107,17 +191,44 @@ class GroundedGraph:
             ids = self._evidence(relation.evidence, context)
             if current_chunk_id not in ids:
                 continue
+            endpoints = []
+            missing = []
+            for reference in (relation.source, relation.target):
+                key = references.get(reference)
+                if key is None:
+                    matches = by_name.get(self._label(reference), set())
+                    if len(matches) == 1:
+                        key = next(iter(matches))
+                    else:
+                        key = ('event', f'미확인 대상 #{scope} ({reference})')
+                        pending_entities.setdefault(key, {
+                            'summary': f'분석 확인 필요: AI가 관계에서 참조한 {reference!r} 대상이 '
+                            '응답의 대상 목록에 없습니다. 원고의 설정 오류로 확정한 것이 아닙니다. '
+                            '연결된 관계의 원문 근거를 확인하세요.',
+                            'ids': set(), 'is_unresolved': True,
+                        })['ids'].update(ids)
+                        missing.append(reference)
+                endpoints.append(key)
+            source, target = endpoints
+            if source == target:
+                raise RuntimeError('관계 지도의 연결 또는 관계 이름이 올바르지 않습니다.')
             selected_keys.update((source, target))
             key = (source, target, relation_label)
             self.relations.setdefault(key, set()).update(ids)
-            claim = {'explanation': relation.explanation.strip(), 'basis': relation.basis,
+            explanation = relation.explanation.strip()
+            if missing:
+                explanation = ('분석 확인 필요: 연결 대상 ' + ', '.join(missing) +
+                    '을 추출 결과에서 확인하지 못했습니다. 작가의 설정 오류로 단정하지 않습니다. '
+                    'AI가 제안한 관계: ' + explanation)
+            claim = {'explanation': explanation, 'basis': 'inferred' if missing else relation.basis,
                      'quotes': [quote.model_dump() for quote in relation.evidence]}
             if claim not in self.claims.setdefault(key, []):
                 self.claims[key].append(claim)
         for key in selected_keys:
             entity = pending_entities[key]
             if key not in self.entities:
-                self.entities[key] = {"summary": entity["summary"], "ids": set()}
+                self.entities[key] = {"summary": entity["summary"], "ids": set(),
+                                      "is_unresolved": entity.get('is_unresolved', False)}
             self.entities[key]["ids"].update(entity["ids"])
 
     def store(self, db, project_id, rows, documents, model, effort):
@@ -132,10 +243,11 @@ class GroundedGraph:
             ids = sorted(entity['ids'])
             doc_ids = {by_id[value]['document_id'] for value in ids}
             first = min(doc_ids, key=lambda value: doc_order[value])
-            db.execute('''INSERT INTO entities(project_id,type,name,aliases,summary,first_seen_document_id)
-                VALUES(?,?,?,'[]',?,?) ON CONFLICT(project_id,type,name) DO UPDATE SET
-                summary=excluded.summary,first_seen_document_id=excluded.first_seen_document_id''',
-                (project_id, kind, name, entity['summary'], first))
+            db.execute('''INSERT INTO entities(project_id,type,name,aliases,summary,first_seen_document_id,is_unresolved)
+                VALUES(?,?,?,'[]',?,?,?) ON CONFLICT(project_id,type,name) DO UPDATE SET
+                summary=excluded.summary,first_seen_document_id=excluded.first_seen_document_id,
+                is_unresolved=excluded.is_unresolved''',
+                (project_id, kind, name, entity['summary'], first, int(entity.get('is_unresolved', False))))
             entity_ids[(kind, name)] = db.execute('SELECT id FROM entities WHERE project_id=? AND type=? AND name=?',
                 (project_id, kind, name)).fetchone()['id']
             for doc_id in doc_ids:

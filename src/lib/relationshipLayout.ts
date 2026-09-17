@@ -148,6 +148,7 @@ export function relationshipPositions(graph: GraphPayload): Map<number, GraphPos
     const spacing = ids.length > 36 ? 195 : ids.length > 20 ? 198 : 205;
     const maxLevel = Math.max(...layerKeys, 0);
     const wrapDeepChain = maxLevel > 8 && ids.length > 18;
+    let levelY = 0;
     for (const level of layerKeys) {
       const ordered = orderedLevels.get(level) ?? [];
       if (wrapDeepChain && ordered.length === 1) {
@@ -159,8 +160,20 @@ export function relationshipPositions(graph: GraphPayload): Map<number, GraphPos
         coordinates.set(ordered[0], { x: column * spacing, y: row * 180 });
         continue;
       }
-      const width = (ordered.length - 1) * spacing;
-      ordered.forEach((id, index) => coordinates.set(id, { x: index * spacing - width / 2, y: level * (ids.length > 36 ? 142 : 158) }));
+      // Wide BFS layers are the main source of the unreadable "horizontal
+      // strip" in 전체 관계. Wrap siblings into balanced rows so the map
+      // keeps a usable aspect ratio and labels have room to breathe.
+      const perRow = ordered.length > 12 ? 7 : ordered.length > 7 ? 6 : ordered.length;
+      const rowCount = Math.max(1, Math.ceil(ordered.length / Math.max(1, perRow)));
+      for (let row = 0; row < rowCount; row += 1) {
+        const rowItems = ordered.slice(row * perRow, (row + 1) * perRow);
+        const width = (rowItems.length - 1) * spacing;
+        rowItems.forEach((id, index) => coordinates.set(id, {
+          x: index * spacing - width / 2,
+          y: levelY + row * 164,
+        }));
+      }
+      levelY += rowCount * 164 + 72;
     }
     const values=[...coordinates.values()];
     const minX=Math.min(...values.map(p=>p.x)),minY=Math.min(...values.map(p=>p.y));

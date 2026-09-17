@@ -1,0 +1,11 @@
+{
+  "buildCommand": "npm run build:demo",
+  "outputDirectory": "demo-dist",
+  "framework": "vite",
+  "rewrites": [
+    {
+      "source": "/api/demo/:path*",
+      "destination": "https://srv1738623.hstgr.cloud/api/demo/:path*"
+    }
+  ]
+}

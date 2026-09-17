@@ -36,6 +36,13 @@ from backend.app.services.rag import RagService
 from backend.app.services.parser import split_chunks
 
 
+def max_rss_mb() -> float:
+    """Normalize ru_maxrss units (bytes on macOS, KiB on Linux)."""
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    divisor = 1024 * 1024 if sys.platform == "darwin" else 1024
+    return value / divisor
+
+
 def main() -> int:
     source_dir = ROOT / "output/validation/goal-1-8-20260913/actual-20-episodes"
     files = sorted(source_dir.glob("episode-*.txt"), key=lambda p: int(p.stem.split("-")[-1]))
@@ -52,7 +59,7 @@ def main() -> int:
     rag = RagService(DATA / "chroma", repository=repo)
     connection = ChatGptConnection(Path.home() / "Library/Application Support/app.storyguard.desktop")
     started = time.monotonic()
-    before_rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    before_rss = max_rss_mb()
     try:
         status = connection.status()
         if status.get("phase") != "connected":
@@ -73,7 +80,7 @@ def main() -> int:
         "chunks": len(repo.list_chunks(project.id)),
         "status": job.status.value if job else None,
         "elapsed_seconds": elapsed,
-        "max_rss_delta_mb": round(max(0, resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - before_rss) / 1024, 1),
+        "max_rss_delta_mb": round(max(0, max_rss_mb() - before_rss), 1),
         "result": result, "error": error,
         "windows": [{k: d.get(k) for k in ("index", "status", "stage", "attempts", "elapsed_seconds", "error", "error_code", "reused")} for d in details],
         "scope": "20편 실제 ChatGPT 구간 분석. 로컬 인덱스·GPT 요청·실패 격리·재개를 포함한 단일 실행 측정.",

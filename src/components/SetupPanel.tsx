@@ -34,7 +34,7 @@ export function SetupPanel({ status, progress, onStart, onRefresh }: SetupPanelP
       </div>
 
       <label>원고 임베딩 모델
-        <select value={model} disabled={running} onChange={(event) => setSelection(event.target.value)}>
+        <select aria-label="원고 임베딩 모델" value={model} disabled={running} onChange={(event) => setSelection(event.target.value)}>
           <option value="Qwen3-Embedding-0.6B-Q8_0.gguf">Qwen · 근거 검색 우선 · 파일 약 639MB</option>
           <option value="embeddinggemma-300m">EmbeddingGemma · 처리 속도 우선 · 파일 약 1.27GB</option>
         </select>

@@ -4,6 +4,8 @@ import asyncio
 import hmac
 import logging
 import os
+import re
+import secrets
 import threading
 import time
 from collections import defaultdict
@@ -14,7 +16,8 @@ os.environ.setdefault("CHROMA_TELEMETRY", "False")
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field
 
 from backend.app.chatgpt_routes import router as chatgpt_router, connection as chatgpt_connection
 from backend.app.config import chroma_path, database_path, models_path
@@ -58,6 +61,7 @@ from backend.app.services.local_ai import (
 from backend.app.services.local_llm import LocalLlmExtractor
 from backend.app.services.parser import UnsupportedDocumentFormat, read_document, split_chunks
 from backend.app.services.rag import RagService
+from backend.app.services.embedding_models import GemmaEmbeddings
 
 
 database = Database(database_path())
@@ -89,6 +93,10 @@ def load_environment_settings() -> AppSettings:
 setup_manager = EnvironmentSetupManager(save_environment_settings, load_environment_settings)
 
 app = FastAPI(title="Story Guard API", version="0.1.0")
+
+
+# The public web demo runs separately in backend.app.demo_server.
+# Keep desktop database and account routes on loopback only.
 
 # Importing several chapters in quick succession should produce one derived
 # index build.  Starting a sync for every file reloads the local embedding
@@ -188,6 +196,7 @@ def shutdown(background_tasks: BackgroundTasks) -> dict[str, str]:
 def shutdown_process() -> None:
     time.sleep(0.2)
     chatgpt_connection.transport.close()
+    GemmaEmbeddings.release()
     os._exit(0)
 
 
@@ -297,9 +306,31 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
         raise HTTPException(status_code=404, detail="파일을 찾을 수 없습니다.") from error
 
     existing_documents = repository.list_documents(payload.project_id)
-    next_chapter_index = (
-        max((document.chapter_index for document in existing_documents), default=-1) + 1
-    )
+    # Re-importing the same file must be idempotent.  Without this guard a
+    # second file-picker attempt created a duplicate chapter and shifted every
+    # subsequent display number by one.
+    duplicate = next((document for document in existing_documents if document.content_hash == content_hash), None)
+    if duplicate is not None:
+        return duplicate
+
+    # Preserve the author's episode numbers from common filenames such as
+    # ``episode-08.txt`` or ``8화.md``.  The old implementation used import
+    # order, so selecting episode 08 first displayed it as 1화.
+    filename = path.stem
+    matches = re.findall(r"(?:^|[^0-9])(\d+)(?:[^0-9]|$)", filename)
+    parsed_episode = int(matches[-1]) if matches else None
+    if parsed_episode is not None and parsed_episode > 0:
+        next_chapter_index = parsed_episode - 1
+        occupied = next((document for document in existing_documents if document.chapter_index == next_chapter_index), None)
+        if occupied is not None:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{parsed_episode}화 번호가 이미 사용 중입니다. 기존 회차를 교체하거나 파일명을 확인해 주세요.",
+            )
+    else:
+        next_chapter_index = (
+            max((document.chapter_index for document in existing_documents), default=-1) + 1
+        )
     document = repository.add_document(
         project_id=payload.project_id,
         path=path,
@@ -327,7 +358,22 @@ async def import_document(payload: DocumentImport) -> StoryDocument:
 @app.put("/documents/{document_id}", response_model=StoryDocument)
 async def replace_document(document_id: int, payload: DocumentReplace) -> StoryDocument:
     try:
-        content, file_format, content_hash = read_document(Path(payload.path))
+        document_path: Path
+        if payload.content is not None:
+            with repository.database.connect() as connection:
+                existing = connection.execute("SELECT path, format, project_id FROM documents WHERE id=?", (document_id,)).fetchone()
+            if existing is None:
+                raise HTTPException(status_code=404, detail="원고를 찾을 수 없습니다.")
+            content = payload.content
+            file_format = existing["format"]
+            document_path = Path(existing["path"])
+            import hashlib
+            content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        elif payload.path:
+            content, file_format, content_hash = read_document(Path(payload.path))
+            document_path = Path(payload.path)
+        else:
+            raise HTTPException(status_code=400, detail="수정할 원문 또는 파일이 필요합니다.")
         if not content.strip():
             raise HTTPException(status_code=400, detail="빈 원고로 교체할 수 없습니다.")
         rag = RagService(chroma_path(), embedding_model=get_settings().embedding_model, repository=repository)
@@ -341,7 +387,7 @@ async def replace_document(document_id: int, payload: DocumentReplace) -> StoryD
             raise HTTPException(status_code=404, detail="원고를 찾을 수 없습니다.")
         project_id = int(row["project_id"])
         chunks = [chunk.text for chunk in rag.split_text(content, document_id, project_id)]
-        document = repository.replace_document(document_id, Path(payload.path), file_format, content_hash, content, chunks)
+        document = repository.replace_document(document_id, document_path, file_format, content_hash, content, chunks)
     except (FileNotFoundError, KeyError) as error:
         raise HTTPException(status_code=404, detail="원고 또는 파일을 찾을 수 없습니다.") from error
     except UnsupportedDocumentFormat as error:

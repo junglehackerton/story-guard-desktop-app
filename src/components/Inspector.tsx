@@ -47,7 +47,7 @@ export function Inspector({
         {entity ? (
           <div className="entity-detail">
             <span className={`entity-type entity-${entity.type}`}>
-              {ENTITY_TYPE_LABELS[entity.type]}
+              {entity.is_unresolved ? '미확인 대상 · 분석 확인 필요' : ENTITY_TYPE_LABELS[entity.type]}
             </span>
             <h3>{entity.name}</h3>
             <p>{entity.summary}</p>
@@ -154,9 +154,10 @@ export function RelationEvidence({ relationId, expanded = false, onOpenDocument,
   const [chunks, setChunks] = useState<EvidenceChunk[] | null>(null);
   const [error, setError] = useState("");
   const [attempt, setAttempt] = useState(0);
+  const [showAll, setShowAll] = useState(false);
   useEffect(() => {
     let cancelled = false;
-    setChunks(null); setError("");
+    setChunks(null); setError(""); setShowAll(false);
     api.relationEvidence(relationId).then(value => { if (!cancelled) setChunks(value); })
       .catch(() => { if (!cancelled) setError("원문 근거를 불러오지 못했습니다. 노드를 다시 선택해 주세요."); });
     return () => { cancelled = true; };
@@ -165,6 +166,9 @@ export function RelationEvidence({ relationId, expanded = false, onOpenDocument,
     <summary>원문 근거 보기</summary>
     {error ? <div role="alert"><p>{error}</p><button type="button" onClick={() => setAttempt(value => value + 1)}>다시 시도</button></div> : chunks === null ? <p>근거를 불러오는 중…</p>
       : chunks.length === 0 ? <p>저장된 원문 근거가 없습니다.</p>
-      : chunks.map(chunk => { const document = documents.find(item => item.id === chunk.document_id); return <blockquote key={chunk.id}><small>{document ? `${document.chapter_index + 1}화 · ${document.title}` : `원문 구간 ${chunk.chunk_index + 1}`}</small><p>{chunk.text}</p>{onOpenDocument && <button onClick={() => onOpenDocument(chunk.document_id, chunk.text)}>이 회차 원고 열기</button>}</blockquote>; })}
+      : <>
+        {(showAll ? chunks : chunks.slice(0, 3)).map(chunk => { const document = documents.find(item => item.id === chunk.document_id); return <blockquote key={chunk.id}><small>{document ? `${document.chapter_index + 1}화 · ${document.title}` : `원문 구간 ${chunk.chunk_index + 1}`}</small><p>{chunk.text}</p>{onOpenDocument && <button className="text-action" onClick={() => onOpenDocument(chunk.document_id, chunk.text)}>이 회차 원고 열기</button>}</blockquote>; })}
+        {chunks.length > 3 && <button type="button" className="text-action evidence-toggle" aria-expanded={showAll} onClick={() => setShowAll(value => !value)}>{showAll ? "근거 접기" : `근거 ${chunks.length - 3}개 더 보기`}</button>}
+      </>}
   </details>;
 }

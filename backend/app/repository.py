@@ -913,9 +913,12 @@ class StoryRepository:
                 continue
             entities.append(EntityNode(**data))
         visible_entity_ids = {entity.id for entity in entities}
+        unresolved_entity_ids = {entity.id for entity in entities if entity.is_unresolved}
         relations = []
         for row in relation_rows:
             data = dict(row)
+            data['has_unresolved_endpoint'] = bool(
+                {data['source_entity_id'], data['target_entity_id']} & unresolved_entity_ids)
             data["claims"] = decode_json(data.get("claims", "[]"))
             if has_range_filter:
                 # Do not show an explanation relying on evidence outside this range.
@@ -1028,6 +1031,8 @@ class StoryRepository:
                 1 for row in relation_rows
                 if int(row["source_entity_id"]) not in visible_entity_ids
                 or int(row["target_entity_id"]) not in visible_entity_ids
+                or int(row["source_entity_id"]) in unresolved_entity_ids
+                or int(row["target_entity_id"]) in unresolved_entity_ids
             ),
             message="근거·변화·고립 후보를 분리해 확인하세요.",
         )

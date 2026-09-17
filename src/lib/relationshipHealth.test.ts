@@ -35,6 +35,14 @@ it("counts dangling relations from the displayed graph scope", () => {
   expect(countDanglingRelations(graph)).toBe(1);
 });
 
+it("keeps persisted unresolved endpoints visible as diagnostics", () => {
+  const edge = { ...relation(3, 8), has_unresolved_endpoint: true };
+  const graph = { entities: [{ id: 3 }, { id: 8, is_unresolved: true }],
+    relations: [edge], issues: [], changes: [] } as unknown as GraphPayload;
+  expect(isDanglingRelation(edge, new Set([3, 8]))).toBe(true);
+  expect(countDanglingRelations(graph)).toBe(1);
+});
+
 it("counts only valid connected relationship islands", () => {
   const graph = {
     entities: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }],

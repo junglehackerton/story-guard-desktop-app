@@ -59,6 +59,7 @@ export interface ProjectDeleteResult {
 }
 
 export interface EntityNode {
+  is_unresolved?: boolean;
   id: number;
   project_id: number;
   type: EntityType;
@@ -81,6 +82,7 @@ export interface RelationClaim {
 }
 
 export interface RelationEdge {
+  has_unresolved_endpoint?: boolean;
   claims?: RelationClaim[];
   origin?: "local" | "gpt";
   id: number;

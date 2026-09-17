@@ -200,6 +200,34 @@ def test_embedding_context_defaults_to_laptop_safe_size(tmp_path, monkeypatch):
     local_ai.LocalLlmEmbeddings._llm_cache.clear()
 
 
+def test_embedding_query_is_compacted_for_512_token_context(tmp_path, monkeypatch):
+    from backend.app.services import local_ai
+
+    model_path = tmp_path / DEFAULT_EMBEDDING_MODEL
+    model_path.write_bytes(b"embedding")
+    seen = []
+
+    class CompactingLlama:
+        def __init__(self, **kwargs):
+            pass
+
+        def embed(self, text, **kwargs):
+            seen.append(text)
+            return [1.0] * 1024
+
+    fake = SimpleNamespace(Llama=CompactingLlama, LLAMA_POOLING_TYPE_LAST=3)
+    monkeypatch.setitem(sys.modules, "llama_cpp", fake)
+    local_ai.llama_cpp_available.cache_clear()
+    local_ai.LocalLlmEmbeddings._llm_cache.clear()
+    embeddings = local_ai.LocalLlmEmbeddings(model_dir=tmp_path)
+
+    embeddings.embed_query("가나다라마바사" * 100)
+
+    assert len(seen[0].split("Query: ", 1)[1]) <= local_ai.DEFAULT_QUERY_CHARS + 3
+    local_ai.LocalLlmEmbeddings._llm_cache.clear()
+    local_ai.llama_cpp_available.cache_clear()
+
+
 def test_embedding_documents_are_batched_for_long_manuscripts(monkeypatch):
     from backend.app.services import local_ai
 

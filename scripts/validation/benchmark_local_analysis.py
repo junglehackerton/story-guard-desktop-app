@@ -7,6 +7,7 @@ the analyzer's prepared-index reuse contract together.
 from __future__ import annotations
 
 import json
+import resource
 import sys
 import tempfile
 import time
@@ -67,6 +68,9 @@ with tempfile.TemporaryDirectory(prefix="storyguard-local-analysis-") as directo
         "provider_stub_calls": connection.calls,
         "status": job.status.value,
         "analysis_seconds": round(elapsed, 3),
+        "max_rss_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / (1024 * 1024 if sys.platform == 'darwin' else 1024), 1),
+        "dtype": os.getenv("STORY_GUARD_GEMMA_DTYPE", "float32"),
+        "low_memory": os.getenv("STORY_GUARD_LOW_MEMORY", "0"),
         "failed_windows": result["failed_window_count"],
         "scope": "실제 EmbeddingGemma 색인·검색과 GPT 오케스트레이터 통합 경로; 외부 GPT 품질·지연 제외",
     }

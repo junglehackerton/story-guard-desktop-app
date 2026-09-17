@@ -4,6 +4,8 @@ import pytest
 from backend.app.database import Database
 from backend.app.repository import StoryRepository
 from backend.app.pipeline.gpt_analyzer import GptStoryAnalyzer, parse_review_result
+from backend.app.pipeline.gpt_graph import GroundedGraph, EvidenceQuote
+from backend.app.pipeline.continuity import detect_rule_action_candidates
 
 
 def fixture(tmp_path):
@@ -25,6 +27,109 @@ def test_parse_review_result_normalizes_numeric_evidence_ids():
     }))
     assert result.entities[0].evidence[0].chunk_id == 42
     assert result.issues[0].evidence_chunk_ids == [42, 43]
+
+
+def test_relation_quote_can_be_grounded_in_adjacent_context_chunk():
+    quote = EvidenceQuote(chunk_id=1, quote='계약 없이 검을 사용했다.')
+    ids = GroundedGraph._evidence([quote], {
+        1: {'text': '유나는'},
+        2: {'text': '계약 없이 검을 사용했다.'},
+    })
+    assert ids == {2}
+    assert quote.chunk_id == 2
+    assert quote.quote == '계약 없이 검을 사용했다.'
+
+
+def test_relation_quote_whitespace_is_canonicalized_to_source_slice():
+    quote = EvidenceQuote(chunk_id=1, quote='유나는\n계약 없이 검을 사용했다.')
+    ids = GroundedGraph._evidence([quote], {1: {'text': '유나는 계약 없이 검을 사용했다.'}})
+    assert ids == {1}
+    assert quote.quote == '유나는 계약 없이 검을 사용했다.'
+
+
+def test_relation_quote_morphology_variant_returns_exact_source_sentence():
+    quote = EvidenceQuote(chunk_id=1, quote='유나는 계약 없이 검을 사용했다.')
+    ids = GroundedGraph._evidence([quote], {1: {'text': '유나는 계약 없이 검을 쓴다.'}})
+    assert ids == {1}
+    assert quote.quote == '유나는 계약 없이 검을 쓴다.'
+
+
+def test_grounded_graph_prompt_context_is_compact_and_source_backed():
+    graph = GroundedGraph()
+    graph.entities[('character', '유나')] = {'summary': '주인공', 'ids': {1}}
+    graph.entities[('item', '봉인검')] = {'summary': '검', 'ids': {1}}
+    key = (('character', '유나'), ('item', '봉인검'), '사용 조건을 위반함')
+    graph.relations[key] = {1, 99}
+    graph.claims[key] = [{'explanation': '계약 없이 검을 사용함', 'basis': 'explicit', 'quotes': []}]
+    assert graph.prompt_context() == [{
+        'source': '유나', 'target': '봉인검', 'relation': '사용 조건을 위반함',
+        'evidence_chunk_ids': [1, 99], 'explanation': '계약 없이 검을 사용함',
+    }]
+
+
+def test_continuity_detector_finds_rule_and_later_action_with_exact_sources(tmp_path):
+    repo = StoryRepository(Database(tmp_path / 'continuity.sqlite'))
+    project = repo.create_project('전역 규칙 검사')
+    first = repo.add_document(project.id, tmp_path / 'one.txt', '1화', 'txt', 'one',
+                              '정식 계약자만 봉인검을 사용할 수 있다.', 0)
+    later = repo.add_document(project.id, tmp_path / 'seven.txt', '7화', 'txt', 'seven',
+                              '유나는 계약 없이 봉인검을 사용했다.', 6)
+    first_id = repo.replace_chunks(project.id, first.id, [first.content])[0]
+    later_id = repo.replace_chunks(project.id, later.id, [later.content])[0]
+    rows = repo.list_chunks(project.id)
+    candidates = detect_rule_action_candidates(rows, [first, later])
+    assert len(candidates) == 1
+    assert candidates[0]['evidence_chunk_ids'] == sorted([first_id, later_id])
+    assert '서로 다른 회차' in candidates[0]['description']
+
+
+def test_continuity_detector_handles_signed_contract_variant(tmp_path):
+    repo = StoryRepository(Database(tmp_path / 'continuity-variant.sqlite'))
+    project = repo.create_project('표현 변형 검사')
+    first = repo.add_document(project.id, tmp_path / 'one.txt', '1화', 'txt', 'one',
+                              '정식 계약자만 봉인검을 사용할 수 있다.', 0)
+    later = repo.add_document(project.id, tmp_path / 'seven.txt', '7화', 'txt', 'seven',
+                              '유나는 계약서에 서명하지 않았지만 봉인검을 꺼내 문을 열었다.', 6)
+    first_id = repo.replace_chunks(project.id, first.id, [first.content])[0]
+    later_id = repo.replace_chunks(project.id, later.id, [later.content])[0]
+    candidates = detect_rule_action_candidates(repo.list_chunks(project.id), [first, later])
+    assert candidates and candidates[0]['evidence_chunk_ids'] == sorted([first_id, later_id])
+
+
+def test_later_review_window_receives_prior_verified_relation_context(tmp_path):
+    repo = StoryRepository(Database(tmp_path / 'cross-chapter.sqlite'))
+    project = repo.create_project('회차 간 관계 비교')
+    first = repo.add_document(project.id, tmp_path / 'one.txt', '1화', 'txt', 'one', '정식 계약자만 봉인검을 사용할 수 있다.', 0)
+    second = repo.add_document(project.id, tmp_path / 'seven.txt', '7화', 'txt', 'seven', '유나는 계약 없이 봉인검을 사용했다.', 6)
+    first_ids = repo.replace_chunks(project.id, first.id, [first.content])
+    second_ids = repo.replace_chunks(project.id, second.id, [second.content])
+    rag = SimpleNamespace(sync_project=lambda _: 2, retrieve=lambda *args, **kwargs: [])
+    prompts = []
+    def complete(model, prompt, **kwargs):
+        prompts.append(prompt)
+        if len(prompts) == 1:
+            return {'text': json.dumps({'entities': [
+                {'id': 's', 'type': 'rule', 'name': '봉인검 사용 규칙', 'summary': '정식 계약자만 사용 가능',
+                 'evidence': [{'chunk_id': first_ids[0], 'quote': first.content}]},
+                {'id': 'i', 'type': 'item', 'name': '봉인검', 'summary': '검',
+                 'evidence': [{'chunk_id': first_ids[0], 'quote': first.content}]},
+            ], 'relations': [{
+                'source': 's', 'target': 'i', 'type': '사용 조건 제한',
+                'explanation': '정식 계약자만 봉인검을 사용할 수 있다.', 'basis': 'explicit',
+                'evidence': [{'chunk_id': first_ids[0], 'quote': first.content}],
+            }], 'issues': []})}
+        assert '사용 조건 제한' in prompt
+        assert '앞선 구간에서 검증된 관계·규칙 후보' in prompt
+        return {'text': '{"entities": [], "relations": [], "issues": []}'}
+    result = GptStoryAnalyzer(repo, rag, SimpleNamespace(complete=complete)).analyze(project.id, 'model', 'low')
+    assert result['published'] is True
+    assert result['issue_count'] == 1
+    assert repo.graph(project.id).issues[0].evidence_chunk_ids == sorted([first_ids[0], second_ids[0]])
+    assert len(prompts) == 2
+    detail = repo.latest_analysis_job(project.id).window_details[1]
+    assert detail['cross_chapter_context'] is True
+    assert first_ids[0] in detail['context_chunk_ids']
+    assert second_ids[0] in detail['owned_chunk_ids']
 
 
 def test_gpt_analysis_persists_only_grounded_candidates(tmp_path):
@@ -156,8 +261,8 @@ def test_chapter_range_limits_review_windows_without_dropping_unselected_data(tm
     assert repo.latest_analysis_job(project.id).review_context['start_chapter'] == 1
     assert repo.latest_analysis_job(project.id).review_context['end_chapter'] == 1
     assert len(prompts) == 1
-    assert str(second_ids[0]) in prompts[0]
-    assert str(ids[0]) not in prompts[0]
+    current_ids = json.loads(prompts[0].split('현재 구간 ID 목록: ', 1)[1].split('\n', 1)[0])
+    assert current_ids == second_ids
 
 
 def test_chapter_range_reanalysis_preserves_graph_from_unselected_chapters(tmp_path):
@@ -513,14 +618,13 @@ def test_graph_relation_labels_normalize_whitespace_and_unicode(tmp_path):
     assert relations[0].type == '계약 없이 사용'
 
 
-@pytest.mark.parametrize('corruption', ['quote', 'chunk', 'endpoint'])
+@pytest.mark.parametrize('corruption', ['quote', 'chunk'])
 def test_invalid_graph_preserves_previous_graph(tmp_path, corruption):
     repo, project, ids, rag = fixture(tmp_path)
     old = repo.upsert_entity(project.id, 'character', '기존 인물', [], '보존', None)
     payload = graph_payload(ids)
     if corruption == 'quote': payload['relations'][0]['evidence'][0]['quote'] = '원고에 없는 문장'
     if corruption == 'chunk': payload['relations'][0]['evidence'][0]['chunk_id'] = 999
-    if corruption == 'endpoint': payload['relations'][0]['target'] = 'unknown'
     connection = SimpleNamespace(complete=lambda *a, **k: {'text': json.dumps(payload)})
     result = GptStoryAnalyzer(repo, rag, connection).analyze(project.id, 'model', None)
     assert result['published'] is False
@@ -624,17 +728,24 @@ def test_new_chapter_reuses_unchanged_review_windows(tmp_path):
     assert len(calls) == 3
     assert result['cached_count'] == 2 and result['request_count'] == 1
 
-def test_gpt_analysis_uses_hybrid_without_increasing_evidence_limit(tmp_path):
+def test_gpt_analysis_uses_hybrid_with_diversified_evidence_window(tmp_path):
     repo, project, ids, rag = fixture(tmp_path)
     original = rag.retrieve
     requested = []
+    queries = []
     def retrieve(*args, **kwargs):
         requested.append(kwargs)
+        queries.append(args[1] if len(args) > 1 else '')
         return original(*args, **kwargs)
     rag.retrieve = retrieve
     connection = SimpleNamespace(complete=lambda *a, **k: {'text': '{"entities": [], "relations": [], "issues": []}'})
     GptStoryAnalyzer(repo, rag, connection).analyze(project.id, 'model', 'low')
-    assert requested and all(k.get('strategy') == 'hybrid' and k['limit'] == 4 for k in requested)
+    assert requested and all(k.get('strategy') == 'hybrid' and k['limit'] == 12 for k in requested)
+    assert queries and all(query.strip() for query in queries)
+    detail = repo.latest_analysis_job(project.id).window_details[0]
+    assert detail['owned_chunk_ids'] and detail['context_chunk_ids']
+    assert len(detail['prompt_hash']) == 64
+    assert len(detail['context_envelope_sha256']) == 64
 
 
 def test_relation_explanation_and_exact_quotes_survive_storage(tmp_path):

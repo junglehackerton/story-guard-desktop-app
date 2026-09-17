@@ -131,6 +131,8 @@ export const api = {
     }),
   replaceDocument: (documentId: number, path: string) =>
     request<StoryDocument>(`/documents/${documentId}`, {method: 'PUT', body: JSON.stringify({path})}),
+  editDocument: (documentId: number, content: string) =>
+    request<StoryDocument>(`/documents/${documentId}`, {method: 'PUT', body: JSON.stringify({content})}),
   reviewHistory: (projectId: number) => request<import('./types').ReviewHistory[]>(`/projects/${projectId}/review-history`),
   deleteDocument: (documentId: number) =>
     request<DocumentDeleteResult>(`/documents/${documentId}`, {

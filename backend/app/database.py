@@ -200,6 +200,7 @@ class Database:
     def initialize(self) -> None:
         with sqlite3.connect(self.db_path) as connection:
             connection.executescript(SCHEMA)
+            ensure_column(connection, 'entities', 'is_unresolved', 'INTEGER NOT NULL DEFAULT 0')
             ensure_column(connection, 'analysis_jobs', 'window_details', "TEXT NOT NULL DEFAULT '[]'")
             ensure_column(connection, 'analysis_jobs', 'review_context', "TEXT NOT NULL DEFAULT '{}'")
             ensure_column(connection, "relations", "origin", "TEXT NOT NULL DEFAULT 'local'")

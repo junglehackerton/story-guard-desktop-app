@@ -55,7 +55,8 @@ class DocumentImport(BaseModel):
 
 
 class DocumentReplace(BaseModel):
-    path: str
+    path: str | None = None
+    content: str | None = None
 
 
 class DocumentDeleteResult(BaseModel):
@@ -114,6 +115,7 @@ class ForeshadowingStatus(BaseModel):
 
 
 class EntityNode(BaseModel):
+    is_unresolved: bool = False
     id: int
     project_id: int
     type: EntityType
@@ -143,6 +145,7 @@ class RelationClaim(BaseModel):
 
 
 class RelationEdge(BaseModel):
+    has_unresolved_endpoint: bool = False
     claims: list[RelationClaim] = []
     origin: Literal["local", "gpt"] = "local"
     id: int

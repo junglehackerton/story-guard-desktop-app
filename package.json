@@ -7,10 +7,14 @@
     "dev": "vite",
     "dev:all": "concurrently -n backend,frontend \"npm run backend\" \"npm run dev\"",
     "build": "tsc && vite build",
+    "build:demo": "tsc --noEmit && vitest run src/demo/guide.test.ts && vite build --config vite.demo.config.ts",
+    "build:demo:static": "tsc --noEmit && vitest run src/demo/guide.test.ts && VITE_DEMO_STATIC=true vite build --config vite.demo.config.ts",
     "preview": "vite preview",
     "tauri": "tauri",
     "backend": ".venv/bin/python -m backend.app.main",
-    "test": "vitest run"
+    "test": "vitest run",
+    "preview:demo": ".venv/bin/python -m uvicorn backend.app.demo_server:app --host 127.0.0.1 --port 4173",
+    "demo:index": ".venv/bin/python -m backend.app.demo_index"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.4.0",
