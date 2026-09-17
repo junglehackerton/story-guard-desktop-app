@@ -11,7 +11,7 @@ import './demo.css';
 import reviewPreview from './demo/assets/review-preview.jpg';
 import graphPreview from './demo/assets/graph-preview.jpg';
 import storyGuardMark from './demo/assets/story-guard-mark.png';
-import { RelationshipExplorer } from './components/RelationshipExplorer';
+import { DemoRelationshipMap } from './demo/DemoRelationshipMap';
 const noop = () => {};
 const unchanged = async () => false;
 const clueLabels = {unreviewed:'검토 전',in_progress:'진행 중',resolved:'회수 확인',intentional:'의도적 미회수'};
@@ -128,6 +128,18 @@ export default function DemoPage() {
     catch { setNotice('브라우저 저장소를 사용할 수 없어 초기화하지 못했습니다.'); }
   }
   if (introOpen) return <DemoIntro onEnter={enterDemo}/>;
+  if (page==='graph') return <DemoRelationshipMap
+    graph={liveGraph}
+    selectedEntityId={entity?.id ?? null}
+    selectedRelationId={relation}
+    reviewFocus={focus}
+    reviewEvidence={focus ? liveEvidenceMap[focus.issueId] : []}
+    onSelectEntity={setEntity}
+    onSelectRelation={setRelation}
+    onOpenEvidence={openSource}
+    onReview={()=>setPage('review')}
+    onIntro={()=>setIntroOpen(true)}
+  />;
   return <div className={`app-shell workbench demo-workbench page-${page}`}>
     <WorkbenchNav demo page={page} onPage={navigate} project={sample.project} projects={[sample.project]} onProject={startGuide} onReset={reset}/>
     <main className="workspace" ref={workspace}>
@@ -140,7 +152,6 @@ export default function DemoPage() {
         <ManuscriptsPage readOnly active={page==='manuscripts'} documents={sample.documents} settings={[]} sourceRequest={source} loading={false} onImport={noop} onDelete={noop} onReplace={noop} onEdit={unchanged} onAnalyze={()=>setPage('analysis')} onCreateSetting={unchanged} onUpdateSetting={unchanged} onDeleteSetting={noop}/>
       </section>
       {page==='review' && <section className="page-content">{liveAnalysis && <LiveAnalysisBanner analysis={liveAnalysis} onGraph={()=>{setEntity(liveTarget);setRelation(null);setFocus(null);setPage('graph');}}/>}{guided ? <DemoGuide status={judgments[guideIssueId] ?? 'open'} onSave={save} onSource={openSource} onGraph={()=>{setEntity(sample.graph.entities.find(e=>e.name==='녹색 플라스틱 머리가 달린 황동 열쇠') ?? null);setRelation(null);setFocus({issueId:guideIssueId});setPage('graph');}} onReview={allReviews} onClues={()=>setPage('foreshadowing')} onAnalyze={()=>setPage('analysis')} onTutorial={()=>setTutorialOpen(true)}/> : <ReviewPage graph={liveGraph} evidence={liveEvidenceMap} documents={sample.documents} history={[]} onStatus={save} onGraph={f=>{setFocus(f);setPage('graph');}} onOpenDocument={openSource} onAnalysis={()=>setPage('analysis')}/>}</section>}
-      {page==='graph' && <section className="page-content">{liveAnalysis && <LiveAnalysisBanner analysis={liveAnalysis} onGraph={()=>{setEntity(liveTarget);setRelation(null);}}/>}<RelationshipExplorer compactReview projectId={sample.project.id} graph={liveGraph} selectedEntityId={entity?.id ?? null} selectedRelationId={relation} onSelectEntity={setEntity} onSelectRelation={setRelation} onOpenEvidence={openSource} reviewFocus={focus} reviewEvidence={focus ? liveEvidenceMap[focus.issueId] : []} onCloseReview={()=>setFocus(null)} onBackReview={()=>setPage('review')}/></section>}
       {page==='foreshadowing' && <section className="page-content"><div className="surface"><h2>추출된 떡밥 후보</h2><p className="muted">AI가 찾은 단서 후보입니다. 언급이 없다는 이유만으로 미회수라고 단정하지 않고, 작가가 상태를 결정합니다. 회차는 저장된 언급·연결 근거가 있는 범위입니다.</p>{graph.entities.filter(e=>e.type==='foreshadowing').map(e=>{
         const current = clues[e.id] ?? 'unreviewed'; const chapters = evidenceChapters(e.id);
         return <article className="source-card foreshadowing-card" key={e.id}><div><h3>{e.name}</h3><span className={`setting-certainty ${current}`}>{clueLabels[current]}</span></div><p>{e.summary}</p><div className="demo-chapter-links"><span>근거 회차</span>{chapters.length ? chapters.map(d=><button className="text-action" key={d.id} onClick={()=>openSource(d.id)}>{d.chapter_index+1}화 원문</button>) : <span>저장된 회차 근거 없음 · 등장 시점 확인 필요</span>}</div><div className="foreshadowing-actions"><label>작가 판단<select aria-label={`${e.name} 상태`} value={current} onChange={event=>saveClue(e.id,event.target.value as ForeshadowingStatusValue)}>{Object.entries(clueLabels).map(([value,label])=><option key={value} value={value}>{label}</option>)}</select></label><button onClick={()=>{setEntity(e);setRelation(null);setFocus(null);setPage('graph');}}>관계 지도에서 확인</button></div></article>;
