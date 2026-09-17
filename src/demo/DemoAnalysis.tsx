@@ -64,7 +64,7 @@ export function DemoAnalysis({active=true,onSource,onGraph,onReview,onResult}: {
     const controller=new AbortController();
     abort.current=controller;
     try {
-      const response=await fetch(`${base}${apiPath}/analyze`,{method:'POST',credentials:'include',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({text:text.trim(),end_chapter:chapter,overrides:Object.entries(nextOverrides).map(([id,value])=>({id:Number(id),text:value}))})});
+      const response=await fetch(`${base}${apiPath}/analyze`,{method:'POST',credentials:'include',signal:controller.signal,headers:{'content-type':'application/json'},body:JSON.stringify({text:text.trim(),end_chapter:chapter,version:sample.version,request_id:request.current.id,overrides:Object.entries(nextOverrides).map(([id,value])=>({id:Number(id),text:value}))})});
       const data=await response.json();
       if(!response.ok)throw new Error(typeof data.detail==='string'?data.detail:'분석을 완료하지 못했습니다. 잠시 후 다시 시도해 주세요.');
       const live={...data,text:text.trim(),resolved:lastVerdict.current==='conflict' && data.verdict==='clear'} as LiveAnalysis;
