@@ -370,8 +370,11 @@ section:has(.review-tabs) > p.muted{margin:0;padding:12px 32px 0;line-height:1.6
 .workbench-nav-top{display:flex;align-items:center;gap:6px;min-width:0}.workbench-nav-top .wordmark{flex:1;min-width:0}.sidebar-toggle{display:grid;place-items:center;flex:0 0 36px;width:36px;height:36px;border:1px solid #DADFD8;border-radius:9px;background:#FFFDF8;color:#24635B;cursor:pointer}.sidebar-toggle:hover{background:#E6EFEB}.workbench-nav.is-collapsed{padding-left:8px;padding-right:8px;align-items:stretch}.workbench-nav.is-collapsed .workbench-nav-top{display:grid;justify-items:center;gap:10px}.workbench-nav.is-collapsed .wordmark{width:100%;justify-content:center;padding:8px 0}.workbench-nav.is-collapsed .wordmark span,.workbench-nav.is-collapsed .project-switch,.workbench-nav.is-collapsed small{display:none}.workbench-nav.is-collapsed .sidebar-toggle{order:-1}.workbench-nav.is-collapsed nav{display:grid;gap:6px}.workbench-nav.is-collapsed nav[aria-label="데모 메뉴"],.workbench-nav.is-collapsed nav[aria-label="앱 메뉴"]{display:none}.workbench-nav.is-collapsed nav button{display:flex;justify-content:center;padding:10px 6px;font-size:0;min-height:44px}.workbench-nav.is-collapsed .nav-bottom{margin-top:auto}.app-shell.workbench:has(.workbench-nav.is-collapsed){grid-template-columns:72px minmax(0,1fr)}
 /* The expanded control is an edge handle; it never occupies the brand row. */
 .workbench-nav-top{position:relative;display:block;min-width:0}
+.workbench-nav{overflow:visible}
 .workbench-nav-top .wordmark{width:100%;min-width:0;padding:8px 0!important;overflow:visible}
-.workbench-nav-top .sidebar-toggle{position:absolute;right:-16px;top:50%;z-index:2;transform:translateY(-50%);flex:0 0 36px;box-shadow:0 2px 8px #252A2718}
-.workbench-nav.is-collapsed .workbench-nav-top{display:flex;flex-direction:column;align-items:center;gap:10px}
-.workbench-nav.is-collapsed .workbench-nav-top .wordmark{width:100%;padding:8px 0!important}
-.workbench-nav.is-collapsed .workbench-nav-top .sidebar-toggle{position:static;order:-1;transform:none;box-shadow:none}
+.workbench-nav-top .sidebar-toggle{position:absolute;right:-16px;top:calc(100% + 4px);z-index:2;transform:none;flex:0 0 36px;box-shadow:0 2px 8px #252A2718}
+.workbench-nav.is-collapsed .workbench-nav-top{position:relative;display:block}
+.workbench-nav.is-collapsed .workbench-nav-top .wordmark{width:100%;margin-top:58px;padding:8px 0!important}
+.workbench-nav.is-collapsed .workbench-nav-top .sidebar-toggle{position:absolute;right:-16px;top:18px;transform:none;box-shadow:0 2px 8px #252A2718}
+.workbench-nav.is-collapsed nav{width:100%}
+.workbench-nav.is-collapsed nav button{width:100%;box-sizing:border-box;justify-content:center}
