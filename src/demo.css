@@ -326,3 +326,5 @@
 .demo-intro-reveal:target{opacity:1;transform:none}
 /* 스크롤 컨테이너·앵커 진입에서 콘텐츠가 희미해지지 않도록 기본 표시를 유지 */
 .demo-intro-page .demo-intro-reveal{opacity:1;transform:none}
+/* Collapsible workbench navigation: override legacy fixed demo track. */
+.app-shell.workbench.demo-workbench:has(.workbench-nav.is-collapsed){grid-template-columns:72px minmax(0,1fr)!important}
